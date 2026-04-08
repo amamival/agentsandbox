@@ -49,7 +49,7 @@ let
   BootConfigs = builtins.attrValues Boot;
   Networking = {
     networking.hostName = HostConf.hostName;
-    systemd.resolveconf.enable = false; # Provided by wrapper.
+    networking.resolvconf.enable = false; # Provided by wrapper.
   };
 
   Users = {
@@ -58,6 +58,7 @@ let
     users.users.${HostConf.wheelUser} = {
       isNormalUser = true;
       uid = 1000;
+      initialPassword = "";
       extraGroups = [ "wheel" ];
     };
   };
@@ -76,7 +77,20 @@ let
     ];
   };
   DesktopEnvironment = { };
-  Service.None = { };
+  Service.OpenSSH = {
+    security.pam.services.sshd.allowNullPassword = true;
+    services.openssh = {
+      enable = true;
+      openFirewall = true;
+      settings = {
+        PasswordAuthentication = true;
+        KbdInteractiveAuthentication = false;
+        PermitEmptyPasswords = true;
+        PermitRootLogin = "yes";
+        UseDns = false;
+      };
+    };
+  };
   Services = builtins.attrValues Service;
   System = { };
   NixOS = {

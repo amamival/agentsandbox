@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Required packages: curl, tar, jq, bubblewrap, util-linux, passt.
-set -e
+set -ev
 
 # Download nixos/nix image from Docker Hub. Requires: curl, tar, jq.
 function fetch_nixos_dockerhub() {
-  TARGET_DIR="$1"
+  local TARGET_DIR="$1"
   [[ -z "$TARGET_DIR" ]] && echo "$0 <NEW_SYSROOT>" && exit
   mkdir -p "$TARGET_DIR"
-  REPO=nixos/nix TAG=latest ARCH=amd64 OS=linux REGISTRY_ENDPOINT="https://registry-1.docker.io/v2"
+  local REPO=nixos/nix TAG=latest ARCH=amd64 OS=linux REGISTRY_ENDPOINT="https://registry-1.docker.io/v2"
   TOKEN="$(curl "https://auth.docker.io/token?service=registry.docker.io&scope=repository:$REPO:pull" | jq -r .token)"
   echo "TOKEN=$TOKEN"
   MANIFESTS=$(curl -H "Authorization: Bearer $TOKEN" "$REGISTRY_ENDPOINT/$REPO/manifests/$TAG")
@@ -29,7 +29,7 @@ function install_nixos() {
   local SYSROOT="$1"
   install -d "$SYSROOT/etc/nixos"
   install -m 0644 flake.nix configuration.nix "$SYSROOT/etc/nixos/"
-  bwrap --bind "$SYSROOT" / --ro-bind /etc/resolv.conf /etc/resolv.conf --proc /proc \
+  bwrap --bind "$SYSROOT" / --ro-bind /etc/resolv.conf /etc/resolv.conf --proc /proc --dev /dev \
     /nix/var/nix/profiles/default/bin/nix --extra-experimental-features 'nix-command flakes' \
       build /etc/nixos#nixosConfigurations.agenthouse.config.system.build.toplevel \
       --out-link /nix/var/nix/profiles/system
@@ -37,15 +37,13 @@ function install_nixos() {
 
 # Start NixOS in container, setup firewall, etc. Requires: unshare, passt, bubblewarp.
 function chroot_to() {
-  SYSROOT="$1"; shift
+  local SYSROOT="$1"; shift
   unshare --map-auto --map-root-user \
     pasta --foreground --config-net --map-host-loopback 10.0.2.2 \
-          --tcp-ports auto --netns-only \
-      bwrap --die-with-parent --un  bwrap --bind "$SYSROOT" / --ro-bind /etc/resolv.conf /etc/resolv.conf --proc /proc \
-    /nix/var/nix/profiles/default/bin/nix --extra-experimental-features 'nix-command flakes' \
-      build /etc/nixos#nixosConfigurations.agenthouse.config.system.build.toplevel \
-      --out-link /nix/var/nix/profiles/systemshare-pid --unshare-ipc --unshare-uts --unshare-cgroup \
-            --bind "$SYSROOT" / --dev /dev --proc /proc --tmpfs /tmp \
+          --tcp-ports 2222:22 --udp-ports none --netns-only \
+      bwrap --die-with-parent --unshare-pid --unshare-ipc --unshare-uts --unshare-cgroup \
+            --bind "$SYSROOT" / --dev /dev --proc /proc --tmpfs /run --tmpfs /tmp \
+            --ro-bind /sys /sys --bind /sys/fs/cgroup /sys/fs/cgroup \
             --ro-bind /etc/resolv.conf /etc/resolv.conf \
             --clearenv \
         -- /nix/var/nix/profiles/default/bin/bash \
@@ -53,24 +51,25 @@ function chroot_to() {
 }
 
 function chroot2() {
-  SYSROOT="$1"; shift
+  local SYSROOT="$1"; shift
   unshare --map-auto --map-root-user \
     pasta --foreground --config-net --map-host-loopback 10.0.2.2 \
-          --tcp-ports auto --netns-only \
+          --tcp-ports 2222:22 --udp-ports none --netns-only \
       bwrap --die-with-parent --unshare-pid --unshare-ipc --unshare-uts\
-            --bind "$SYSROOT" / --dev /dev --proc /proc --tmpfs /tmp \
+            --bind "$SYSROOT" / --dev /dev --proc /proc --tmpfs /run --tmpfs /tmp \
             --ro-bind /sys /sys --bind /sys/fs/cgroup /sys/fs/cgroup \
             --ro-bind /etc/resolv.conf /etc/resolv.conf \
             --clearenv \
         --as-pid-1 /nix/var/nix/profiles/system/init
 }
+
 function chroot3() {
-  SYSROOT="$1"; shift
+  local SYSROOT="$1"; shift
   unshare --user --map-auto --map-root-user --ipc --mount --pid --cgroup --time \
     pasta --foreground --config-net --map-host-loopback 10.0.2.2 \
-          --tcp-ports auto --netns-only \
+          --tcp-ports 2222:22 --udp-ports none --netns-only \
       bwrap --die-with-parent --unshare-pid --unshare-ipc --unshare-uts\
-            --bind "$SYSROOT" / --dev /dev --proc /proc --tmpfs /tmp \
+            --bind "$SYSROOT" / --dev /dev --proc /proc --tmpfs /run --tmpfs /tmp \
             --ro-bind /sys /sys --bind /sys/fs/cgroup /sys/fs/cgroup \
             --ro-bind /etc/resolv.conf /etc/resolv.conf \
             --clearenv \
@@ -78,10 +77,18 @@ function chroot3() {
 }
 
 function main() {
-  local SYSROOT="${1:-sysroot}"
+  local SYSROOT="${1:-sysroot}" PID=
+  local RUNTIME_DIR="$SYSROOT/.host" PIDFILE="$SYSROOT/.host/container.pid"
   [[ -d "$SYSROOT/nix/store" ]] || fetch_nixos_dockerhub "$SYSROOT"
   [[ -e "$SYSROOT/nix/var/nix/profiles/system" ]] || install_nixos "$SYSROOT"
-  chroot2 "$SYSROOT"
+  [[ -f "$PIDFILE" ]] && PID="$(<"$PIDFILE")"
+  if [[ -z "$PID" ]] || ! kill -0 "$PID" 2>/dev/null; then
+    install -d "$RUNTIME_DIR"
+    chroot2 "$SYSROOT" >"$RUNTIME_DIR/console.log" 2>&1 &
+    PID=$!
+    echo "$PID" >"$PIDFILE"
+  fi
+  nsenter -t "$PID" -a /run/current-system/sw/bin/bash -l
 }
 
 main "$@"

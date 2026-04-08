@@ -29,6 +29,7 @@ function install_nixos() {
   local SYSROOT="$1"
   install -d "$SYSROOT/etc/nixos"
   install -m 0644 flake.nix configuration.nix "$SYSROOT/etc/nixos/"
+  rm -f "$SYSROOT/nix/var/nix/profiles/system"
   bwrap --bind "$SYSROOT" / --ro-bind /etc/resolv.conf /etc/resolv.conf --proc /proc --dev /dev \
     /nix/var/nix/profiles/default/bin/nix --extra-experimental-features 'nix-command flakes' \
       build /etc/nixos#nixosConfigurations.agenthouse.config.system.build.toplevel \
@@ -36,59 +37,36 @@ function install_nixos() {
 }
 
 # Start NixOS in container, setup firewall, etc. Requires: unshare, passt, bubblewarp.
-function chroot_to() {
-  local SYSROOT="$1"; shift
+function start_container() {
+  local SYSROOT="$1"
   unshare --map-auto --map-root-user \
-    pasta --foreground --config-net --map-host-loopback 10.0.2.2 \
-          --tcp-ports 2222:22 --udp-ports none --netns-only \
-      bwrap --die-with-parent --unshare-pid --unshare-ipc --unshare-uts --unshare-cgroup \
-            --bind "$SYSROOT" / --dev /dev --proc /proc --tmpfs /run --tmpfs /tmp \
-            --ro-bind /sys /sys --bind /sys/fs/cgroup /sys/fs/cgroup \
-            --ro-bind /etc/resolv.conf /etc/resolv.conf \
-            --clearenv \
-        -- /nix/var/nix/profiles/default/bin/bash \
-           --init-file /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh -i "$@"
+    /bin/sh -c 'echo $$ > '"$SYSROOT.pid"'; exec "$@"' _ \
+      pasta --foreground --config-net --map-host-loopback 10.0.2.2 \
+            --tcp-ports 2222:22 --udp-ports none --netns-only \
+        bwrap --die-with-parent --unshare-pid --unshare-ipc --unshare-uts \
+              --bind "$SYSROOT" / --dev /dev --proc /proc --tmpfs /run --tmpfs /tmp \
+              --ro-bind /sys /sys --bind /sys/fs/cgroup /sys/fs/cgroup \
+              --ro-bind /etc/resolv.conf /etc/resolv.conf \
+              --clearenv --as-pid-1 /nix/var/nix/profiles/system/init
 }
 
-function chroot2() {
-  local SYSROOT="$1"; shift
-  unshare --map-auto --map-root-user \
-    pasta --foreground --config-net --map-host-loopback 10.0.2.2 \
-          --tcp-ports 2222:22 --udp-ports none --netns-only \
-      bwrap --die-with-parent --unshare-pid --unshare-ipc --unshare-uts\
-            --bind "$SYSROOT" / --dev /dev --proc /proc --tmpfs /run --tmpfs /tmp \
-            --ro-bind /sys /sys --bind /sys/fs/cgroup /sys/fs/cgroup \
-            --ro-bind /etc/resolv.conf /etc/resolv.conf \
-            --clearenv \
-        --as-pid-1 /nix/var/nix/profiles/system/init
-}
-
-function chroot3() {
-  local SYSROOT="$1"; shift
-  unshare --user --map-auto --map-root-user --ipc --mount --pid --cgroup --time \
-    pasta --foreground --config-net --map-host-loopback 10.0.2.2 \
-          --tcp-ports 2222:22 --udp-ports none --netns-only \
-      bwrap --die-with-parent --unshare-pid --unshare-ipc --unshare-uts\
-            --bind "$SYSROOT" / --dev /dev --proc /proc --tmpfs /run --tmpfs /tmp \
-            --ro-bind /sys /sys --bind /sys/fs/cgroup /sys/fs/cgroup \
-            --ro-bind /etc/resolv.conf /etc/resolv.conf \
-            --clearenv \
-        --as-pid-1 /nix/var/nix/profiles/system/init
+# Attach to the running container.
+function attach() {
+  local PID="$1"
+  PID="$(pgrep --ns "$PID" --nslist user -f /run/current-system/systemd/lib/systemd/systemd)"
+  env -i "TERM=$TERM" nsenter -t "$PID" -U -m -n -p -i -u
 }
 
 function main() {
   local SYSROOT="${1:-sysroot}" PID=
-  local RUNTIME_DIR="$SYSROOT/.host" PIDFILE="$SYSROOT/.host/container.pid"
+  local PIDFILE=$SYSROOT.pid
   [[ -d "$SYSROOT/nix/store" ]] || fetch_nixos_dockerhub "$SYSROOT"
   [[ -e "$SYSROOT/nix/var/nix/profiles/system" ]] || install_nixos "$SYSROOT"
   [[ -f "$PIDFILE" ]] && PID="$(<"$PIDFILE")"
   if [[ -z "$PID" ]] || ! kill -0 "$PID" 2>/dev/null; then
-    install -d "$RUNTIME_DIR"
-    chroot2 "$SYSROOT" >"$RUNTIME_DIR/console.log" 2>&1 &
-    PID=$!
-    echo "$PID" >"$PIDFILE"
+    start_container "$SYSROOT"
   fi
-  nsenter -t "$PID" -a /run/current-system/sw/bin/bash -l
+  attach "$PID"
 }
 
 main "$@"

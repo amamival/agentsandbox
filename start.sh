@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Required packages: curl, tar, jq, bubblewrap, util-linux, passt.
 set -e
 
 # Download nixos/nix image from Docker Hub. Requires: curl, tar, jq.
@@ -17,10 +18,21 @@ function fetch_nixos_dockerhub() {
   echo "MANIFEST=$MANIFEST"
   BLOBSUMS="$(jq -r '.layers[].digest' <<<"$MANIFEST")"
   echo "BLOBSUMS=$BLOBSUMS"
-  while read BLOBSUM; do
+  while read -r BLOBSUM; do
     curl -IH "Authorization: Bearer $TOKEN" "$REGISTRY_ENDPOINT/$REPO/blobs/$BLOBSUM";
     curl -LH "Authorization: Bearer $TOKEN" "$REGISTRY_ENDPOINT/$REPO/blobs/$BLOBSUM" | tar zxf - -C "$TARGET_DIR"
   done <<<"$BLOBSUMS"
+}
+
+# Build NixOS system in container. Requires: bwrap.
+function install_nixos() {
+  local SYSROOT="$1"
+  install -d "$SYSROOT/etc/nixos"
+  install -m 0644 flake.nix configuration.nix "$SYSROOT/etc/nixos/"
+  bwrap --bind "$SYSROOT" / --ro-bind /etc/resolv.conf /etc/resolv.conf --proc /proc \
+    /nix/var/nix/profiles/default/bin/nix --extra-experimental-features 'nix-command flakes' \
+      build /etc/nixos#nixosConfigurations.agenthouse.config.system.build.toplevel \
+      --out-link /nix/var/nix/profiles/system
 }
 
 # Start NixOS in container, setup firewall, etc. Requires: unshare, passt, bubblewarp.
@@ -29,22 +41,15 @@ function chroot_to() {
   unshare --map-auto --map-root-user \
     pasta --foreground --config-net --map-host-loopback 10.0.2.2 \
           --tcp-ports auto --netns-only \
-      bwrap --die-with-parent --unshare-pid --unshare-ipc --unshare-uts --unshare-cgroup \
+      bwrap --die-with-parent --un  bwrap --bind "$SYSROOT" / --ro-bind /etc/resolv.conf /etc/resolv.conf --proc /proc \
+    /nix/var/nix/profiles/default/bin/nix --extra-experimental-features 'nix-command flakes' \
+      build /etc/nixos#nixosConfigurations.agenthouse.config.system.build.toplevel \
+      --out-link /nix/var/nix/profiles/systemshare-pid --unshare-ipc --unshare-uts --unshare-cgroup \
             --bind "$SYSROOT" / --dev /dev --proc /proc --tmpfs /tmp \
             --ro-bind /etc/resolv.conf /etc/resolv.conf \
             --clearenv \
         -- /nix/var/nix/profiles/default/bin/bash \
            --init-file /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh -i "$@"
-}
-
-function install_nixos() {
-  SYSROOT="$1"
-  mkdir -p "$SYSROOT/etc/nixos"
-  cp {flake,configuration}.nix "$SYSROOT/etc/nixos/"
-  chroot_to "$SYSROOT" -c \
-    "nix --extra-experimental-features nix-command\ flakes \
-       build /etc/nixos#nixosConfigurations.agenthouse.config.system.build.toplevel \
-       --out-link /nix/var/nix/profiles/system"
 }
 
 function chroot2() {
@@ -72,7 +77,11 @@ function chroot3() {
         --as-pid-1 /nix/var/nix/profiles/system/init
 }
 
-# fetch_nixos_dockerhub sysroot
-#chroot_to sysroot
-#install_nixos sysroot
-chroot2 sysroot
+function main() {
+  local SYSROOT="${1:-sysroot}"
+  [[ -d "$SYSROOT/nix/store" ]] || fetch_nixos_dockerhub "$SYSROOT"
+  [[ -e "$SYSROOT/nix/var/nix/profiles/system" ]] || install_nixos "$SYSROOT"
+  chroot2 "$SYSROOT"
+}
+
+main "$@"

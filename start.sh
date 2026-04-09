@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Required packages: curl, tar, jq, bubblewrap, util-linux, passt.
-set -ev
+set -e
 
 # Download nixos/nix image from Docker Hub. Requires: curl, tar, jq.
 function fetch_nixos_dockerhub() {
@@ -38,13 +38,14 @@ function install_nixos() {
 
 # Start NixOS in container, setup firewall, etc. Requires: unshare, passt, bubblewarp.
 function start_container() {
-  local SYSROOT="$1"
+  local SYSROOT="$1" PERSISTENT="$2" PIDFILE="$3"
   unshare --map-auto --map-root-user \
-    /bin/sh -c 'echo $$ > '"$SYSROOT.pid"'; exec "$@"' _ \
+    /bin/sh -c 'echo $$ > "'"$PIDFILE"'"; exec "$@"' _ \
       pasta --foreground --config-net --map-host-loopback 10.0.2.2 \
             --tcp-ports 2222:22 --udp-ports none --netns-only \
         bwrap --die-with-parent --unshare-pid --unshare-ipc --unshare-uts \
-              --bind "$SYSROOT" / --dev /dev --proc /proc --tmpfs /run --tmpfs /tmp \
+              --tmpfs / --bind "$SYSROOT/nix" /nix --dev /dev --proc /proc \
+              --bind "$PERSISTENT" /persistent \
               --ro-bind /sys /sys --bind /sys/fs/cgroup /sys/fs/cgroup \
               --ro-bind /etc/resolv.conf /etc/resolv.conf \
               --clearenv --as-pid-1 /nix/var/nix/profiles/system/init
@@ -58,15 +59,21 @@ function attach() {
 }
 
 function main() {
-  local SYSROOT="${1:-sysroot}" PID=
-  local PIDFILE=$SYSROOT.pid
+  local XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+  local XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+  local XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+  local SYSROOT="$XDG_DATA_HOME/agentsandbox/sysroot" PID=
+  local PERSISTENT="$XDG_STATE_HOME/agentsandbox/persistent"
+  local PIDFILE="$XDG_RUNTIME_DIR/agentsandbox.pid"
+  install -d "$PERSISTENT" "$XDG_RUNTIME_DIR"
   [[ -d "$SYSROOT/nix/store" ]] || fetch_nixos_dockerhub "$SYSROOT"
-  [[ -e "$SYSROOT/nix/var/nix/profiles/system" ]] || install_nixos "$SYSROOT"
   [[ -f "$PIDFILE" ]] && PID="$(<"$PIDFILE")"
   if [[ -z "$PID" ]] || ! kill -0 "$PID" 2>/dev/null; then
-    start_container "$SYSROOT"
+    install_nixos "$SYSROOT"
+    start_container "$SYSROOT" "$PERSISTENT" "$PIDFILE"
+  else
+    attach "$PID"
   fi
-  attach "$PID"
 }
 
 main "$@"

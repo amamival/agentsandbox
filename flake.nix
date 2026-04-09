@@ -4,14 +4,18 @@
     nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
     home-manager.url = "github:nix-community/home-manager/release-25.11";
     home-manager.inputs.nixpkgs.follows = "nixpkgs";
+    impermanence.url = "github:nix-community/impermanence";
+    impermanence.inputs.nixpkgs.follows = "";
+    impermanence.inputs.home-manager.follows = "";
   };
-  outputs = { self, nixpkgs, nixpkgs-unstable, home-manager }:
+  outputs = { self, nixpkgs, nixpkgs-unstable, home-manager, impermanence }:
     let
       nixosWithOverlay = system: modules:
         nixpkgs.lib.nixosSystem {
           inherit system;
           modules = modules ++ [
             home-manager.nixosModules.home-manager
+            impermanence.nixosModules.impermanence
             (_: { nixpkgs.overlays = [ (_: _: self.packages.${system}) ]; })
           ];
           specialArgs.pkgs-unstable = import nixpkgs-unstable { inherit system; config.allowUnfree = true; };

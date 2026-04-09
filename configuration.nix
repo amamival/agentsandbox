@@ -46,13 +46,14 @@ let
       allowTrash = true;
       directories = [
         "/etc/nixos"
-        "/var/log"
         "/var/lib/nixos"
-        # { directory = "/var/lib/colord"; user = "colord"; group = "colord"; mode = "u=rwx,g=rx,o="; }
+        "/var/log"
+        # { directory = ""; user = ""; group = ""; mode = "u=rwx,g=rx,o="; }
       ];
       files = [
         "/etc/machine-id"
-        #{ file = "/var/keys/secret_file"; parentDirectory = { mode = "u=rwx,g=,o="; }; }
+        "/etc/ssh/ssh_host_ed25519_key"
+        # { file = ""; parentDirectory = { mode = "u=rwx,g=,o="; ... }; }
       ];
     };
   };
@@ -60,8 +61,65 @@ let
   
   Networking = {
     networking.hostName = HostConf.hostName;
-    networking.resolvconf.enable = false; # Provided by wrapper.
+    networking.resolvconf.enable = false; # Provided by host.
   };
+
+  Shell = {
+    environment.systemPackages = with pkgs; [
+      btop
+      dig
+      htop
+      file
+      git
+      gh
+      iproute2
+      jq
+      lsof
+      nixpkgs-fmt
+      nodejs_24 # For Remote-SSH: "vscode@localhost -p 2222".
+      perf
+      ripgrep
+      shellcheck
+      sqlite
+      strace
+      sysstat
+      taplo
+      tmux
+      util-linux
+      yq
+      wget
+    ];
+    environment.shellAliases = {
+      ll = "ls -l";
+      ga = "git add";
+      gb = "git branch";
+      gc = "git commit";
+      gck = "git checkout";
+      gd = "git diff";
+      gl = "git log";
+      gr = "git restore";
+      gs = "git status";
+      gsw = "git switch";
+      gpl = "git pull";
+      gps = "git push";
+    };
+    environment.variables.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
+  };
+
+  DesktopEnvironment = { };
+
+  Service.OpenSSH = {
+    security.pam.services.sshd.allowNullPassword = true;
+    services.openssh = {
+      enable = true;
+      settings = {
+        PermitEmptyPasswords = true;
+        PermitRootLogin = "yes";
+      };
+      hostKeys = [{ type = "ed25519"; path = "/etc/ssh/ssh_host_ed25519_key"; }];
+    };
+  };
+  Services = builtins.attrValues Service;
 
   Users = {
     users.mutableUsers = false;
@@ -79,6 +137,14 @@ let
       programs.bash.profileExtra = ''
         export NPM_CONFIG_PREFIX=~/.npm-global PATH=$PATH:~/.npm-global/bin
       '';
+      programs.direnv = {
+        enable = true;
+        nix-direnv.enable = true;
+        config = {
+          global.warn_timeout = "30m"; # `nix develop` may take a long time.
+          whitelist.prefix = [ "/" ]; # Since we are running in container.
+        };
+      };
       systemd.user.services.ai-cli-update = {
         Unit.Description = "Install or update codex and claude on login";
         Service = {
@@ -109,7 +175,6 @@ let
           ".config/ohmyposh"
           ".config/opencode"
           ".config/tmux/plugins"
-          { directory = ".gnupg"; mode = "0700"; }
           ".local/bin"
           ".local/share/claude"
           ".local/share/fish"
@@ -122,6 +187,7 @@ let
           ".rustup"
           ".tmux/plugins"
           "go"
+          { directory = ".gnupg"; mode = "0700"; }
           { directory = ".ssh"; mode = "0700"; }
           { directory = ".local/share/keyrings"; mode = "0700"; }
         ];
@@ -137,73 +203,6 @@ let
     };
   };
 
-  Shell = {
-    environment.systemPackages = with pkgs; [
-      btop
-      dig
-      htop
-      file
-      git
-      gh
-      iproute2
-      jq
-      lsof
-      nixpkgs-fmt
-      nodejs_24 # For Remote-SSH: "vscode@localhost -p 2222".
-      perf
-      ripgrep
-      shellcheck
-      sqlite
-      strace
-      sysstat
-      taplo
-      tmux
-      util-linux
-      yq
-      wget
-    ];
-    programs.direnv = {
-      enable = true;
-      settings = {
-        global.warn_timeout = "30m"; # `nix develop` may take a long time.
-        whitelist.prefix = [ "/" ]; # Since we are running in container.
-      };
-    };
-    environment.shellAliases = {
-      ll = "ls -l";
-      ga = "git add";
-      gb = "git branch";
-      gc = "git commit";
-      gck = "git checkout";
-      gd = "git diff";
-      gl = "git log";
-      gr = "git restore";
-      gs = "git status";
-      gsw = "git switch";
-      gpl = "git pull";
-      gps = "git push";
-    };
-    environment.variables.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
-  };
-
-  DesktopEnvironment = { };
-
-  Service.OpenSSH = {
-    security.pam.services.sshd.allowNullPassword = true;
-    services.openssh = {
-      enable = true;
-      openFirewall = true;
-      settings = {
-        PasswordAuthentication = true;
-        KbdInteractiveAuthentication = false;
-        PermitEmptyPasswords = true;
-        PermitRootLogin = "yes";
-        UseDns = false;
-      };
-    };
-  };
-  Services = builtins.attrValues Service;
-
   System = {
     time.timeZone = "Asia/Tokyo";
     i18n.supportedLocales = [ "ja_JP.UTF-8/UTF-8" "en_US.UTF-8/UTF-8" ];
@@ -215,11 +214,11 @@ let
     nix.gc.dates = "Monday 04:00";
     nix.settings.auto-optimise-store = true;
     nix.settings.experimental-features = "flakes nix-command";
-    nix.settings.max-jobs = "auto"; # Default 1.
+    nix.settings.max-jobs = "auto";
     system.stateVersion = "25.11";
   };
 in
 {
   imports = BootConfigs ++ Services ++
-    [ Networking Users Shell DesktopEnvironment System NixOS ];
+    [ Networking Shell DesktopEnvironment Users System NixOS ];
 }

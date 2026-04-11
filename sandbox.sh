@@ -129,7 +129,11 @@ function start_container() {
 }
 
 function running_pid() {
-  pgrep -o --ns "$(<"$APP_DIR/$PIDFILE")" --nslist user -f /run/current-system/systemd/lib/systemd/systemd
+  local PID="$(<"$APP_DIR/$PIDFILE")"
+  if [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null; then
+    pgrep -o --ns "$PID" --nslist user -f /run/current-system/systemd/lib/systemd/systemd
+  else false
+  fi
 }
 function map_inner_1000() {
   awk '1000 >= $1 && 1000 < ($1 + $3) { print $2 + 1000 - $1; found = 1; exit } END { exit !found }' "$1" ||

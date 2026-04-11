@@ -23,11 +23,21 @@
       eachSystem = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" ];
     in
     {
-      packages = eachSystem (system: rec {
-        _pkgs = import nixpkgs { inherit system; config.allowUnfree = true; };
+      packages = eachSystem (system:
+        let pkgs = import nixpkgs { inherit system; config.allowUnfree = true; };
+        in rec {
         # Extra packages available.
+        bwrap-seccomp = pkgs.stdenv.mkDerivation {
+          pname = "bwrap-seccomp";
+          version = "0";
+          src = ./bwrap-seccomp.c;
+          dontUnpack = true;
+          nativeBuildInputs = [ pkgs.pkg-config ];
+          buildInputs = [ pkgs.libseccomp ];
+          buildPhase = ''$CC $src -o bwrap-seccomp $(pkg-config --cflags --libs libseccomp)'';
+          installPhase = ''install -Dm755 bwrap-seccomp $out/bin/bwrap-seccomp'';
+        };
       });
       nixosConfigurations.agenthouse = nixosWithOverlay "x86_64-linux" [ ./configuration.nix ];
     };
 }
-

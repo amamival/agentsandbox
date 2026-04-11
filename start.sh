@@ -12,7 +12,7 @@ function die() { echo "$0: $*" >&2; exit 1; }
 
 function usage() {
   cat <<'EOF'
-usage: ./start.sh [help|build|up|down|kill|pause|unpause|exec|logs|ssh|--] [args ...]
+usage: ./start.sh [help|build|up|down|kill|pause|unpause|exec|logs|ssh|add|delete|mount|unmount|--] [args ...]
 
   help     show this help
   build    prepare sandbox state and rebuild the NixOS system
@@ -24,6 +24,10 @@ usage: ./start.sh [help|build|up|down|kill|pause|unpause|exec|logs|ssh|--] [args
   exec     attach to the running sandbox, or run a command
   logs     run journalctl in the sandbox; default args: -en1000
   ssh      ssh to vscode@127.0.0.1 -p 2222; pass args through to ssh
+  add      register host directories in /sandbox/mounts and mount them now
+  delete   unmount directories and remove them from /sandbox/mounts
+  mount    mount all directories listed in /sandbox/mounts
+  unmount  unmount all directories listed in /sandbox/mounts
 
 With no subcommand:
   - if the sandbox is running, attach
@@ -127,12 +131,36 @@ function start_container() {
 function running_pid() {
   pgrep -o --ns "$(<"$APP_DIR/$PIDFILE")" --nslist user -f /run/current-system/systemd/lib/systemd/systemd
 }
+function map_inner_1000() {
+  awk '1000 >= $1 && 1000 < ($1 + $3) { print $2 + 1000 - $1; found = 1; exit } END { exit !found }' "$1" ||
+    die "inner $2 1000 is not mapped in $1"
+}
 function require_running_pid() { running_pid || die "sandbox is not running"; }
 function sandbox_exec() { env -i "TERM=${TERM:-xterm-256color}" nsenter -t "$1" -U -m -n -p -i -u ${2:+--} "${@:2}"; }
 function send_signal() { pkill -"$1" --ns "$(require_running_pid)" --nslist pid -f . 2>/dev/null || true; }
+function mount_workspace() {
+  local src="$1" dst="$APP_DIR/$PERSISTENT/workspace$1" cur="$2" uid="$3" gid="$4"
+  if mountpoint -q "$dst"; then
+    cur="$(findmnt -n -o SOURCE --target "$dst" || true)"
+    [[ "$cur" == "$src" ]] && { echo "/workspace$src is already mounted"; return; }
+    die "$dst is already mounted from $cur"
+  fi
+  sudo sh -eu -c 'install -d "$1" && mount --bind --mkdir --map-users "$2:$3:1" --map-groups "$4:$5:1" "$6" "$7"' sh \
+    "$(dirname "$dst")" "$uid" "$UID" "$gid" "$(id -g)" "$src" "$dst"
+  echo "$src -> /workspace$src"
+}
+function unmount_workspace() {
+  local src="$1" dst="$APP_DIR/$PERSISTENT/workspace$1" cur
+  mountpoint -q "$dst" || return
+  cur="$(findmnt -n -o SOURCE --target "$dst" || true)"
+  [[ -z "$cur" || "$cur" == "$src" ]] || die "$dst is mounted from $cur"
+  sudo umount "$dst"
+  echo "/workspace$src unmounted"
+}
 
 function main() {
-  local CMD="${1:-}" PID=
+  local CMD="${1:-}" PID= src uid gid tmp
+  local -a lines=()
   case "$CMD" in
     help|-h|--help) usage ;;
     build) ensure_system "$SYSROOT" "$PERSISTENT" "$PIDFILE" ;;
@@ -155,6 +183,43 @@ function main() {
       sandbox_exec "$(require_running_pid)" "$@" ;;
     logs) shift; sandbox_exec "$(require_running_pid)" journalctl "${@:--en1000}" ;;
     ssh) shift; require_running_pid >/dev/null; exec ssh -p 2222 vscode@127.0.0.1 "$@" ;;
+    add)
+      shift
+      [[ "$#" -gt 0 ]] || die "add requires at least one path"
+      PID="$(require_running_pid)"; uid="$(map_inner_1000 "/proc/$PID/uid_map" UID)"; gid="$(map_inner_1000 "/proc/$PID/gid_map" GID)"
+      sudo install -D -m 644 /dev/null "$APP_DIR/mounts"
+      for src in "$@"; do
+        src="$(realpath -e "$src")"
+        [[ -d "$src" ]] || die "only directories are supported: $src"
+        grep -Fxq -- "$src" "$APP_DIR/mounts" || printf '%s\n' "$src" | sudo tee -a "$APP_DIR/mounts" >/dev/null
+        mount_workspace "$src" "" "$uid" "$gid"
+      done
+      ;;
+    delete)
+      shift
+      [[ "$#" -gt 0 ]] || die "delete requires at least one path"
+      sudo install -D -m 644 /dev/null "$APP_DIR/mounts"
+      for src in "$@"; do
+        src="$(realpath -m "$src")"
+        tmp="$(mktemp)"
+        grep -Fxv -- "$src" "$APP_DIR/mounts" >"$tmp" || true
+        sudo install -m 644 "$tmp" "$APP_DIR/mounts"
+        rm -f "$tmp"
+        unmount_workspace "$src"
+      done
+      ;;
+    mount)
+      shift
+      [[ -r "$APP_DIR/mounts" ]] || return
+      PID="$(require_running_pid)"; uid="$(map_inner_1000 "/proc/$PID/uid_map" UID)"; gid="$(map_inner_1000 "/proc/$PID/gid_map" GID)"
+      while IFS= read -r src; do [[ -n "$src" ]] && mount_workspace "$src" "" "$uid" "$gid"; done < "$APP_DIR/mounts"
+      ;;
+    unmount)
+      shift
+      [[ -r "$APP_DIR/mounts" ]] || return
+      mapfile -t lines < "$APP_DIR/mounts"
+      for ((i=${#lines[@]}-1; i>=0; i--)); do [[ -n "${lines[i]}" ]] && unmount_workspace "${lines[i]}"; done
+      ;;
     *) die "unknown subcommand: $CMD" ;;
   esac
 }

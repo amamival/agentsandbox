@@ -1,9 +1,36 @@
 #!/usr/bin/env bash
 # Required packages: curl, tar, jq, bubblewrap, util-linux, passt, sudo.
-set -e
+set -euo pipefail
 
 APP_DIR="/sandbox"
 SRC_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+SYSROOT="sysroot"
+PERSISTENT="persistent"
+PIDFILE="sysroot.pid"
+
+function die() { echo "$0: $*" >&2; exit 1; }
+
+function usage() {
+  cat <<'EOF'
+usage: ./start.sh [help|build|up|down|kill|pause|unpause|exec|logs|ssh|--] [args ...]
+
+  help     show this help
+  build    prepare sandbox state and rebuild the NixOS system
+  up       rebuild and start the sandbox; fail if already running
+  down     graceful shutdown (SIGRTMIN+3 to guest systemd)
+  kill     send TERM to all processes in the sandbox pid namespace
+  pause    send STOP to all processes in the sandbox pid namespace
+  unpause  send CONT to all processes in the sandbox pid namespace
+  exec     attach to the running sandbox, or run a command
+  logs     run journalctl in the sandbox; default args: -en1000
+  ssh      ssh to vscode@127.0.0.1 -p 2222; pass args through to ssh
+
+With no subcommand:
+  - if the sandbox is running, attach
+  - if the sandbox is stopped, behave like build then up
+Use `exec [--] cmd ...` or `-- cmd ...` to run a command via exec.
+EOF
+}
 
 # Run as ID-mapped isolated root user within $APP_DIR.
 function nssudo() {
@@ -59,7 +86,7 @@ function fetch_nixos_dockerhub() {
 function install_nixos() {
   local SYSROOT="$1"
   nssudo install -d "$SYSROOT/etc/nixos"
-  cp {flake,configuration}.nix /tmp
+  cp "$SRC_DIR"/{flake,configuration}.nix /tmp
   nssudo install -m 644 /tmp/{flake,configuration}.nix "$SYSROOT/etc/nixos/"
   nssudo rm -f "$SYSROOT/nix/var/nix/profiles/system"
   # Python's _multiprocessing.SemLock expects a writable 1777 /dev/shm.
@@ -70,13 +97,20 @@ function install_nixos() {
       --out-link /nix/var/nix/profiles/system
 }
 
+function ensure_system() {
+  local SYSROOT="$1" PERSISTENT="$2" PIDFILE="$3"
+  [[ -f "$APP_DIR/$PIDFILE" ]] || prepare "$SYSROOT" "$PERSISTENT" "$PIDFILE"
+  [[ -d "$APP_DIR/$SYSROOT/nix/store" ]] || fetch_nixos_dockerhub "$SYSROOT"
+  install_nixos "$SYSROOT"
+}
+
 # Start NixOS in container, setup firewall, etc.
 function start_container() {
-  local SYSROOT="$1" PERSISTENT="$2" PIDFILE="$3"
+  local SYSROOT="$1" PERSISTENT="$2" PIDFILE="$3" CURRENT_CGROUP
   # Let the id-mapped container systemd open the host tty via bwrap's /dev/console bind.
   chmod o+rw "$(tty)" # nssudo --map-current-user chown 0:0 "$(tty)" <- won't work.
   # Change owner of cgroup and bind mount into container directly.
-  local CURRENT_CGROUP="/sys/fs/cgroup$(awk -F: '$1==0{print $3}' /proc/self/cgroup)"
+  CURRENT_CGROUP="/sys/fs/cgroup$(awk -F: '$1==0{print $3}' /proc/self/cgroup)"
   nssudo --map-current-user chown -R 0:0 "$CURRENT_CGROUP"
   nssudo /bin/sh -c 'echo $$ > "'"$PIDFILE"'"; exec "$@"' _ \
     pasta --foreground --config-net --map-host-loopback 10.0.2.2 \
@@ -90,24 +124,39 @@ function start_container() {
         /nix/var/nix/profiles/system/init
 }
 
-# Attach to the running container.
-function attach() {
-  local PID="$1"
-  PID="$(pgrep --ns "$PID" --nslist user -f /run/current-system/systemd/lib/systemd/systemd)"
-  env -i "TERM=$TERM" nsenter -t "$PID" -U -m -n -p -i -u
+function running_pid() {
+  pgrep -o --ns "$(<"$APP_DIR/$PIDFILE")" --nslist user -f /run/current-system/systemd/lib/systemd/systemd
 }
+function require_running_pid() { running_pid || die "sandbox is not running"; }
+function sandbox_exec() { env -i "TERM=${TERM:-xterm-256color}" nsenter -t "$1" -U -m -n -p -i -u ${2:+--} "${@:2}"; }
+function send_signal() { pkill -"$1" --ns "$(require_running_pid)" --nslist pid -f . 2>/dev/null || true; }
 
 function main() {
-  local SYSROOT="sysroot" PERSISTENT="persistent" PIDFILE="sysroot.pid" PID=
-  [[ -f "$APP_DIR/$PIDFILE" ]] || prepare "$SYSROOT" "$PERSISTENT" "$PIDFILE" \
-    && PID="$(<"$APP_DIR/$PIDFILE")"
-  [[ -d "$APP_DIR/$SYSROOT/nix/store" ]] || fetch_nixos_dockerhub "$SYSROOT"
-  if [[ -z "$PID" ]] || ! kill -0 "$PID" 2>/dev/null; then
-    install_nixos "$SYSROOT"
-    start_container "$SYSROOT" "$PERSISTENT" "$PIDFILE"
-  else
-    attach "$PID"
-  fi
+  local CMD="${1:-}" PID=
+  case "$CMD" in
+    help|-h|--help) usage ;;
+    build) ensure_system "$SYSROOT" "$PERSISTENT" "$PIDFILE" ;;
+    up|--|"") [[ -n "$CMD" ]] && shift
+      if PID="$(running_pid 2>/dev/null)"; then
+        if [[ "$CMD" != up ]];
+          then sandbox_exec "$PID" "$@";
+          else die "sandbox is already running at pid $PID";
+        fi
+      else
+        ensure_system "$SYSROOT" "$PERSISTENT" "$PIDFILE"
+        start_container "$SYSROOT" "$PERSISTENT" "$PIDFILE"
+      fi
+      ;;
+    down) PID="$(running_pid 2>/dev/null || true)"; [[ -z "$PID" ]] || kill -s SIGRTMIN+3 "$PID" ;;
+    kill) send_signal TERM ;;
+    pause) send_signal STOP ;;
+    unpause) send_signal CONT ;;
+    exec) shift; [[ "${1:-}" == "--" ]] && shift;
+      sandbox_exec "$(require_running_pid)" "$@" ;;
+    logs) shift; sandbox_exec "$(require_running_pid)" journalctl "${@:--en1000}" ;;
+    ssh) shift; require_running_pid >/dev/null; exec ssh -p 2222 vscode@127.0.0.1 "$@" ;;
+    *) die "unknown subcommand: $CMD" ;;
+  esac
 }
 
 main "$@"

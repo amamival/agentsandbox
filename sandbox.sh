@@ -12,7 +12,7 @@ function die() { echo "$0: $*" >&2; exit 1; }
 
 function usage() {
   cat <<'EOF'
-usage: ./start.sh [help|build|up|down|kill|pause|unpause|exec|logs|ssh|add|delete|mount|unmount|--] [args ...]
+usage: ./sandbox.sh [help|build|up|down|kill|pause|unpause|exec|logs|ssh|add|delete|mount|unmount|--] [args ...]
 
   help     show this help
   build    prepare sandbox state and rebuild the NixOS system
@@ -139,23 +139,23 @@ function require_running_pid() { running_pid || die "sandbox is not running"; }
 function sandbox_exec() { env -i "TERM=${TERM:-xterm-256color}" nsenter -t "$1" -U -m -n -p -i -u ${2:+--} "${@:2}"; }
 function send_signal() { pkill -"$1" --ns "$(require_running_pid)" --nslist pid -f . 2>/dev/null || true; }
 function mount_workspace() {
-  local src="$1" dst="$APP_DIR/$PERSISTENT/workspace$1" cur="$2" uid="$3" gid="$4"
+  local src="$1" dst="$APP_DIR/$PERSISTENT/workspace/${1##*/}" cur uid="$2" gid="$3"
   if mountpoint -q "$dst"; then
     cur="$(findmnt -n -o SOURCE --target "$dst" || true)"
-    [[ "$cur" == "$src" ]] && { echo "/workspace$src is already mounted"; return; }
+    [[ "$cur" == "$src" ]] && { echo "/workspace/${src##*/} is already mounted"; return; }
     die "$dst is already mounted from $cur"
   fi
   sudo sh -eu -c 'install -d "$1" && mount --bind --mkdir --map-users "$2:$3:1" --map-groups "$4:$5:1" "$6" "$7"' sh \
     "$(dirname "$dst")" "$uid" "$UID" "$gid" "$(id -g)" "$src" "$dst"
-  echo "$src -> /workspace$src"
+  echo "$src -> /workspace/${src##*/}"
 }
 function unmount_workspace() {
-  local src="$1" dst="$APP_DIR/$PERSISTENT/workspace$1" cur
+  local src="$1" dst="$APP_DIR/$PERSISTENT/workspace/${1##*/}" cur
   mountpoint -q "$dst" || return
   cur="$(findmnt -n -o SOURCE --target "$dst" || true)"
   [[ -z "$cur" || "$cur" == "$src" ]] || die "$dst is mounted from $cur"
   sudo umount "$dst"
-  echo "/workspace$src unmounted"
+  echo "/workspace/${src##*/} unmounted"
 }
 
 function main() {
@@ -192,7 +192,7 @@ function main() {
         src="$(realpath -e "$src")"
         [[ -d "$src" ]] || die "only directories are supported: $src"
         grep -Fxq -- "$src" "$APP_DIR/mounts" || printf '%s\n' "$src" | sudo tee -a "$APP_DIR/mounts" >/dev/null
-        mount_workspace "$src" "" "$uid" "$gid"
+        mount_workspace "$src" "$uid" "$gid"
       done
       ;;
     delete)
@@ -212,7 +212,7 @@ function main() {
       shift
       [[ -r "$APP_DIR/mounts" ]] || return
       PID="$(require_running_pid)"; uid="$(map_inner_1000 "/proc/$PID/uid_map" UID)"; gid="$(map_inner_1000 "/proc/$PID/gid_map" GID)"
-      while IFS= read -r src; do [[ -n "$src" ]] && mount_workspace "$src" "" "$uid" "$gid"; done < "$APP_DIR/mounts"
+      while IFS= read -r src; do [[ -n "$src" ]] && mount_workspace "$src" "$uid" "$gid"; done < "$APP_DIR/mounts"
       ;;
     unmount)
       shift

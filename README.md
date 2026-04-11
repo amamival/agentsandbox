@@ -4,13 +4,13 @@ This repo boots a NixOS-based development sandbox on a local Linux host.
 
 It gives you a real booted NixOS userland with `systemd`, persistence, and SSH access, while keeping guest root id-mapped instead of mapping directly to the host login user. The target is something closer to a lightweight rootless container VM than a `nix develop` shell.
 
-This is a good fit for packaging, service work, NixOS modules, and NixOS learning in general. You can iterate on a real [`configuration.nix`](/workspace/cont/configuration.nix), rebuild, and observe how services, users, SSH, packages, and persistent state behave together without committing to a full VM workflow.
+This is a good fit for packaging, service work, NixOS modules, and NixOS learning in general. You can iterate on a real [`configuration.nix`](configuration.nix), rebuild, and observe how services, users, SSH, packages, and persistent state behave together without committing to a full VM workflow.
 
 This is not a polished runtime. It is still an experimental launcher with a small amount of host-side setup to boot guest `systemd`.
 
 The intended host platform is recent `amd64` Linux in general, not just NixOS. If this does not run on a reasonably current non-macOS Linux machine, that should be treated as a bug rather than an unsupported edge case.
 
-The entrypoint is [`start.sh`](/workspace/cont/start.sh), which handles sysroot bootstrap, system build, container startup, and re-attach.
+The entrypoint is [`sandbox.sh`](sandbox.sh), which handles sysroot bootstrap, system build, container startup, re-attach, and workspace mounts.
 
 ## Requirements
 
@@ -25,14 +25,15 @@ Host-side dependencies:
 - `passt`
   requires the `pasta` binary
 - `util-linux`
-  requires `unshare` and `nsenter`
+  requires `unshare`, `nsenter`, `mount`, `findmnt`, and `mountpoint`
 - `procps`
-  requires `pgrep`
+  requires `pgrep` and `pkill`
+- `gawk`
 
 On NixOS, this is roughly enough:
 
 ```bash
-nix-shell -p curl jq bubblewrap passt procps
+nix-shell -p curl jq bubblewrap passt procps util-linux gawk
 ```
 
 This is expected to work on recent `amd64` Linux generally, not just on NixOS hosts.
@@ -47,9 +48,10 @@ unshare --user --map-auto --setuid=0 --setgid=0 true && grep "^$USER:" /etc/subu
 ## What It Does
 
 - pulls a `nixos/nix:latest` base sysroot from Docker Hub
-- builds a NixOS system from [`flake.nix`](/workspace/cont/flake.nix) and [`configuration.nix`](/workspace/cont/configuration.nix)
+- builds a NixOS system from [`flake.nix`](flake.nix) and [`configuration.nix`](configuration.nix)
 - starts that system under `unshare`, `pasta`, and `bubblewrap` isolation
 - attaches to the running sandbox with `nsenter`
+- manages registered workspace mounts under `/sandbox/mounts`
 
 Inside the sandbox, `systemd` runs as PID 1. SSH is enabled in the guest and forwarded to host port `2222`.
 
@@ -58,7 +60,7 @@ Inside the sandbox, `systemd` runs as PID 1. SSH is enabled in the guest and for
 Launch a sandbox container:
 
 ```bash
-./start.sh
+./sandbox.sh
 ```
 
 The first boot may ask for `sudo` in order to create and prepare `/sandbox`.
@@ -66,7 +68,7 @@ The first boot may ask for `sudo` in order to create and prepare `/sandbox`.
 Attach to the running sandbox:
 
 ```bash
-./start.sh
+./sandbox.sh
 ```
 
 The script does both. If the sandbox is down, it bootstraps and starts it. If it is already up, it attaches to the guest namespaces.
@@ -81,18 +83,57 @@ On a successful boot, the first terminal stays attached to the guest boot log an
 
 That is the expected steady state. Leave that tab alone, then either:
 
-- open another terminal and run `./start.sh` again to attach locally as root
+- open another terminal and run `./sandbox.sh` again to attach locally as root
 - connect from your editor over SSH to `127.0.0.1:2222`
+
+## Common Commands
+
+```bash
+./sandbox.sh build
+./sandbox.sh up
+./sandbox.sh down
+./sandbox.sh exec -- bash
+./sandbox.sh logs
+./sandbox.sh logs -u sshd -n 50
+./sandbox.sh ssh
+```
+
+- `./sandbox.sh`
+  if the sandbox is running, attach; otherwise rebuild and start it
+- `./sandbox.sh build`
+  prepare `/sandbox` if needed and rebuild the guest system without starting it
+- `./sandbox.sh up`
+  rebuild and start the sandbox; fails if it is already running
+- `./sandbox.sh down`
+  ask guest `systemd` to shut down cleanly with `SIGRTMIN+3`
+- `./sandbox.sh kill`
+  send `TERM` to all processes in the sandbox PID namespace
+- `./sandbox.sh pause`
+  send `STOP` to all processes in the sandbox PID namespace
+- `./sandbox.sh unpause`
+  send `CONT` to all processes in the sandbox PID namespace
+- `./sandbox.sh exec -- cmd ...`
+  run a command in the running sandbox, or omit `cmd` to attach
+- `./sandbox.sh logs [journalctl args ...]`
+  run `journalctl` in the sandbox; default args are `-en1000`
+- `./sandbox.sh ssh [ssh args ...]`
+  run `ssh -p 2222 vscode@127.0.0.1 ...`
 
 ## Access
 
 ### Local Attach
 
-Running `./start.sh` again will find the guest `systemd` process in the same user namespace and enter it with `nsenter`.
+Running `./sandbox.sh` again will find the guest `systemd` process in the same user namespace and enter it with `nsenter`.
+
+To run a single command instead of attaching, use:
+
+```bash
+./sandbox.sh exec -- sh -lc 'id && pwd'
+```
 
 ### SSH
 
-OpenSSH is enabled in the guest. The relevant config lives in [`configuration.nix`](/workspace/cont/configuration.nix).
+OpenSSH is enabled in the guest. The relevant config lives in [`configuration.nix`](configuration.nix).
 
 - host port: `2222`
 - user: `vscode`
@@ -135,6 +176,29 @@ vscode@localhost -p 2222
 
 Guest networking is provided by `pasta`. The sandbox gets outbound network access, and guest SSH is forwarded to host port `2222`.
 
+## Workspace Mounts
+
+Registered workspace mounts are stored in `/sandbox/mounts`.
+
+```bash
+./sandbox.sh add ~/my-project
+./sandbox.sh delete ~/my-project
+./sandbox.sh mount
+./sandbox.sh unmount
+```
+
+- `add`
+  append paths to `/sandbox/mounts` and mount them immediately
+- `delete`
+  remove paths from `/sandbox/mounts` and unmount them
+- `mount`
+  mount every path listed in `/sandbox/mounts`
+- `unmount`
+  unmount every registered path in reverse order
+
+Each host path `/host/path` is exposed in the guest as `/workspace/$(basename /host/path)`. The mount uses the running sandbox's current idmap so files owned by the host user appear as guest UID/GID `1000`.
+That means `add` and `mount` expect a running sandbox.
+
 ## Host State
 
 Runtime state lives under `/sandbox`:
@@ -142,6 +206,7 @@ Runtime state lives under `/sandbox`:
 - `/sandbox/sysroot`
 - `/sandbox/persistent`
 - `/sandbox/sysroot.pid`
+- `/sandbox/mounts`
 
 The first run needs `sudo` only to create and prepare `/sandbox`.
 
@@ -155,12 +220,22 @@ rm -rfv /sandbox/sysroot
 
 ## Stopping
 
-To stop the running sandbox, either interrupt the foreground boot log with `Ctrl-C` or run [`kill.sh`](/workspace/cont/kill.sh).
+Use the built-in subcommands:
 
 ```bash
-./kill.sh
+./sandbox.sh down
+./sandbox.sh kill
+./sandbox.sh pause
+./sandbox.sh unpause
 ```
+
+- `down`
+  clean guest shutdown through `systemd`
+- `kill`
+  send `TERM` to the whole sandbox PID namespace
+- `pause` / `unpause`
+  send `STOP` / `CONT` to the whole sandbox PID namespace
 
 ## Related Projects
 
-- `devsandbox`: [devsandbox/README.md](/workspace/cont/devsandbox/README.md)
+- `devsandbox`: [devsandbox/README.md](devsandbox/README.md)

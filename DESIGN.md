@@ -18,7 +18,7 @@ This is not a polished runtime. It is still an experimental launcher that requir
 
 The target host platform is recent `amd64` Linux in general, not just NixOS. If this does not run on a reasonably current Linux machine, that should be treated as a bug rather than an unsupported edge case.
 
-The entrypoint is [`agentsandbox`](agentsandbox), which handles sysroot bootstrap, system build, libvirt startup, attach, and workspace mounts.
+The entrypoint is [`agentsandbox`](agentsandbox), which handles sysroot bootstrap, system build, libvirt startup, attach, and mounts.
 
 ## Installation
 
@@ -37,7 +37,7 @@ help                Show help
 version             Show version
 doctor              Show diagnostics
 
-init                Copy the initial `flake.nix` and `configuration.nix` into the current directory
+init                Create `.agentsandbox/` and copy the initial `{flake.nix,configuration.nix,allowed_hosts,mounts}`
 build               Build the guest system
 up                  Rebuild and start a VM; fails if it is already running
 down                Tear down the VM gracefully
@@ -89,3 +89,291 @@ In our experiments, *gVisor* could not run *SystemD* as PID 1 because it lacks t
 ## Similar project
 
 [devsandbox](https://github.com/zekker6/devsandbox) - a `bwrap`-based container runtime with request logs, domain filtering, egress secret reduction, `GH_TOKEN` injection, desktop notification, and automatic sharing of tool configuration.
+
+# Design detail
+
+## Design decisions
+
+- Guest builds live under `nixosConfigurations.<name>`, and runtime profiles live
+  under `sandboxConfigurations.<name>`. Each `sandboxConfiguration` selects the
+  `nixosConfiguration` it uses.
+- The execution path is fixed to Linux `qemu:///session`, KVM, libvirt, virtiofs,
+  NixOS, and home-manager.
+- On the first project-less run, if no global config exists, automatically run
+  `agentsandbox init --global` and then continue the build.
+- The host is not assumed to be NixOS. Each instance has its own dedicated
+  `sysroot`. The `/nix` shown to the guest uses the instance `sysroot/nix`, not
+  the host `/nix`.
+- Host-side state lives only under `XDG_CONFIG_HOME`, `XDG_DATA_HOME`,
+  `XDG_STATE_HOME`, and `XDG_RUNTIME_DIR`. `XDG_CACHE_HOME` is not used.
+- The instance id is `<dirname>-<machine-id>`. `machine-id` is persisted on the
+  host and used as the source for the guest machine-id and the libvirt UUID.
+- No extra `current-system` link or host-state metadata JSON is kept.
+- Place `sysroot/` next to `persistent/`.
+- `allowed_hosts` and `mounts` are plain-text files and are always copied from
+  the template. An empty `allowed_hosts` file remains deny-by-default.
+- Generic HTTP filter DSL, `filter-default`, `block-domain`, HTTP ask mode,
+  `proxy filter generate`, and CIDR cache are not part of the design.
+- `.git/config` is not inherited, so `.git/config` sanitization is also not part
+  of the design.
+- `mutableSandboxConfig` is a bool and is used to protect `.agentsandbox` inside
+  the workspace.
+- The initial workspace mount appears in the guest as
+  `/persistent/workspace/<dirname>`. It is stored in the same dynamic `mounts`
+  file as directories added later with `mount`.
+- Dynamic mounts are materialized under `/persistent/workspace` in a private
+  host mount namespace and are exported through the single `/persistent`
+  virtiofs share.
+- OpenSnitch is optional, and its endpoint is provided by the selected
+  `nixosConfiguration`. If the connection to the host is lost, treat it as a
+  security breach and let the watchdog destroy the VM.
+- Logs live under `logs/`. Active log files are uncompressed, and rotated
+  archives use zstd compression. Runtime sockets and pid files live under
+  `XDG_RUNTIME_DIR`.
+- Generate the libvirt domain XML as a path in the Nix store and start the
+  transient domain with `virsh create`.
+- Apply the port-forward set when the domain is created. Reflect changes by
+  recreating the transient domain.
+
+## Configuration resolution
+
+- The local config search target is the first `.agentsandbox/flake.nix` found
+  while walking upward from the workspace.
+- If no local config is found, use `$XDG_CONFIG_HOME/agentsandbox/flake.nix`.
+- `agentsandbox init` creates `.agentsandbox/` in the current directory and
+  copies `{flake.nix,configuration.nix,allowed_hosts,mounts}` into it.
+- `agentsandbox init --global` copies
+  `{flake.nix,configuration.nix,allowed_hosts,mounts}` to
+  `$XDG_CONFIG_HOME/agentsandbox/`.
+- The active config dir is treated as unique across the launcher and is used as
+  the edit target for `allowed_hosts` and `mounts`, the flake build target, and
+  the target for `mutableSandboxConfig` checks.
+
+## Flake contract
+
+- `nixosConfigurations.<name>` represents a guest system build.
+- `nixosConfigurations.<name>` is self-contained and usable directly as
+  `nixos-rebuild --flake <config-dir>#name`, where `<config-dir>` is either
+  `.agentsandbox` or `$XDG_CONFIG_HOME/agentsandbox`.
+- `sandboxConfigurations.<name>` represents a runtime profile.
+- `sandboxConfigurations.<name>` contains at least the following.
+
+```nix
+# Evaluated by launcher with AgentSandbox's nixosModule.
+{
+  nixosConfiguration = "dev"; # Defaults to <name>.
+  mutableSandboxConfig = false;
+  memoryMiB = 8192;
+  vcpus = 4;
+  portForwards = [
+    { proto = "tcp"; host = 2223; guest = 22; }
+  ];
+  libvirtXml = {
+    pkgs,
+    name,
+    uuid,
+    machineId,
+    toplevel,
+    sysrootNixDir,
+    persistentDir,
+    runtimeDir,
+    memoryMiB,
+    vcpus,
+    portForwards,
+  }: pkgs.writeText "domain.xml" ''
+    ...
+  '';
+}
+```
+
+- `toplevel` uses the selected
+  `nixosConfigurations.<name>.config.system.build.toplevel`.
+- `libvirtXml` returns an XML path in the Nix store.
+- The launcher builds the dynamic mount set from the active config dir's
+  `mounts` file. It includes the initial workspace mount and any additional
+  mounts added through `mount`.
+- The OpenSnitch endpoint lives at
+  `services.opensnitch.settings.Server.Address` in the selected
+  `nixosConfiguration`.
+
+## Instance layout
+
+- Split host state per instance as follows.
+
+```text
+$XDG_CONFIG_HOME/agentsandbox/
+  flake.nix
+  configuration.nix
+  allowed_hosts
+  mounts
+
+$XDG_DATA_HOME/agentsandbox/<instance-id>/
+  machine-id
+  sysroot/
+  persistent/
+
+$XDG_STATE_HOME/agentsandbox/<instance-id>/
+  logs/
+    runtime.log
+    requests.jsonl
+    runtime-*.log.zst
+    requests-*.jsonl.zst
+
+$XDG_RUNTIME_DIR/agentsandbox/<instance-id>/
+  lock
+  virtiofs/nix.pid
+  virtiofs/nix.sock
+  virtiofs/persistent.pid
+  virtiofs/persistent.sock
+  mount-helper.pid
+  proxy.pid
+  opensnitch-forward.pid
+  opensnitch-watchdog.pid
+```
+
+- `sysroot/` contains an instance-specific Nix root and the source of guest boot
+  artifacts.
+- `persistent/` is exported to the guest as `/persistent`.
+- `machine-id` is reused after it is created the first time.
+- `mounts` stores the dynamic mount set for the active config, including the
+  initial workspace mount.
+- `logs/` stores the active log files and their rotated archives.
+- The runtime dir contains sockets, pid files, and helper state for the private
+  mount namespace and long-lived sidecars.
+
+## Build flow
+
+- The launcher resolves the active config dir and the selected
+  `sandboxConfiguration`.
+- The launcher resolves the instance id and each XDG path, then ensures
+  `machine-id`.
+- In the first bootstrap phase, the launcher creates the sysroot. The bootstrap
+  source uses the same Nix base sysroot as `sandbox.sh`.
+- The build runs in a Nix environment that uses sysroot as its root and realizes
+  the selected `nixosConfigurations.<name>` `toplevel` into `sysroot/nix/store`.
+- The guest boot path uses `init`, `kernel-params`, kernel, and initrd under the
+  selected `toplevel`.
+- The launcher evaluates the selected `sandboxConfiguration.libvirtXml`, gets an
+  XML path in the Nix store, and passes that path to `virsh create`.
+
+## Guest system contract
+
+- The guest boots with direct kernel boot.
+- The guest root filesystem uses tmpfs, and `/nix` and `/persistent` are
+  mounted with virtiofs.
+- `/nix` exports instance `sysroot/nix` as `read-write,nodev`.
+- `/persistent` exports instance `persistent/` as `read-write,nodev`.
+- The mount entry corresponding to the startup workspace root appears at
+  `/persistent/workspace/<dirname>`.
+- Additional mount entries managed by `mount` and `unmount` appear at
+  `/persistent/workspace/<guest-name>`.
+- The guest `machine-id` uses the same value as instance `machine-id`
+  (`instance-id` is `<dirname>-<machine-id>`).
+- The guest home-manager profile keeps shell and tool integration inside the
+  guest, as in `v1_bwrap`.
+- The guest persistent home uses `/persistent/home/vscode`.
+- `~/.local/bin`, `.npm-global`, `.local/share/*`, and `.local/state/*` are kept
+  as the guest-home compatibility layer.
+
+## Mount export
+
+- The startup workspace root is the directory containing `.agentsandbox` when
+  local config exists, and the startup `cwd` for project-less execution.
+- The active config dir contains a plain-text `mounts` file next to
+  `allowed_hosts`.
+- Each line of `mounts` represents one entry as `<host-path><TAB><guest-name>`.
+- The launcher ensures that `mounts` contains an entry for the startup
+  workspace root, and the guest-visible name of that entry is the basename of
+  the startup workspace root.
+- `mount` adds entries to `mounts`, and `unmount` removes them.
+- The launcher starts a helper in a private host mount namespace and builds a
+  synthetic tree under the exported `persistent/workspace` root.
+- For instances with `mutableSandboxConfig = false`, the startup workspace
+  entry is materialized with `.agentsandbox` read-only inside that synthetic
+  tree.
+- For instances with `mutableSandboxConfig = true`, the startup workspace entry
+  is materialized without that protection.
+- Additional mount entries are materialized as bind mounts under
+  `persistent/workspace/<guest-name>` in the same namespace.
+- The single `virtiofsd` instance for `/persistent` exports that synthetic tree
+  to the guest.
+- `mount` and `unmount` update both the `mounts` file and the helper namespace
+  state for the running instance.
+- The active config dir for the build is always reachable from the launcher.
+
+## Network and proxy
+
+- VM networking uses libvirt user networking with `passt`.
+- `portForwards` is represented as an array of `{ proto, host, guest }` for
+  host-to-guest publication only.
+- Apply all `portForwards` from the selected `sandboxConfiguration` when the
+  domain is created.
+- The `ssh` subcommand uses the `tcp` forward where `guest = 22`.
+- Gateway restriction is enforced with a guest-side firewall, and host-gateway
+  paths are concentrated on the proxy port and the OpenSnitch forward port.
+- `allowed_hosts` uses the plain-text file in the active config dir.
+- `allow-domain` appends normalized host/glob entries after deduplication.
+- `unallow-domain` removes exact-match lines.
+- Allowlist decisions use normalized hosts as keys.
+- Even if vendor-specific live expansion is added in the future, the allowlist
+  file itself remains plain-text host/glob.
+
+## Proxy pipeline
+
+- The proxy runs on the host side and receives the VM's HTTP/S egress.
+- The request pipeline flows in the following order.
+  1. request capture
+  2. credential injection
+  3. host allowlist check
+  4. redaction
+  5. upstream dispatch
+- The only injector explicitly supported in v1 is GitHub.
+- A redaction rule has either `pattern` or
+  `source = value|env|file|env_file_key`.
+- Conflicts between injected credentials and redaction rules are checked at
+  proxy startup.
+- Request logs are recorded as JSONL and include response metadata, filter
+  results, and redaction results.
+- Optional remote receivers are `syslog`, `syslog-remote`, `otlp-http`, and
+  `otlp-grpc`.
+
+## OpenSnitch
+
+- OpenSnitch exists as an optional feature.
+- The selected `nixosConfiguration` contains
+  `services.opensnitch.settings.Server.Address`.
+- OpenSnitch transport is separate from `portForwards`.
+- The launcher starts a helper that connects the host-side UI listener and the
+  forward port visible from the guest.
+- The guest daemon connects to the selected `Server.Address`.
+- The watchdog monitors OpenSnitch connection state and destroys disconnected
+  instances after the grace period.
+- For instances that use OpenSnitch, the baseline is `DefaultAction = "deny"`
+  and `InterceptUnknown = true`.
+
+## Logging
+
+- State logs are collected under `logs/`.
+- The active request log file is `logs/requests.jsonl`.
+- The active non-request log file is `logs/runtime.log`.
+- Request logs append JSON lines to the active file.
+- Non-request logs append line-oriented records with timestamp, component, and
+  message.
+- Rotation renames the previous active file to an archive with a timestamp
+  suffix and compresses it with zstd.
+- Non-request log archives use `logs/runtime-*.log.zst`.
+- Request log archives use `logs/requests-*.jsonl.zst`.
+- `proxy-logs` reads the request log series.
+- Diagnostics from the launcher, proxy, watchdog, and virtiofsd helpers are
+  collected in `logs/runtime.log`.
+
+## Lifecycle
+
+- `build` realizes the selected `nixosConfiguration` `toplevel` into sysroot.
+- `up` starts the runtime helpers and starts the transient domain with
+  `virsh create`.
+- `down` requests guest shutdown.
+- `kill` immediately destroys the transient domain.
+- `destroy` stops the transient domain, removes the instance `sysroot/`, and
+  keeps `persistent/`.
+- `port` resolves the host port from the selected `portForwards`.

@@ -123,7 +123,7 @@ function start_container() {
             --tmpfs / --dev /dev --proc /proc --ro-bind /sys /sys \
             --unshare-cgroup --bind "$CURRENT_CGROUP" /sys/fs/cgroup \
             --bind "$SYSROOT/nix" /nix --bind "$PERSISTENT" /persistent \
-            --ro-bind /etc/resolv.conf /etc/resolv.conf \
+            --ro-bind /etc/resolv.conf /etc/resolv.conf --dev-bind /dev/kvm /dev/kvm --dev-bind /dev/fuse /dev/fuse \
             --clearenv --new-session --as-pid-1 \
         /nix/var/nix/profiles/system/init
 }

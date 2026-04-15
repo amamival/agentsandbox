@@ -1,0 +1,1186 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SRC_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd -P)"
+TEMPLATE_DIR="$SRC_DIR/template"
+if [[ ! -d "$TEMPLATE_DIR" ]]; then
+  TEMPLATE_DIR="$(cd -- "$SRC_DIR/../share/agentsandbox/template" && pwd -P)"
+fi
+
+APP_NAME="agentsandbox"
+DEFAULT_PROFILE="${AGENTSANDBOX_PROFILE:-default}"
+URI="${LIBVIRT_DEFAULT_URI:-qemu:///session}"
+VERSION="${AGENTSANDBOX_VERSION:-0.0.0-dev}"
+RUNTIME_LOG_ROTATE_BYTES="${AGENTSANDBOX_LOG_ROTATE_BYTES:-10485760}"
+PROXY_PORT="${AGENTSANDBOX_PROXY_PORT:-3128}"
+
+function die() {
+  echo "${APP_NAME}: $*" >&2
+  exit 1
+}
+
+function usage() {
+  cat <<'EOF'
+usage: agentsandbox [help|version|doctor|init|build|up|down|kill|pause|unpause|destroy|ps|ssh|exec|logs|stats|wait]
+                    [mount|unmount|port|allow-domain|unallow-domain|proxy-logs]
+
+  help                Show help
+  version             Show version
+  doctor              Show diagnostics
+
+  init                Create .agentsandbox/ and copy the initial template files
+  build               Build the selected guest system into the instance sysroot
+  up                  Rebuild and start a VM; fails if it is already running
+  down                Tear down the VM gracefully
+  kill                Forcibly stop the VM
+  pause               Pause a running VM
+  unpause             Resume a paused VM
+  destroy             Delete the guest system while preserving persistent data
+
+  ps                  Show status of the selected VM
+  ssh                 Connect to a running VM
+  exec                Execute a command in a running VM, or attach if omitted
+  logs                Show guest journal logs
+  stats               Show libvirt domain statistics
+  wait                Wait for the selected VM to stop
+
+  mount               Add a mount now and on future starts, or show current mounts
+  unmount             Remove a mount now and on future starts
+
+  port                Print the host port for a published guest port
+  allow-domain        Add a domain or glob to allowed_hosts
+  unallow-domain      Remove a domain or glob from allowed_hosts
+  proxy-logs          Follow request logs
+EOF
+}
+
+function nssudo() {
+  unshare --map-root-user --setuid=0 --setgid=0 "$@"
+}
+
+function prepare() {
+  local data_dir="$1" state_dir="$2" runtime_dir="$3" machine_id="$4"
+
+  install -d \
+    "$data_dir/sysroot" \
+    "$data_dir/persistent/home/vscode" \
+    "$data_dir/persistent/proxy/mitmproxy" \
+    "$data_dir/persistent/workspace"
+  install -d "$state_dir/logs"
+  touch "$state_dir/logs/runtime.log" "$state_dir/logs/requests.jsonl"
+  if [[ -n "$runtime_dir" ]]; then
+    install -d "$runtime_dir/virtiofs"
+    touch "$runtime_dir/lock"
+  fi
+
+  if [[ -e "$data_dir/machine-id" ]]; then
+    [[ "$(tr -d '\n' < "$data_dir/machine-id")" == "$machine_id" ]] || die "machine-id mismatch in $data_dir"
+  else
+    printf '%s\n' "$machine_id" > "$data_dir/machine-id"
+  fi
+}
+
+function fetch_nixos_dockerhub() {
+  local sysroot="$1" repo="nixos/nix" tag="latest" arch="amd64" os="linux"
+  local registry_endpoint="https://registry-1.docker.io/v2" token manifests manifest manifest_digest blobsums blobsum
+
+  token="$(
+    curl -fsSL "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${repo}:pull" | jq -r .token
+  )"
+  manifests="$(
+    curl -fsSL -H "Authorization: Bearer ${token}" "${registry_endpoint}/${repo}/manifests/${tag}"
+  )"
+  manifest_digest="$(
+    jq -r ".manifests[] | select(.platform.architecture == \"${arch}\" and .platform.os == \"${os}\") | .digest" \
+      <<<"$manifests"
+  )"
+  manifest="$(
+    curl -fsSL -H "Authorization: Bearer ${token}" "${registry_endpoint}/${repo}/manifests/${manifest_digest}"
+  )"
+  blobsums="$(jq -r '.layers[].digest' <<<"$manifest")"
+  while read -r blobsum; do
+    [[ -n "$blobsum" ]] || continue
+    {
+      IFS= read -r -N 2 magic || die "empty registry layer ${blobsum}"
+      if [[ "$magic" == $'\x1f\x8b' ]]; then
+        { printf '%s' "$magic"; cat; } | gzip -dc | nssudo tar xf - -C "$sysroot"
+      else
+        { printf '%s' "$magic"; cat; } | nssudo tar xf - -C "$sysroot"
+      fi
+    } < <(curl -fsSL -H "Authorization: Bearer ${token}" "${registry_endpoint}/${repo}/blobs/${blobsum}")
+  done <<<"$blobsums"
+}
+
+function install_nixos() {
+  local sysroot="$1" active_config_dir="$2" nixos_configuration="$3"
+  local staged_flake="$sysroot/tmp/active-flake"
+  local inner_toplevel=""
+
+  rm -rf "$staged_flake"
+  mkdir -p "$staged_flake"
+  cp -a "$active_config_dir"/. "$staged_flake/"
+  inner_toplevel="$(
+    nssudo bwrap \
+      --bind "$sysroot" / \
+      --ro-bind /etc/resolv.conf /etc/resolv.conf \
+      --proc /proc \
+      --dev /dev \
+      --perms 1777 --tmpfs /dev/shm \
+      /nix/var/nix/profiles/default/bin/nix \
+        --extra-experimental-features 'nix-command flakes' \
+        build \
+        --no-link \
+        --print-out-paths \
+        "/tmp/active-flake#nixosConfigurations.${nixos_configuration}.config.system.build.toplevel"
+  )"
+  printf '%s\n' "${sysroot}${inner_toplevel}"
+}
+
+function ensure_system() {
+  local sysroot="$1" active_config_dir="$2" nixos_configuration="$3"
+
+  [[ -d "$sysroot/nix/store" ]] || fetch_nixos_dockerhub "$sysroot"
+  install_nixos "$sysroot" "$active_config_dir" "$nixos_configuration"
+}
+
+function running_pid() {
+  local domain_name="$1" state=""
+
+  state="$(virsh -c "$URI" domstate "$domain_name" 2>/dev/null || true)"
+  if [[ "$state" == "running" || "$state" == "paused" ]]; then
+    printf '%s\n' "$domain_name"
+    return 0
+  fi
+  return 1
+}
+
+function require_running_pid() {
+  local domain_name="$1"
+
+  running_pid "$domain_name" || die "VM is not running"
+}
+
+function sandbox_exec() {
+  local ssh_port="$1"
+  shift || true
+
+  if [[ "$#" -eq 0 ]]; then
+    exec ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$ssh_port" vscode@127.0.0.1
+  fi
+  exec ssh -t -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$ssh_port" vscode@127.0.0.1 -- "$@"
+}
+
+function mount_workspace() {
+  local helper_pid="$1" persistent_dir="$2" mounts_file="$3" startup_root="$4" startup_name="$5" mutable="$6"
+
+  if [[ -n "$helper_pid" ]] && kill -0 "$helper_pid" 2>/dev/null; then
+    nsenter -t "$helper_pid" -m -- bash "$SCRIPT_PATH" __sync-mounts-inner \
+      "$persistent_dir" "$mounts_file" "$startup_root" "$startup_name" "$mutable"
+  fi
+}
+
+function unmount_workspace() {
+  local helper_pid="$1" persistent_dir="$2" mounts_file="$3" startup_root="$4" startup_name="$5" mutable="$6"
+
+  if [[ -n "$helper_pid" ]] && kill -0 "$helper_pid" 2>/dev/null; then
+    nsenter -t "$helper_pid" -m -- bash "$SCRIPT_PATH" __sync-mounts-inner \
+      "$persistent_dir" "$mounts_file" "$startup_root" "$startup_name" "$mutable"
+  fi
+}
+
+function main() {
+  local cmd="${1:-}" global_flag="0"
+
+  case "$cmd" in
+    help|-h|--help)
+      usage
+      ;;
+    version)
+      printf '%s\n' "$VERSION"
+      ;;
+    __resolve-active-config)
+      local resolve_from="${2:-$PWD}" search_dir="" local_config_dir="" global_config_dir=""
+      local startup_workspace_root="" startup_workspace_name="" config_scope=""
+
+      search_dir="$(readlink -f "$resolve_from")"
+      while :; do
+        if [[ -f "$search_dir/.agentsandbox/flake.nix" ]]; then
+          local_config_dir="$search_dir/.agentsandbox"
+          startup_workspace_root="$search_dir"
+          startup_workspace_name="$(basename "$search_dir")"
+          config_scope="local"
+          break
+        fi
+        [[ "$search_dir" == "/" ]] && break
+        search_dir="$(dirname "$search_dir")"
+      done
+
+      if [[ -n "$local_config_dir" ]]; then
+        printf 'ACTIVE_CONFIG_DIR=%q\n' "$local_config_dir"
+        printf 'STARTUP_WORKSPACE_ROOT=%q\n' "$startup_workspace_root"
+        printf 'STARTUP_WORKSPACE_NAME=%q\n' "$startup_workspace_name"
+        printf 'CONFIG_SCOPE=%q\n' "$config_scope"
+        return 0
+      fi
+
+      global_config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/agentsandbox"
+      if [[ -f "$global_config_dir/flake.nix" ]]; then
+        startup_workspace_root="$(readlink -f "$resolve_from")"
+        startup_workspace_name="$(basename "$startup_workspace_root")"
+        printf 'ACTIVE_CONFIG_DIR=%q\n' "$global_config_dir"
+        printf 'STARTUP_WORKSPACE_ROOT=%q\n' "$startup_workspace_root"
+        printf 'STARTUP_WORKSPACE_NAME=%q\n' "$startup_workspace_name"
+        printf 'CONFIG_SCOPE=%q\n' "global"
+        return 0
+      fi
+
+      die "no active config found; run '${APP_NAME} init' or '${APP_NAME} init --global'"
+      ;;
+    __ensure-active-config)
+      local ensure_from="${2:-$PWD}" search_dir="" global_config_dir=""
+
+      search_dir="$(readlink -f "$ensure_from")"
+      while :; do
+        if [[ -f "$search_dir/.agentsandbox/flake.nix" ]]; then
+          exec bash "$SCRIPT_PATH" __resolve-active-config "$ensure_from"
+        fi
+        [[ "$search_dir" == "/" ]] && break
+        search_dir="$(dirname "$search_dir")"
+      done
+
+      global_config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/agentsandbox"
+      if [[ ! -f "$global_config_dir/flake.nix" ]]; then
+        bash "$SCRIPT_PATH" init --global >/dev/null
+      fi
+      exec bash "$SCRIPT_PATH" __resolve-active-config "$ensure_from"
+      ;;
+    __resolve-instance)
+      local startup_workspace_root="$2" active_config_dir="$3" profile_name="$4"
+      local xdg_data_home="" xdg_state_home="" runtime_base="" machine_id="" instance_name="" instance_id="" uuid=""
+
+      xdg_data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+      xdg_state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
+      runtime_base="${XDG_RUNTIME_DIR:-}"
+      machine_id="$(
+        printf '%s\0%s\0%s\0' \
+          "$(readlink -f "$startup_workspace_root")" \
+          "$(readlink -f "$active_config_dir")" \
+          "$profile_name" \
+          | sha256sum \
+          | awk '{print substr($1, 1, 32)}'
+      )"
+      instance_name="$(basename "$startup_workspace_root")"
+      instance_id="${instance_name}-${machine_id}"
+      uuid="${machine_id:0:8}-${machine_id:8:4}-${machine_id:12:4}-${machine_id:16:4}-${machine_id:20:12}"
+
+      printf 'PROFILE_NAME=%q\n' "$profile_name"
+      printf 'INSTANCE_NAME=%q\n' "$instance_name"
+      printf 'INSTANCE_ID=%q\n' "$instance_id"
+      printf 'MACHINE_ID=%q\n' "$machine_id"
+      printf 'DOMAIN_UUID=%q\n' "$uuid"
+      printf 'DATA_DIR=%q\n' "${xdg_data_home}/agentsandbox/${instance_id}"
+      printf 'STATE_DIR=%q\n' "${xdg_state_home}/agentsandbox/${instance_id}"
+      if [[ -n "$runtime_base" ]]; then
+        printf 'RUNTIME_DIR=%q\n' "${runtime_base}/agentsandbox/${instance_id}"
+      else
+        printf 'RUNTIME_DIR=%q\n' ""
+      fi
+      printf 'DOMAIN_NAME=%q\n' "agentsandbox-${instance_id}"
+      ;;
+    __eval-profile)
+      local config_dir="$2" profile_name="$3" nixos_configuration="" mutable_json="" memory_json="" vcpus_json="" port_json=""
+      local opensnitch_enabled_json="" opensnitch_address=""
+
+      nixos_configuration="$(nix eval --raw "${config_dir}#sandboxConfigurations.${profile_name}.nixosConfiguration")"
+      mutable_json="$(nix eval --json "${config_dir}#sandboxConfigurations.${profile_name}.mutableSandboxConfig")"
+      memory_json="$(nix eval --json "${config_dir}#sandboxConfigurations.${profile_name}.memoryMiB")"
+      vcpus_json="$(nix eval --json "${config_dir}#sandboxConfigurations.${profile_name}.vcpus")"
+      port_json="$(nix eval --json "${config_dir}#sandboxConfigurations.${profile_name}.portForwards")"
+      opensnitch_enabled_json="$(
+        nix eval --json "${config_dir}#nixosConfigurations.${nixos_configuration}.config.services.opensnitch.enable"
+      )"
+      opensnitch_address="$(
+        nix eval --raw "${config_dir}#nixosConfigurations.${nixos_configuration}.config.services.opensnitch.settings.Server.Address"
+      )"
+
+      printf 'NIXOS_CONFIGURATION=%q\n' "$nixos_configuration"
+      printf 'MUTABLE_SANDBOX_CONFIG=%q\n' "$(jq -r . <<<"$mutable_json")"
+      printf 'MEMORY_MIB=%q\n' "$(jq -r . <<<"$memory_json")"
+      printf 'VCPUS=%q\n' "$(jq -r . <<<"$vcpus_json")"
+      printf 'PORT_FORWARDS_JSON=%q\n' "$port_json"
+      printf 'OPENSNITCH_ENABLED=%q\n' "$(jq -r . <<<"$opensnitch_enabled_json")"
+      printf 'OPENSNITCH_ADDRESS=%q\n' "$opensnitch_address"
+      ;;
+    __state)
+      local state_from="${2:-$PWD}" profile_name="${3:-$DEFAULT_PROFILE}"
+      local ACTIVE_CONFIG_DIR="" STARTUP_WORKSPACE_ROOT="" STARTUP_WORKSPACE_NAME="" CONFIG_SCOPE=""
+      local PROFILE_NAME="" INSTANCE_NAME="" INSTANCE_ID="" MACHINE_ID="" DOMAIN_UUID="" DATA_DIR="" STATE_DIR=""
+      local RUNTIME_DIR="" DOMAIN_NAME="" NIXOS_CONFIGURATION="" MUTABLE_SANDBOX_CONFIG="" MEMORY_MIB="" VCPUS=""
+      local PORT_FORWARDS_JSON="" OPENSNITCH_ENABLED="" OPENSNITCH_ADDRESS=""
+
+      eval "$("$SCRIPT_PATH" __resolve-active-config "$state_from")"
+      eval "$("$SCRIPT_PATH" __resolve-instance "$STARTUP_WORKSPACE_ROOT" "$ACTIVE_CONFIG_DIR" "$profile_name")"
+      eval "$("$SCRIPT_PATH" __eval-profile "$ACTIVE_CONFIG_DIR" "$PROFILE_NAME")"
+      printf 'ACTIVE_CONFIG_DIR=%q\n' "$ACTIVE_CONFIG_DIR"
+      printf 'STARTUP_WORKSPACE_ROOT=%q\n' "$STARTUP_WORKSPACE_ROOT"
+      printf 'STARTUP_WORKSPACE_NAME=%q\n' "$STARTUP_WORKSPACE_NAME"
+      printf 'CONFIG_SCOPE=%q\n' "$CONFIG_SCOPE"
+      printf 'PROFILE_NAME=%q\n' "$PROFILE_NAME"
+      printf 'INSTANCE_NAME=%q\n' "$INSTANCE_NAME"
+      printf 'INSTANCE_ID=%q\n' "$INSTANCE_ID"
+      printf 'MACHINE_ID=%q\n' "$MACHINE_ID"
+      printf 'DOMAIN_UUID=%q\n' "$DOMAIN_UUID"
+      printf 'DATA_DIR=%q\n' "$DATA_DIR"
+      printf 'STATE_DIR=%q\n' "$STATE_DIR"
+      printf 'RUNTIME_DIR=%q\n' "$RUNTIME_DIR"
+      printf 'DOMAIN_NAME=%q\n' "$DOMAIN_NAME"
+      printf 'NIXOS_CONFIGURATION=%q\n' "$NIXOS_CONFIGURATION"
+      printf 'MUTABLE_SANDBOX_CONFIG=%q\n' "$MUTABLE_SANDBOX_CONFIG"
+      printf 'MEMORY_MIB=%q\n' "$MEMORY_MIB"
+      printf 'VCPUS=%q\n' "$VCPUS"
+      printf 'PORT_FORWARDS_JSON=%q\n' "$PORT_FORWARDS_JSON"
+      printf 'OPENSNITCH_ENABLED=%q\n' "$OPENSNITCH_ENABLED"
+      printf 'OPENSNITCH_ADDRESS=%q\n' "$OPENSNITCH_ADDRESS"
+      ;;
+    __ensure-startup-mount)
+      local active_config_dir="$2" startup_workspace_root="$3" startup_workspace_name="$4" mounts_file="" startup_line=""
+
+      mounts_file="${active_config_dir}/mounts"
+      [[ -e "$mounts_file" ]] || cp "$TEMPLATE_DIR/mounts" "$mounts_file"
+      startup_line="$(printf '%s\t%s' "$(readlink -f "$startup_workspace_root")" "$startup_workspace_name")"
+      if awk -F $'\t' -v name="$startup_workspace_name" -v root="$(readlink -f "$startup_workspace_root")" '
+        /^[[:space:]]*#/ || NF == 0 { next }
+        ($2 == name && $1 != root) || ($1 == root && $2 != name) { exit 1 }
+      ' "$mounts_file"; then
+        :
+      else
+        die "startup workspace mount conflicts with an existing mounts entry"
+      fi
+      if ! grep -Fxq -- "$startup_line" "$mounts_file" 2>/dev/null; then
+        printf '%s\n' "$startup_line" >> "$mounts_file"
+      fi
+      ;;
+    __mount-helper)
+      local persistent_dir="$2" runtime_log="$3"
+
+      mount --make-rprivate /
+      mkdir -p "$persistent_dir/home/vscode" "$persistent_dir/workspace"
+      printf '%s mount-helper ready %s\n' "$(date -Iseconds)" "$persistent_dir" >> "$runtime_log"
+      exec sleep infinity
+      ;;
+    __sync-mounts-inner)
+      local persistent_dir="$2" mounts_file="$3" startup_root="$4" startup_name="$5" mutable="$6"
+      local mountinfo_line="" mountpoint_path="" src="" guest_name="" dst=""
+
+      mkdir -p "$persistent_dir/home/vscode" "$persistent_dir/workspace"
+      while read -r mountinfo_line; do
+        [[ -n "$mountinfo_line" ]] || continue
+        mountpoint_path="${mountinfo_line%% *}"
+        if mountpoint -q "$mountpoint_path"; then
+          umount "$mountpoint_path" >/dev/null 2>&1 || true
+        fi
+      done < <(
+        awk -v root="$persistent_dir/workspace" '$5 ~ ("^" root "(/|$)") { print $5 }' /proc/self/mountinfo | sort -r
+      )
+
+      while IFS=$'\t' read -r src guest_name; do
+        [[ -n "${src:-}" ]] || continue
+        [[ "${src:0:1}" == "#" ]] && continue
+        [[ -n "${guest_name:-}" ]] || die "invalid mounts entry: ${src}"
+        [[ "$guest_name" != */* ]] || die "guest mount name must not contain /: ${guest_name}"
+        [[ -e "$src" ]] || die "mount source does not exist: ${src}"
+        dst="$persistent_dir/workspace/$guest_name"
+
+        mkdir -p "$dst"
+        mount --rbind "$src" "$dst"
+        if [[ "$mutable" == "false" && "$(readlink -f "$src")" == "$(readlink -f "$startup_root")" && -e "$src/.agentsandbox" ]]; then
+          mkdir -p "$dst/.agentsandbox"
+          mount --bind "$src/.agentsandbox" "$dst/.agentsandbox"
+          mount -o remount,bind,ro "$dst/.agentsandbox"
+        fi
+      done < "$mounts_file"
+      ;;
+    __start-virtiofs-inner)
+      local source_dir="$2" socket_path="$3" pid_path="$4" readonly="$5" runtime_log="$6" pid=""
+
+      rm -f "$socket_path" "$pid_path"
+      if [[ "$readonly" == "1" ]]; then
+        virtiofsd --socket-path "$socket_path" --shared-dir "$source_dir" --sandbox none --readonly >> "$runtime_log" 2>&1 &
+      else
+        virtiofsd --socket-path "$socket_path" --shared-dir "$source_dir" --sandbox none >> "$runtime_log" 2>&1 &
+      fi
+      pid="$!"
+      printf '%s\n' "$pid" > "$pid_path"
+      for pid in $(seq 1 50); do
+        [[ -S "$socket_path" ]] && return 0
+        sleep 0.1
+      done
+      die "timed out waiting for virtiofsd socket: $socket_path"
+      ;;
+    __opensnitch-watchdog)
+      local domain_name="$2" runtime_log="$3" forward_pid_file="$4" forward_port="$5" grace_seconds="${6:-15}"
+      local deadline="" forward_pid="" observed="0"
+
+      deadline=$((SECONDS + grace_seconds))
+      while :; do
+        if [[ ! -r "$forward_pid_file" ]]; then
+          virsh -c "$URI" destroy "$domain_name" >/dev/null 2>&1 || true
+          exit 1
+        fi
+        forward_pid="$(<"$forward_pid_file")"
+        if ! kill -0 "$forward_pid" >/dev/null 2>&1; then
+          printf '%s opensnitch-forward exited\n' "$(date -Iseconds)" >> "$runtime_log"
+          virsh -c "$URI" destroy "$domain_name" >/dev/null 2>&1 || true
+          exit 1
+        fi
+        if ss -tnH state established "( sport = :${forward_port} )" | grep -q .; then
+          observed="1"
+        elif [[ "$observed" == "1" || "$SECONDS" -ge "$deadline" ]]; then
+          printf '%s opensnitch connection lost\n' "$(date -Iseconds)" >> "$runtime_log"
+          virsh -c "$URI" destroy "$domain_name" >/dev/null 2>&1 || true
+          exit 1
+        fi
+        sleep 1
+      done
+      ;;
+    init)
+      shift || true
+      if [[ "${1:-}" == "--global" ]]; then
+        global_flag="1"
+        shift || true
+      fi
+      local init_target=""
+
+      if [[ "$global_flag" == "1" ]]; then
+        init_target="${XDG_CONFIG_HOME:-$HOME/.config}/agentsandbox"
+      else
+        init_target="$PWD/.agentsandbox"
+      fi
+
+      install -d "$init_target"
+      for cmd in flake.nix configuration.nix allowed_hosts mounts; do
+        [[ ! -e "$init_target/$cmd" ]] || die "$init_target/$cmd already exists"
+        install -m 644 "$TEMPLATE_DIR/$cmd" "$init_target/$cmd"
+      done
+      ;;
+    doctor)
+      eval "$("$SCRIPT_PATH" __resolve-active-config "$PWD" 2>/dev/null || true)"
+      printf 'script: %s\n' "$SCRIPT_PATH"
+      printf 'template: %s\n' "$TEMPLATE_DIR"
+      printf 'uri: %s\n' "$URI"
+      command -v nix >/dev/null 2>&1 && printf 'nix: %s\n' "$(command -v nix)" || printf 'nix: missing\n'
+      command -v virsh >/dev/null 2>&1 && printf 'virsh: %s\n' "$(command -v virsh)" || printf 'virsh: missing\n'
+      command -v qemu-system-x86_64 >/dev/null 2>&1 && printf 'qemu: %s\n' "$(command -v qemu-system-x86_64)" || printf 'qemu: missing\n'
+      command -v virtiofsd >/dev/null 2>&1 && printf 'virtiofsd: %s\n' "$(command -v virtiofsd)" || printf 'virtiofsd: missing\n'
+      command -v mitmdump >/dev/null 2>&1 && printf 'mitmdump: %s\n' "$(command -v mitmdump)" || printf 'mitmdump: missing\n'
+      command -v bwrap >/dev/null 2>&1 && printf 'bwrap: %s\n' "$(command -v bwrap)" || printf 'bwrap: missing\n'
+      if [[ -n "${ACTIVE_CONFIG_DIR:-}" ]]; then
+        printf 'active-config: %s\n' "$ACTIVE_CONFIG_DIR"
+      fi
+      ;;
+    build)
+      eval "$("$SCRIPT_PATH" __ensure-active-config "$PWD")"
+      eval "$("$SCRIPT_PATH" __resolve-instance "$STARTUP_WORKSPACE_ROOT" "$ACTIVE_CONFIG_DIR" "$DEFAULT_PROFILE")"
+      eval "$("$SCRIPT_PATH" __eval-profile "$ACTIVE_CONFIG_DIR" "$PROFILE_NAME")"
+      prepare "$DATA_DIR" "$STATE_DIR" "$RUNTIME_DIR" "$MACHINE_ID"
+      bash "$SCRIPT_PATH" __ensure-startup-mount "$ACTIVE_CONFIG_DIR" "$STARTUP_WORKSPACE_ROOT" "$STARTUP_WORKSPACE_NAME" >/dev/null
+      ensure_system "$DATA_DIR/sysroot" "$ACTIVE_CONFIG_DIR" "$NIXOS_CONFIGURATION"
+      ;;
+    up|"")
+      [[ -n "$cmd" ]] && shift || true
+      eval "$("$SCRIPT_PATH" __ensure-active-config "$PWD")"
+      eval "$("$SCRIPT_PATH" __resolve-instance "$STARTUP_WORKSPACE_ROOT" "$ACTIVE_CONFIG_DIR" "$DEFAULT_PROFILE")"
+      eval "$("$SCRIPT_PATH" __eval-profile "$ACTIVE_CONFIG_DIR" "$PROFILE_NAME")"
+      prepare "$DATA_DIR" "$STATE_DIR" "$RUNTIME_DIR" "$MACHINE_ID"
+      bash "$SCRIPT_PATH" __ensure-startup-mount "$ACTIVE_CONFIG_DIR" "$STARTUP_WORKSPACE_ROOT" "$STARTUP_WORKSPACE_NAME" >/dev/null
+      [[ -n "$RUNTIME_DIR" ]] || die "XDG_RUNTIME_DIR is required"
+      [[ -e "$ACTIVE_CONFIG_DIR/allowed_hosts" ]] || cp "$TEMPLATE_DIR/allowed_hosts" "$ACTIVE_CONFIG_DIR/allowed_hosts"
+
+      if running_pid "$DOMAIN_NAME" >/dev/null; then
+        if [[ -z "$cmd" ]]; then
+          shift 0
+          local attach_port=""
+          attach_port="$(
+            jq -r '.[] | select(.proto == "tcp" and .guest == 22) | .host' <<<"$PORT_FORWARDS_JSON" | head -n 1
+          )"
+          sandbox_exec "$attach_port" "$@"
+        fi
+        die "VM is already running"
+      fi
+
+      exec 9>"$RUNTIME_DIR/lock"
+      flock -n 9 || die "another agentsandbox process already owns $RUNTIME_DIR/lock"
+
+      # Log rotation block. Keep this block byte-for-byte aligned with future call sites.
+      log_file="$STATE_DIR/logs/runtime.log"
+      if [[ -f "$log_file" ]]; then
+        size_bytes="$(stat -c %s "$log_file")"
+        if (( size_bytes >= RUNTIME_LOG_ROTATE_BYTES )); then
+          timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+          case "$log_file" in
+            *.jsonl) archive_base="${log_file%.jsonl}-${timestamp}.jsonl" ;;
+            *.log) archive_base="${log_file%.log}-${timestamp}.log" ;;
+            *) archive_base="${log_file}-${timestamp}" ;;
+          esac
+          mv "$log_file" "$archive_base"
+          zstd -fq --rm "$archive_base"
+        fi
+      fi
+      touch "$log_file"
+
+      # Log rotation block. Keep this block byte-for-byte aligned with future call sites.
+      log_file="$STATE_DIR/logs/requests.jsonl"
+      if [[ -f "$log_file" ]]; then
+        size_bytes="$(stat -c %s "$log_file")"
+        if (( size_bytes >= RUNTIME_LOG_ROTATE_BYTES )); then
+          timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+          case "$log_file" in
+            *.jsonl) archive_base="${log_file%.jsonl}-${timestamp}.jsonl" ;;
+            *.log) archive_base="${log_file%.log}-${timestamp}.log" ;;
+            *) archive_base="${log_file}-${timestamp}" ;;
+          esac
+          mv "$log_file" "$archive_base"
+          zstd -fq --rm "$archive_base"
+        fi
+      fi
+      touch "$log_file"
+
+      # Runtime helper cleanup block. Keep this block byte-for-byte aligned with future call sites.
+      for pid_file in \
+        "$RUNTIME_DIR/mount-helper.pid" \
+        "$RUNTIME_DIR/proxy.pid" \
+        "$RUNTIME_DIR/opensnitch-forward.pid" \
+        "$RUNTIME_DIR/opensnitch-watchdog.pid" \
+        "$RUNTIME_DIR/virtiofs/nix.pid" \
+        "$RUNTIME_DIR/virtiofs/persistent.pid"
+      do
+        [[ -r "$pid_file" ]] || continue
+        pid="$(<"$pid_file")"
+        [[ -n "$pid" ]] && kill "$pid" >/dev/null 2>&1 || true
+        rm -f "$pid_file"
+      done
+      rm -f \
+        "$RUNTIME_DIR/proxy-addon.py" \
+        "$RUNTIME_DIR/virtiofs/nix.sock" \
+        "$RUNTIME_DIR/virtiofs/persistent.sock"
+
+      local toplevel_host="" helper_pid="" ssh_port="" xml_path="" kernel_params="" opensnitch_port="" boot_success="0"
+      local github_token="" proxy_addon="" proxy_confdir="" proxy_pid="" log_file="" size_bytes="" timestamp=""
+      local archive_base="" pid_file="" pid=""
+
+      trap '
+        if [[ "$boot_success" != "1" ]]; then
+          virsh -c "$URI" destroy "$DOMAIN_NAME" >/dev/null 2>&1 || true
+          # Runtime helper cleanup block. Keep this block byte-for-byte aligned with future call sites.
+          for pid_file in \
+            "$RUNTIME_DIR/mount-helper.pid" \
+            "$RUNTIME_DIR/proxy.pid" \
+            "$RUNTIME_DIR/opensnitch-forward.pid" \
+            "$RUNTIME_DIR/opensnitch-watchdog.pid" \
+            "$RUNTIME_DIR/virtiofs/nix.pid" \
+            "$RUNTIME_DIR/virtiofs/persistent.pid"
+          do
+            [[ -r "$pid_file" ]] || continue
+            pid="$(<"$pid_file")"
+            [[ -n "$pid" ]] && kill "$pid" >/dev/null 2>&1 || true
+            rm -f "$pid_file"
+          done
+          rm -f \
+            "$RUNTIME_DIR/proxy-addon.py" \
+            "$RUNTIME_DIR/virtiofs/nix.sock" \
+            "$RUNTIME_DIR/virtiofs/persistent.sock"
+        fi
+      ' EXIT
+
+      toplevel_host="$(ensure_system "$DATA_DIR/sysroot" "$ACTIVE_CONFIG_DIR" "$NIXOS_CONFIGURATION")"
+      github_token="${AGENTSANDBOX_GITHUB_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
+      proxy_addon="$RUNTIME_DIR/proxy-addon.py"
+      proxy_confdir="$DATA_DIR/persistent/proxy/mitmproxy"
+      rm -f "$proxy_addon" "$RUNTIME_DIR/proxy.pid"
+      install -d "$proxy_confdir"
+
+      # Proxy sidecar addon. Keep this block byte-for-byte aligned with future call sites.
+      cat >"$proxy_addon" <<'EOF'
+from __future__ import annotations
+
+import fnmatch
+import json
+import os
+from datetime import datetime, timezone
+
+from mitmproxy import http
+
+ALLOWED_HOSTS_FILE = os.environ["AGENTSANDBOX_ALLOWED_HOSTS"]
+REQUEST_LOG = os.environ["AGENTSANDBOX_REQUEST_LOG"]
+GITHUB_TOKEN = os.environ.get("AGENTSANDBOX_GITHUB_TOKEN", "")
+
+
+def normalize_host(value: str) -> str:
+    host = value.strip().lower().rstrip(".")
+    if host.startswith("[") and "]" in host:
+        host = host[1 : host.index("]")]
+    elif ":" in host:
+        host = host.split(":", 1)[0]
+    return host
+
+
+class AgentSandboxProxy:
+    def __init__(self) -> None:
+        self.allowed_hosts = []
+        self.allowed_hosts_mtime = None
+
+    def load_allowed_hosts(self) -> None:
+        try:
+            stat_result = os.stat(ALLOWED_HOSTS_FILE)
+        except FileNotFoundError:
+            self.allowed_hosts = []
+            self.allowed_hosts_mtime = None
+            return
+        if self.allowed_hosts_mtime == stat_result.st_mtime_ns:
+            return
+        loaded = []
+        with open(ALLOWED_HOSTS_FILE, "r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip().lower()
+                if not line or line.startswith("#"):
+                    continue
+                loaded.append(line)
+        self.allowed_hosts = loaded
+        self.allowed_hosts_mtime = stat_result.st_mtime_ns
+
+    def allow_host(self, host: str) -> bool:
+        self.load_allowed_hosts()
+        return any(fnmatch.fnmatch(host, pattern) for pattern in self.allowed_hosts)
+
+    def log_request(self, flow: http.HTTPFlow, filter_action: str, filter_reason: str) -> None:
+        injected = flow.metadata.get("agentsandbox_injected", [])
+        entry = {
+            "time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "method": flow.request.method,
+            "url": flow.request.pretty_url,
+            "host": flow.metadata.get("agentsandbox_host", normalize_host(flow.request.pretty_host)),
+            "status": flow.response.status_code if flow.response else None,
+            "filter": {"action": filter_action, "reason": filter_reason},
+            "credential_injection": injected,
+            "redaction": [],
+        }
+        with open(REQUEST_LOG, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, sort_keys=True))
+            handle.write("\n")
+        flow.metadata["agentsandbox_logged"] = True
+
+    def requestheaders(self, flow: http.HTTPFlow) -> None:
+        host = normalize_host(flow.request.pretty_host)
+        flow.metadata["agentsandbox_host"] = host
+        flow.metadata["agentsandbox_injected"] = []
+        if flow.request.method != "CONNECT" and host == "api.github.com" and GITHUB_TOKEN:
+            if "authorization" not in flow.request.headers:
+                flow.request.headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+                flow.metadata["agentsandbox_injected"] = [{"name": "github", "target": "api.github.com"}]
+        if self.allow_host(host):
+            flow.metadata["agentsandbox_filter"] = ("allow", "")
+            return
+        flow.metadata["agentsandbox_filter"] = ("block", "host_not_allowed")
+        flow.response = http.Response.make(
+            403,
+            b"blocked by agentsandbox\n",
+            {"Content-Type": "text/plain; charset=utf-8"},
+        )
+        self.log_request(flow, "block", "host_not_allowed")
+
+    def response(self, flow: http.HTTPFlow) -> None:
+        if flow.metadata.get("agentsandbox_logged"):
+            return
+        filter_action, filter_reason = flow.metadata.get("agentsandbox_filter", ("allow", ""))
+        self.log_request(flow, filter_action, filter_reason)
+
+
+addons = [AgentSandboxProxy()]
+EOF
+      AGENTSANDBOX_ALLOWED_HOSTS="$ACTIVE_CONFIG_DIR/allowed_hosts" \
+        AGENTSANDBOX_REQUEST_LOG="$STATE_DIR/logs/requests.jsonl" \
+        AGENTSANDBOX_GITHUB_TOKEN="$github_token" \
+        mitmdump \
+          --listen-host 0.0.0.0 \
+          --listen-port "$PROXY_PORT" \
+          --set block_global=false \
+          --set confdir="$proxy_confdir" \
+          --set flow_detail=0 \
+          --set termlog_verbosity=warn \
+          -s "$proxy_addon" >>"$STATE_DIR/logs/runtime.log" 2>&1 &
+      proxy_pid="$!"
+      printf '%s\n' "$proxy_pid" > "$RUNTIME_DIR/proxy.pid"
+      for proxy_pid in $(seq 1 50); do
+        if [[ -f "$proxy_confdir/mitmproxy-ca-cert.pem" ]] \
+          && ss -ltnH "( sport = :${PROXY_PORT} )" | grep -q .; then
+          break
+        fi
+        sleep 0.1
+      done
+      [[ "$proxy_pid" != 50 ]] || die "timed out waiting for proxy on port ${PROXY_PORT}"
+      unshare --mount --fork --pid -- bash "$SCRIPT_PATH" __mount-helper "$DATA_DIR/persistent" "$STATE_DIR/logs/runtime.log" &
+      helper_pid="$!"
+      printf '%s\n' "$helper_pid" > "$RUNTIME_DIR/mount-helper.pid"
+      mount_workspace \
+        "$helper_pid" \
+        "$DATA_DIR/persistent" \
+        "$ACTIVE_CONFIG_DIR/mounts" \
+        "$STARTUP_WORKSPACE_ROOT" \
+        "$STARTUP_WORKSPACE_NAME" \
+        "$MUTABLE_SANDBOX_CONFIG"
+
+      nsenter -t "$helper_pid" -m -- bash "$SCRIPT_PATH" __start-virtiofs-inner \
+        "$DATA_DIR/sysroot/nix" \
+        "$RUNTIME_DIR/virtiofs/nix.sock" \
+        "$RUNTIME_DIR/virtiofs/nix.pid" \
+        0 \
+        "$STATE_DIR/logs/runtime.log"
+      nsenter -t "$helper_pid" -m -- bash "$SCRIPT_PATH" __start-virtiofs-inner \
+        "$DATA_DIR/persistent" \
+        "$RUNTIME_DIR/virtiofs/persistent.sock" \
+        "$RUNTIME_DIR/virtiofs/persistent.pid" \
+        0 \
+        "$STATE_DIR/logs/runtime.log"
+
+      if [[ "$OPENSNITCH_ENABLED" == "true" ]]; then
+        opensnitch_port="${OPENSNITCH_ADDRESS##*:}"
+        socat "TCP-LISTEN:${opensnitch_port},bind=0.0.0.0,reuseaddr,fork" "TCP:127.0.0.1:50051" \
+          >>"$STATE_DIR/logs/runtime.log" 2>&1 &
+        printf '%s\n' "$!" > "$RUNTIME_DIR/opensnitch-forward.pid"
+      fi
+
+      kernel_params="$(tr '\n' ' ' < "$toplevel_host/kernel-params" | sed -e 's/[[:space:]]*$//')"
+      xml_path="$(
+        CONFIG_DIR="$ACTIVE_CONFIG_DIR" \
+        PROFILE_NAME="$PROFILE_NAME" \
+        DOMAIN_NAME="$DOMAIN_NAME" \
+        DOMAIN_UUID="$DOMAIN_UUID" \
+        MACHINE_ID="$MACHINE_ID" \
+        TOPLEVEL_HOST="$toplevel_host" \
+        KERNEL_PARAMS="$kernel_params" \
+        SYSROOT_NIX_DIR="$DATA_DIR/sysroot/nix" \
+        PERSISTENT_DIR="$DATA_DIR/persistent" \
+        RUNTIME_DIR="$RUNTIME_DIR" \
+        MEMORY_MIB_JSON="$(printf '%s' "$MEMORY_MIB")" \
+        VCPUS_JSON="$(printf '%s' "$VCPUS")" \
+        PORT_FORWARDS_JSON="$PORT_FORWARDS_JSON" \
+        nix build --no-link --print-out-paths --impure --expr '
+          let
+            flake = builtins.getFlake (builtins.getEnv "CONFIG_DIR");
+            pkgs = import flake.inputs.nixpkgs { system = builtins.currentSystem; config.allowUnfree = true; };
+            profile = builtins.getAttr (builtins.getEnv "PROFILE_NAME") flake.outputs.sandboxConfigurations;
+          in
+            profile.libvirtXml {
+              inherit pkgs;
+              name = builtins.getEnv "DOMAIN_NAME";
+              uuid = builtins.getEnv "DOMAIN_UUID";
+              machineId = builtins.getEnv "MACHINE_ID";
+              toplevel = builtins.getEnv "TOPLEVEL_HOST";
+              kernelParams = builtins.getEnv "KERNEL_PARAMS";
+              sysrootNixDir = builtins.getEnv "SYSROOT_NIX_DIR";
+              persistentDir = builtins.getEnv "PERSISTENT_DIR";
+              runtimeDir = builtins.getEnv "RUNTIME_DIR";
+              memoryMiB = builtins.fromJSON (builtins.getEnv "MEMORY_MIB_JSON");
+              vcpus = builtins.fromJSON (builtins.getEnv "VCPUS_JSON");
+              portForwards = builtins.fromJSON (builtins.getEnv "PORT_FORWARDS_JSON");
+            }
+        '
+      )"
+
+      virsh -c "$URI" create "$xml_path" >/dev/null
+
+      if [[ "$OPENSNITCH_ENABLED" == "true" ]]; then
+        bash "$SCRIPT_PATH" __opensnitch-watchdog \
+          "$DOMAIN_NAME" \
+          "$STATE_DIR/logs/runtime.log" \
+          "$RUNTIME_DIR/opensnitch-forward.pid" \
+          "$opensnitch_port" \
+          15 &
+        printf '%s\n' "$!" > "$RUNTIME_DIR/opensnitch-watchdog.pid"
+      fi
+
+      ssh_port="$(jq -r '.[] | select(.proto == "tcp" and .guest == 22) | .host' <<<"$PORT_FORWARDS_JSON" | head -n 1)"
+      for helper_pid in $(seq 1 90); do
+        if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=2 \
+          -p "$ssh_port" vscode@127.0.0.1 true >/dev/null 2>&1; then
+          boot_success="1"
+          trap - EXIT
+          if [[ -z "$cmd" ]]; then
+            sandbox_exec "$ssh_port" "$@"
+          fi
+          printf 'ssh -p %s vscode@127.0.0.1\n' "$ssh_port"
+          return 0
+        fi
+        sleep 2
+      done
+
+      die "guest did not become reachable over ssh"
+      ;;
+    down)
+      eval "$("$SCRIPT_PATH" __state "$PWD" "$DEFAULT_PROFILE")"
+      require_running_pid "$DOMAIN_NAME" >/dev/null
+      virsh -c "$URI" shutdown "$DOMAIN_NAME"
+      ;;
+    kill)
+      eval "$("$SCRIPT_PATH" __state "$PWD" "$DEFAULT_PROFILE")"
+      require_running_pid "$DOMAIN_NAME" >/dev/null
+      virsh -c "$URI" destroy "$DOMAIN_NAME"
+      # Runtime helper cleanup block. Keep this block byte-for-byte aligned with future call sites.
+      for pid_file in \
+        "$RUNTIME_DIR/mount-helper.pid" \
+        "$RUNTIME_DIR/proxy.pid" \
+        "$RUNTIME_DIR/opensnitch-forward.pid" \
+        "$RUNTIME_DIR/opensnitch-watchdog.pid" \
+        "$RUNTIME_DIR/virtiofs/nix.pid" \
+        "$RUNTIME_DIR/virtiofs/persistent.pid"
+      do
+        [[ -r "$pid_file" ]] || continue
+        pid="$(<"$pid_file")"
+        [[ -n "$pid" ]] && kill "$pid" >/dev/null 2>&1 || true
+        rm -f "$pid_file"
+      done
+      rm -f \
+        "$RUNTIME_DIR/proxy-addon.py" \
+        "$RUNTIME_DIR/virtiofs/nix.sock" \
+        "$RUNTIME_DIR/virtiofs/persistent.sock"
+      ;;
+    pause)
+      eval "$("$SCRIPT_PATH" __state "$PWD" "$DEFAULT_PROFILE")"
+      require_running_pid "$DOMAIN_NAME" >/dev/null
+      virsh -c "$URI" suspend "$DOMAIN_NAME"
+      ;;
+    unpause)
+      eval "$("$SCRIPT_PATH" __state "$PWD" "$DEFAULT_PROFILE")"
+      require_running_pid "$DOMAIN_NAME" >/dev/null
+      virsh -c "$URI" resume "$DOMAIN_NAME"
+      ;;
+    destroy)
+      eval "$("$SCRIPT_PATH" __state "$PWD" "$DEFAULT_PROFILE")"
+      if running_pid "$DOMAIN_NAME" >/dev/null; then
+        virsh -c "$URI" destroy "$DOMAIN_NAME"
+      fi
+      # Runtime helper cleanup block. Keep this block byte-for-byte aligned with future call sites.
+      for pid_file in \
+        "$RUNTIME_DIR/mount-helper.pid" \
+        "$RUNTIME_DIR/proxy.pid" \
+        "$RUNTIME_DIR/opensnitch-forward.pid" \
+        "$RUNTIME_DIR/opensnitch-watchdog.pid" \
+        "$RUNTIME_DIR/virtiofs/nix.pid" \
+        "$RUNTIME_DIR/virtiofs/persistent.pid"
+      do
+        [[ -r "$pid_file" ]] || continue
+        pid="$(<"$pid_file")"
+        [[ -n "$pid" ]] && kill "$pid" >/dev/null 2>&1 || true
+        rm -f "$pid_file"
+      done
+      rm -f \
+        "$RUNTIME_DIR/proxy-addon.py" \
+        "$RUNTIME_DIR/virtiofs/nix.sock" \
+        "$RUNTIME_DIR/virtiofs/persistent.sock"
+      rm -rf "$DATA_DIR/sysroot"
+      ;;
+    ps)
+      eval "$("$SCRIPT_PATH" __resolve-active-config "$PWD")"
+      eval "$("$SCRIPT_PATH" __resolve-instance "$STARTUP_WORKSPACE_ROOT" "$ACTIVE_CONFIG_DIR" "$DEFAULT_PROFILE")"
+      local domain_state=""
+      domain_state="$(virsh -c "$URI" domstate "$DOMAIN_NAME" 2>/dev/null || printf 'stopped')"
+      printf '%s\t%s\t%s\n' "$INSTANCE_ID" "$DOMAIN_NAME" "$domain_state"
+      ;;
+    port)
+      shift || true
+      eval "$("$SCRIPT_PATH" __state "$PWD" "$DEFAULT_PROFILE")"
+      local guest_port="${1:-22}" guest_proto="${2:-tcp}"
+      jq -r --argjson guest "$guest_port" --arg proto "$guest_proto" '
+        .[] | select(.guest == $guest and .proto == $proto) | .host
+      ' <<<"$PORT_FORWARDS_JSON" | head -n 1
+      ;;
+    ssh)
+      shift || true
+      eval "$("$SCRIPT_PATH" __state "$PWD" "$DEFAULT_PROFILE")"
+      require_running_pid "$DOMAIN_NAME" >/dev/null
+      local ssh_port=""
+      ssh_port="$(jq -r '.[] | select(.proto == "tcp" and .guest == 22) | .host' <<<"$PORT_FORWARDS_JSON" | head -n 1)"
+      exec ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$ssh_port" vscode@127.0.0.1 "$@"
+      ;;
+    exec)
+      shift || true
+      [[ "${1:-}" == "--" ]] && shift || true
+      eval "$("$SCRIPT_PATH" __state "$PWD" "$DEFAULT_PROFILE")"
+      require_running_pid "$DOMAIN_NAME" >/dev/null
+      local exec_port=""
+      exec_port="$(jq -r '.[] | select(.proto == "tcp" and .guest == 22) | .host' <<<"$PORT_FORWARDS_JSON" | head -n 1)"
+      sandbox_exec "$exec_port" "$@"
+      ;;
+    logs)
+      shift || true
+      eval "$("$SCRIPT_PATH" __state "$PWD" "$DEFAULT_PROFILE")"
+      require_running_pid "$DOMAIN_NAME" >/dev/null
+      local logs_port=""
+      logs_port="$(jq -r '.[] | select(.proto == "tcp" and .guest == 22) | .host' <<<"$PORT_FORWARDS_JSON" | head -n 1)"
+      if [[ "$#" -eq 0 ]]; then
+        exec ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$logs_port" \
+          vscode@127.0.0.1 journalctl -en1000
+      fi
+      exec ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$logs_port" \
+        vscode@127.0.0.1 journalctl "$@"
+      ;;
+    stats)
+      eval "$("$SCRIPT_PATH" __state "$PWD" "$DEFAULT_PROFILE")"
+      require_running_pid "$DOMAIN_NAME" >/dev/null
+      local stats_port="" stats_first="" stats_second="" stats_start_ns="" stats_end_ns="" stats_elapsed_ns=""
+      local stats_cpu_1="" stats_cpu_2="" stats_mem_current="" stats_mem_max="" stats_net_rx_1="" stats_net_rx_2=""
+      local stats_net_tx_1="" stats_net_tx_2="" stats_block_rd_1="" stats_block_rd_2="" stats_block_wr_1=""
+      local stats_block_wr_2="" stats_cpu_pct="" stats_mem_pct="" stats_mem_usage="" stats_mem_limit=""
+      local stats_net_io="" stats_block_io="" stats_pids=""
+
+      stats_port="$(jq -r '.[] | select(.proto == "tcp" and .guest == 22) | .host' <<<"$PORT_FORWARDS_JSON" | head -n 1)"
+      stats_first="$(virsh -c "$URI" domstats "$DOMAIN_NAME")"
+      stats_start_ns="$(date +%s%N)"
+      sleep 1
+      stats_second="$(virsh -c "$URI" domstats "$DOMAIN_NAME")"
+      stats_end_ns="$(date +%s%N)"
+      stats_elapsed_ns="$((stats_end_ns - stats_start_ns))"
+      (( stats_elapsed_ns > 0 )) || stats_elapsed_ns=1
+
+      stats_cpu_1="$(awk -F= '$1 == "cpu.time" { print $2; exit }' <<<"$stats_first")"
+      stats_cpu_2="$(awk -F= '$1 == "cpu.time" { print $2; exit }' <<<"$stats_second")"
+      stats_mem_current="$(awk -F= '$1 == "balloon.current" { print $2; exit }' <<<"$stats_second")"
+      stats_mem_max="$(awk -F= '$1 == "balloon.maximum" { print $2; exit }' <<<"$stats_second")"
+      stats_net_rx_1="$(awk -F= '$1 ~ /^net\.[0-9]+\.rx\.bytes$/ { sum += $2 } END { print sum + 0 }' <<<"$stats_first")"
+      stats_net_rx_2="$(awk -F= '$1 ~ /^net\.[0-9]+\.rx\.bytes$/ { sum += $2 } END { print sum + 0 }' <<<"$stats_second")"
+      stats_net_tx_1="$(awk -F= '$1 ~ /^net\.[0-9]+\.tx\.bytes$/ { sum += $2 } END { print sum + 0 }' <<<"$stats_first")"
+      stats_net_tx_2="$(awk -F= '$1 ~ /^net\.[0-9]+\.tx\.bytes$/ { sum += $2 } END { print sum + 0 }' <<<"$stats_second")"
+      stats_block_rd_1="$(awk -F= '$1 ~ /^block\.[0-9]+\.rd\.bytes$/ { sum += $2 } END { print sum + 0 }' <<<"$stats_first")"
+      stats_block_rd_2="$(awk -F= '$1 ~ /^block\.[0-9]+\.rd\.bytes$/ { sum += $2 } END { print sum + 0 }' <<<"$stats_second")"
+      stats_block_wr_1="$(awk -F= '$1 ~ /^block\.[0-9]+\.wr\.bytes$/ { sum += $2 } END { print sum + 0 }' <<<"$stats_first")"
+      stats_block_wr_2="$(awk -F= '$1 ~ /^block\.[0-9]+\.wr\.bytes$/ { sum += $2 } END { print sum + 0 }' <<<"$stats_second")"
+
+      stats_cpu_pct="$(
+        awk -v before="${stats_cpu_1:-0}" -v after="${stats_cpu_2:-0}" -v elapsed="$stats_elapsed_ns" '
+          BEGIN {
+            if (elapsed <= 0 || after < before) {
+              printf "0.00%%"
+            } else {
+              printf "%.2f%%", ((after - before) / elapsed) * 100
+            }
+          }
+        '
+      )"
+      stats_mem_pct="$(
+        awk -v current="${stats_mem_current:-0}" -v limit="${stats_mem_max:-0}" '
+          BEGIN {
+            if (limit <= 0 || current < 0) {
+              printf "0.00%%"
+            } else {
+              printf "%.2f%%", (current / limit) * 100
+            }
+          }
+        '
+      )"
+      stats_mem_usage="$(numfmt --to=iec-i --suffix=B "$(( ${stats_mem_current:-0} * 1024 ))")"
+      stats_mem_limit="$(numfmt --to=iec-i --suffix=B "$(( ${stats_mem_max:-0} * 1024 ))")"
+      stats_net_io="$(
+        printf '%s / %s' \
+          "$(numfmt --to=iec-i --suffix=B "$(( stats_net_rx_2 - stats_net_rx_1 ))")" \
+          "$(numfmt --to=iec-i --suffix=B "$(( stats_net_tx_2 - stats_net_tx_1 ))")"
+      )"
+      stats_block_io="$(
+        printf '%s / %s' \
+          "$(numfmt --to=iec-i --suffix=B "$(( stats_block_rd_2 - stats_block_rd_1 ))")" \
+          "$(numfmt --to=iec-i --suffix=B "$(( stats_block_wr_2 - stats_block_wr_1 ))")"
+      )"
+      if [[ -n "$stats_port" ]]; then
+        stats_pids="$(
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$stats_port" vscode@127.0.0.1 \
+            sh -lc 'ps -e --no-headers | wc -l' 2>/dev/null | tr -d '[:space:]'
+        )"
+      fi
+      [[ -n "${stats_pids:-}" ]] || stats_pids="-"
+      printf '%-42s %8s %17s %8s %17s %17s %5s\n' \
+        "NAME" "CPU %" "MEM USAGE / LIMIT" "MEM %" "NET I/O" "BLOCK I/O" "PIDS"
+      printf '%-42s %8s %17s %8s %17s %17s %5s\n' \
+        "$DOMAIN_NAME" \
+        "$stats_cpu_pct" \
+        "${stats_mem_usage} / ${stats_mem_limit}" \
+        "$stats_mem_pct" \
+        "$stats_net_io" \
+        "$stats_block_io" \
+        "$stats_pids"
+      ;;
+    wait)
+      eval "$("$SCRIPT_PATH" __state "$PWD" "$DEFAULT_PROFILE")"
+      while running_pid "$DOMAIN_NAME" >/dev/null 2>&1; do
+        sleep 1
+      done
+      # Runtime helper cleanup block. Keep this block byte-for-byte aligned with future call sites.
+      for pid_file in \
+        "$RUNTIME_DIR/mount-helper.pid" \
+        "$RUNTIME_DIR/proxy.pid" \
+        "$RUNTIME_DIR/opensnitch-forward.pid" \
+        "$RUNTIME_DIR/opensnitch-watchdog.pid" \
+        "$RUNTIME_DIR/virtiofs/nix.pid" \
+        "$RUNTIME_DIR/virtiofs/persistent.pid"
+      do
+        [[ -r "$pid_file" ]] || continue
+        pid="$(<"$pid_file")"
+        [[ -n "$pid" ]] && kill "$pid" >/dev/null 2>&1 || true
+        rm -f "$pid_file"
+      done
+      rm -f \
+        "$RUNTIME_DIR/proxy-addon.py" \
+        "$RUNTIME_DIR/virtiofs/nix.sock" \
+        "$RUNTIME_DIR/virtiofs/persistent.sock"
+      ;;
+    allow-domain)
+      shift || true
+      [[ -n "${1:-}" ]] || die "usage: ${APP_NAME} allow-domain DOMAIN"
+      eval "$("$SCRIPT_PATH" __resolve-active-config "$PWD")"
+      local allow_host=""
+
+      # Normalize host/glob exactly like the proxy host matcher expects.
+      allow_host="$1"
+      allow_host="${allow_host#http://}"
+      allow_host="${allow_host#https://}"
+      allow_host="${allow_host%%/*}"
+      if [[ "$allow_host" == \[* ]]; then
+        allow_host="${allow_host#[}"
+        allow_host="${allow_host%%]*}"
+      else
+        allow_host="${allow_host%%:*}"
+      fi
+      allow_host="${allow_host,,}"
+      while [[ "$allow_host" == *"." ]]; do
+        allow_host="${allow_host%.}"
+      done
+      [[ -n "$allow_host" ]] || die "empty domain"
+      [[ -e "$ACTIVE_CONFIG_DIR/allowed_hosts" ]] || cp "$TEMPLATE_DIR/allowed_hosts" "$ACTIVE_CONFIG_DIR/allowed_hosts"
+      if ! grep -Fxq -- "$allow_host" "$ACTIVE_CONFIG_DIR/allowed_hosts" 2>/dev/null; then
+        printf '%s\n' "$allow_host" >> "$ACTIVE_CONFIG_DIR/allowed_hosts"
+      fi
+      ;;
+    unallow-domain)
+      shift || true
+      [[ -n "${1:-}" ]] || die "usage: ${APP_NAME} unallow-domain DOMAIN"
+      eval "$("$SCRIPT_PATH" __resolve-active-config "$PWD")"
+      local unallow_host="" unallow_tmp=""
+
+      # Normalize host/glob exactly like the proxy host matcher expects.
+      unallow_host="$1"
+      unallow_host="${unallow_host#http://}"
+      unallow_host="${unallow_host#https://}"
+      unallow_host="${unallow_host%%/*}"
+      if [[ "$unallow_host" == \[* ]]; then
+        unallow_host="${unallow_host#[}"
+        unallow_host="${unallow_host%%]*}"
+      else
+        unallow_host="${unallow_host%%:*}"
+      fi
+      unallow_host="${unallow_host,,}"
+      while [[ "$unallow_host" == *"." ]]; do
+        unallow_host="${unallow_host%.}"
+      done
+      [[ -e "$ACTIVE_CONFIG_DIR/allowed_hosts" ]] || cp "$TEMPLATE_DIR/allowed_hosts" "$ACTIVE_CONFIG_DIR/allowed_hosts"
+      unallow_tmp="$(mktemp)"
+      grep -Fxv -- "$unallow_host" "$ACTIVE_CONFIG_DIR/allowed_hosts" > "$unallow_tmp" || true
+      mv "$unallow_tmp" "$ACTIVE_CONFIG_DIR/allowed_hosts"
+      ;;
+    mount)
+      shift || true
+      eval "$("$SCRIPT_PATH" __resolve-active-config "$PWD")"
+      bash "$SCRIPT_PATH" __ensure-startup-mount "$ACTIVE_CONFIG_DIR" "$STARTUP_WORKSPACE_ROOT" "$STARTUP_WORKSPACE_NAME" >/dev/null
+      if [[ "$#" -eq 0 ]]; then
+        cat "$ACTIVE_CONFIG_DIR/mounts"
+        return 0
+      fi
+      local mount_src="" mount_name="" helper_pid=""
+
+      mount_src="$(readlink -f "$1")"
+      mount_name="${2:-$(basename "$mount_src")}"
+      [[ -e "$mount_src" ]] || die "mount source does not exist: $mount_src"
+      [[ "$mount_name" != */* ]] || die "guest mount name must not contain /"
+      if awk -F $'\t' -v src="$mount_src" -v name="$mount_name" '
+        /^[[:space:]]*#/ || NF == 0 { next }
+        $1 == src && $2 == name { exact = 1; next }
+        $1 == src || $2 == name { conflict = 1 }
+        END {
+          if (conflict) exit 2
+          if (exact) exit 0
+          exit 1
+        }
+      ' "$ACTIVE_CONFIG_DIR/mounts"; then
+        :
+      elif [[ "$?" -eq 1 ]]; then
+        printf '%s\t%s\n' "$mount_src" "$mount_name" >> "$ACTIVE_CONFIG_DIR/mounts"
+      else
+        die "mount path or guest name is already assigned"
+      fi
+      if eval "$("$SCRIPT_PATH" __resolve-instance "$STARTUP_WORKSPACE_ROOT" "$ACTIVE_CONFIG_DIR" "$DEFAULT_PROFILE")" \
+        && [[ -r "$RUNTIME_DIR/mount-helper.pid" ]]; then
+        helper_pid="$(<"$RUNTIME_DIR/mount-helper.pid")"
+        if [[ -n "$helper_pid" ]] && kill -0 "$helper_pid" 2>/dev/null; then
+          eval "$("$SCRIPT_PATH" __eval-profile "$ACTIVE_CONFIG_DIR" "$PROFILE_NAME")"
+          mount_workspace \
+            "$helper_pid" \
+            "$DATA_DIR/persistent" \
+            "$ACTIVE_CONFIG_DIR/mounts" \
+            "$STARTUP_WORKSPACE_ROOT" \
+            "$STARTUP_WORKSPACE_NAME" \
+            "$MUTABLE_SANDBOX_CONFIG"
+        fi
+      fi
+      ;;
+    unmount)
+      shift || true
+      eval "$("$SCRIPT_PATH" __resolve-active-config "$PWD")"
+      bash "$SCRIPT_PATH" __ensure-startup-mount "$ACTIVE_CONFIG_DIR" "$STARTUP_WORKSPACE_ROOT" "$STARTUP_WORKSPACE_NAME" >/dev/null
+      [[ -n "${1:-}" ]] || die "usage: ${APP_NAME} unmount PATH"
+      local unmount_src="" unmount_tmp="" helper_pid=""
+
+      unmount_src="$(readlink -f "$1")"
+      [[ "$unmount_src" != "$(readlink -f "$STARTUP_WORKSPACE_ROOT")" ]] || die "cannot remove the startup workspace mount"
+      unmount_tmp="$(mktemp)"
+      awk -F $'\t' -v src="$unmount_src" '
+        /^[[:space:]]*#/ || NF == 0 { print; next }
+        $1 != src { print }
+      ' "$ACTIVE_CONFIG_DIR/mounts" > "$unmount_tmp"
+      mv "$unmount_tmp" "$ACTIVE_CONFIG_DIR/mounts"
+      if eval "$("$SCRIPT_PATH" __resolve-instance "$STARTUP_WORKSPACE_ROOT" "$ACTIVE_CONFIG_DIR" "$DEFAULT_PROFILE")" \
+        && [[ -r "$RUNTIME_DIR/mount-helper.pid" ]]; then
+        helper_pid="$(<"$RUNTIME_DIR/mount-helper.pid")"
+        if [[ -n "$helper_pid" ]] && kill -0 "$helper_pid" 2>/dev/null; then
+          eval "$("$SCRIPT_PATH" __eval-profile "$ACTIVE_CONFIG_DIR" "$PROFILE_NAME")"
+          unmount_workspace \
+            "$helper_pid" \
+            "$DATA_DIR/persistent" \
+            "$ACTIVE_CONFIG_DIR/mounts" \
+            "$STARTUP_WORKSPACE_ROOT" \
+            "$STARTUP_WORKSPACE_NAME" \
+            "$MUTABLE_SANDBOX_CONFIG"
+        fi
+      fi
+      ;;
+    proxy-logs)
+      shift || true
+      eval "$("$SCRIPT_PATH" __resolve-active-config "$PWD")"
+      eval "$("$SCRIPT_PATH" __resolve-instance "$STARTUP_WORKSPACE_ROOT" "$ACTIVE_CONFIG_DIR" "$DEFAULT_PROFILE")"
+      install -d "$STATE_DIR/logs"
+      touch "$STATE_DIR/logs/requests.jsonl"
+      for request_log in "$STATE_DIR"/logs/requests-*.jsonl.zst; do
+        [[ -e "$request_log" ]] || continue
+        zstd -dc -- "$request_log"
+      done
+      for request_log in "$STATE_DIR"/logs/requests-*.jsonl; do
+        [[ -e "$request_log" && "$request_log" != "$STATE_DIR/logs/requests.jsonl" ]] || continue
+        [[ ! -e "${request_log}.zst" ]] || continue
+        cat -- "$request_log"
+      done
+      exec tail -n +1 -F "$STATE_DIR/logs/requests.jsonl"
+      ;;
+    *)
+      die "unknown subcommand: ${cmd:-<empty>}"
+      ;;
+  esac
+}
+
+main "$@"

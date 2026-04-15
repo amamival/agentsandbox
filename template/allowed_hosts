@@ -1,0 +1,2 @@
+# One host or glob per line.
+# Empty means deny-by-default until allow-domain adds entries.

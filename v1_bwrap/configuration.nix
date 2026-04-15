@@ -216,6 +216,7 @@ let
     nix.settings.experimental-features = "flakes nix-command";
     nix.settings.max-jobs = "auto";
     system.stateVersion = "25.11";
+    nix.settings.system-features = [ "nixos-test" ];
   };
 in
 {

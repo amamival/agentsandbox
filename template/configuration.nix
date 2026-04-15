@@ -13,7 +13,6 @@ let
     boot.kernelParams = [
       "console=ttyS0,115200n8"
       "systemd.journald.forward_to_console=1"
-      "systemd.unit=multi-user.target"
     ];
     fileSystems."/" = {
       device = "none";

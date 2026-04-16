@@ -128,24 +128,17 @@
         security.pki.certificates = [
           ''
             -----BEGIN CERTIFICATE-----
-            MIIDNTCCAh2gAwIBAgIUVFYrhjZWHWbI4jBMzB2GInXhgOAwDQYJKoZIhvcNAQEL
-            BQAwKDESMBAGA1UEAwwJbWl0bXByb3h5MRIwEAYDVQQKDAltaXRtcHJveHkwHhcN
-            MjYwNDE0MTYwNzExWhcNMzYwNDEzMTYwNzExWjAoMRIwEAYDVQQDDAltaXRtcHJv
-            eHkxEjAQBgNVBAoMCW1pdG1wcm94eTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCC
-            AQoCggEBAMXloWBP7mW/7QrEANAyN56ZKjFFWiACp1wigVuQ8pFjXMqbGPgUxdr4
-            iIpXzN/n4Ete0a8dD9uiemmj56rar9DrPua+Ko9R1ZY4lK+0qJNFE7pPjNy4ixM1
-            Rt2B3rLoiILwR5pq4B2RtgTP2HF8nhE1Q0dvctMSzeZS6S8SVdQYiBMuMnCN4I2/
-            ad2bc7yRaCGJ432vuzIvIuD92+uvibDydDDy/9CrmcUHFpUKEZbaVA2AwOFHg8JH
-            tOkfjDYpxyP8qgNAPaHTRk2YZSX2aYH9FwjztgwH/aFh9c4ia7NMQhiAlAnBOq+0
-            BEKo7o57bc9MEhzeUxe9cE/dGNefNw0CAwEAAaNXMFUwDwYDVR0TAQH/BAUwAwEB
-            /zATBgNVHSUEDDAKBggrBgEFBQcDATAOBgNVHQ8BAf8EBAMCAQYwHQYDVR0OBBYE
-            FCHfYeP2gWQBJBzJC+YfHN4dw6J0MA0GCSqGSIb3DQEBCwUAA4IBAQAYUti5mFgV
-            BP+M7wHHXec99Lx5KLRbvQFY0Mg2yLU7/PxLSTJqRPirAur0tLhLeCG93zDJbvg5
-            i5s4+c3s4ex2H87LSq+jcNn5Aw9Ep+s6HJE/utaOGXE+mcz8n1d6xXplncyveoDX
-            R1kKl6UEJFQ4NnK7jVPZ2k12d1kOEM4vY5BALCY4/2hKSkFNDJxZ9F9NKwdkyiQe
-            D9WkvAZbSjDWEkYhfJEM/Lu5C+HGSuEc9FuQ28cC0g4zbpTrw4zxC31KLN+ohtJ+
-            Af+B5PHFZgpU3+MigPNWUBhr7F4SCqUIzls0RyfAX+OIxiygdvUoV/jCoH6rCLRN
-            2UBfUniovrN8
+            MIIB6zCCAZGgAwIBAgIUaYGGUbLG+HkvXvXu3K82ADTaQKEwCgYIKoZIzj0EAwIw
+            HzEdMBsGA1UEAwwUYWdlbnRzYW5kYm94LW1pdG0tY2EwHhcNMjYwNDE2MTIyOTQ4
+            WhcNMzYwNDEzMTIyOTQ4WjAfMR0wGwYDVQQDDBRhZ2VudHNhbmRib3gtbWl0bS1j
+            YTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABES2mEt0z0slKAmT5c8VjPiIupQ6
+            BmDuvsV/2vxcJUW/JAjCoCv5dCdkMqQqx2W2cOqVK13QJlSpNANUlKY8DzKjgaow
+            gacwHQYDVR0OBBYEFFxRZJh9Hi9yytkJ+J9m8H9iC3afMB8GA1UdIwQYMBaAFFxR
+            ZJh9Hi9yytkJ+J9m8H9iC3afMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQD
+            AgGGMBMGA1UdJQQMMAoGCCsGAQUFBwMBMC8GA1UdEQQoMCaCDmF1dGguZG9ja2Vy
+            LmlvghRyZWdpc3RyeS0xLmRvY2tlci5pbzAKBggqhkjOPQQDAgNIADBFAiEAjxp4
+            swt3eD19q8U5jb7en8Mqdk1i4V+uWRzo9lPafIwCIBHvmTTbmRRSZLtqzHzltolS
+            hHRWTSDkZBTwOJ0bWEl7
             -----END CERTIFICATE-----
           ''
         ];

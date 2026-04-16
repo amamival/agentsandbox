@@ -5,45 +5,40 @@
     home-manager.url = "github:nix-community/home-manager/release-25.11";
     home-manager.inputs.nixpkgs.follows = "nixpkgs";
     impermanence.url = "github:nix-community/impermanence";
-    impermanence.inputs.nixpkgs.follows = "nixpkgs";
+    impermanence.inputs.nixpkgs.follows = ""; # Only used in test.
+    impermanence.inputs.home-manager.follows = "";
   };
 
   outputs = { self, nixpkgs, nixpkgs-unstable, home-manager, impermanence, ... }:
     let
-      lib = nixpkgs.lib;
-      system = "x86_64-linux";
-      pkgs = import nixpkgs {
-        inherit system;
-        config.allowUnfree = true;
-      };
-      guestSystem = nixpkgs.lib.nixosSystem {
-        inherit system;
-        specialArgs = {
-          pkgs-unstable = import nixpkgs-unstable { inherit system; config.allowUnfree = true; };
-          inherit nixpkgs;
+      nixosWithOverlay = system: modules:
+        nixpkgs.lib.nixosSystem {
+          inherit system;
+          modules = modules ++ [
+            home-manager.nixosModules.home-manager
+            impermanence.nixosModules.impermanence
+            (_: { nixpkgs.overlays = [ (_: _: self.packages.${system}) ]; })
+          ];
+          specialArgs.pkgs-unstable = import nixpkgs-unstable { inherit system; config.allowUnfree = true; };
+          specialArgs.nixpkgs = nixpkgs;
         };
-        modules = [
-          home-manager.nixosModules.home-manager
-          impermanence.nixosModules.impermanence
-          ./configuration.nix
-        ];
-      };
+      eachSystem = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" ];
+      libvirtKvmSandbox = x: x; # FIXME: NixOS-module abstraction.
     in
     {
-      nixosConfigurations.default = guestSystem;
+      packages = eachSystem (system: {
+        # Extra packages available.
+      });
+      nixosConfigurations.agenthouse = nixosWithOverlay "x86_64-linux" [ ./configuration.nix ];
 
-      sandboxConfigurations.default = {
-        nixosConfiguration = "default";
-        mutableSandboxConfig = false;
+      sandboxConfigurations.agenthouse = libvirtKvmSandbox {
+        # nixosConfiguration = "<attrname>";
+        mutableSandboxConfig = false; # Whether to block write to the sandbox config.
+        # QEMU/KVM configuration.
         memoryMiB = 8192;
         vcpus = 4;
-        portForwards = [
-          {
-            proto = "tcp";
-            host = 2223;
-            guest = 22;
-          }
-        ];
+        portForwards.ssh = { proto = "tcp"; host = 2223; guest = 22; };
+        # FIXME: Provide a template, faster machine configuration.
         libvirtXml = {
           pkgs,
           name,
@@ -57,7 +52,7 @@
           memoryMiB,
           vcpus,
           portForwards,
-        }: pkgs.writeText "agentsandbox-${name}.xml" ''
+        }: pkgs.writeText "${name}.xml" ''
           <domain type='kvm'>
             <name>${name}</name>
             <uuid>${uuid}</uuid>
@@ -68,7 +63,7 @@
               <type arch='x86_64' machine='q35'>hvm</type>
               <kernel>${toplevel}/kernel</kernel>
               <initrd>${toplevel}/initrd</initrd>
-              <cmdline>${lib.escapeXML (lib.removeSuffix "\n" kernelParams)} systemd.machine_id=${machineId}</cmdline>
+              <cmdline>${nixpkgs.lib.escapeXML (nixpkgs.lib.removeSuffix "\n" kernelParams)} systemd.machine_id=${machineId}</cmdline>
             </os>
             <cpu mode='host-passthrough' migratable='off'/>
             <memoryBacking>
@@ -102,11 +97,12 @@
               <interface type='user'>
                 <backend type='passt'/>
                 <model type='virtio'/>
-          ${lib.concatMapStrings (forward: ''
+          ${nixpkgs.lib.concatMapStrings (forward: ''
                   <portForward proto='${forward.proto}'>
                     <range start='${toString forward.host}' to='${toString forward.guest}'/>
                   </portForward>
-          '') portForwards}      </interface>
+          '') portForwards}
+              </interface>
             </devices>
           </domain>
         '';

@@ -62,7 +62,7 @@ let
     networking.useDHCP = true;
     networking.firewall.enable = false;
     networking.proxy.default = "http://10.0.2.2:3128";
-    security.pki.certificateFiles = [ "/persistent/required-ca.pem" ];
+    security.pki.certificateFiles = [ ./required-ca.pem ];
     services.opensnitch = {
       enable = false;
       settings = {

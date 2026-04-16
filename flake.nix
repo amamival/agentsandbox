@@ -13,23 +13,24 @@
       pkgsFor = system: import nixpkgs { inherit system; config.allowUnfree = true; };
     in
     {
-      packages = eachSystem (system:
-        let pkgs = pkgsFor system; in {
-          default = pkgs.stdenvNoCC.mkDerivation {
-            pname = "agentsandbox";
-            version = "0.0.0-dev";
-            src = self;
-            dontUnpack = true;
-            nativeBuildInputs = [ pkgs.makeWrapper ];
-            installPhase = ''
-              mkdir "$out" && cp -a "$src"/{bin,share} "$out/"
-              wrapProgram "$out/bin/agentsandbox" \
-                --prefix PATH : ${pkgs.lib.makeBinPath (with pkgs; [
-                  bubblewrap curl jq libvirt mitmproxy openssh socat util-linux virtiofsd zstd
-                ])}
-            '';
-          };
-        });
+      packages = eachSystem
+        (system:
+          let pkgs = pkgsFor system; in {
+            default = pkgs.stdenvNoCC.mkDerivation {
+              pname = "agentsandbox";
+              version = "0.0.0-dev";
+              src = self;
+              dontUnpack = true;
+              nativeBuildInputs = [ pkgs.makeWrapper ];
+              installPhase = ''
+                mkdir "$out" && cp -r "$src"/{bin,share} "$out/" && chmod -R u+w "$out"
+                wrapProgram "$out/bin/agentsandbox" \
+                  --prefix PATH : ${pkgs.lib.makeBinPath (with pkgs; [
+                    bubblewrap curl jq libvirt mitmproxy openssh socat util-linux virtiofsd zstd
+                  ])} 
+              '';
+            };
+          });
 
       apps = eachSystem (system: {
         default = {
@@ -49,65 +50,32 @@
 
       checks = eachSystem (system:
         let pkgs = pkgsFor system; in {
-          lint = pkgs.runCommand "lint" { } ''${pkgs.shellcheck}/bin/shellcheck ${./bin/agentsandbox} > "$out"'';
-
-          nixos-userns-smoke = pkgs.testers.runNixOSTest {
-            name = "agentsandbox-nixos-userns-smoke";
-            nodes.machine = { pkgs, ... }: {
-              security.unprivilegedUsernsClone = true;
-              security.wrappers.newuidmap.source = "${pkgs.shadow}/bin/newuidmap";
-              security.wrappers.newuidmap.setuid = true;
-              security.wrappers.newgidmap.source = "${pkgs.shadow}/bin/newgidmap";
-              security.wrappers.newgidmap.setuid = true;
-              users.users.vscode = {
-                isNormalUser = true;
-                subUidRanges = [{ startUid = 165536; count = 65536; }];
-                subGidRanges = [{ startGid = 165536; count = 65536; }];
-              };
-              environment.systemPackages = with pkgs; [ util-linux shadow ];
-            };
-            testScript = ''
-              start_all()
-              machine.wait_for_unit("multi-user.target")
-              machine.succeed("su -s /bin/sh -c 'unshare --map-auto --setuid=0 --setgid=0 true' vscode")
-            '';
-          };
-
+          lint = pkgs.runCommand "lint" { } ''${pkgs.shellcheck}/bin/shellcheck ${./bin}/* > "$out"'';
           nixos-e2e = pkgs.testers.runNixOSTest {
             name = "agentsandbox-nixos-e2e";
             nodes.machine = { pkgs, ... }: {
-              security.unprivilegedUsernsClone = true;
-              security.wrappers.newuidmap = {
-                source = "${pkgs.shadow}/bin/newuidmap";
-                setuid = true;
-                owner = "root";
-                group = "root";
-              };
-              security.wrappers.newgidmap = {
-                source = "${pkgs.shadow}/bin/newgidmap";
-                setuid = true;
-                owner = "root";
-                group = "root";
-              };
-              users.users.root = {
-                subUidRanges = [{ startUid = 100000; count = 65536; }];
-                subGidRanges = [{ startGid = 100000; count = 65536; }];
-              };
-              security.pki.certificateFiles = [ ./mitm-proxy-ca.pem ];
+              virtualisation.cores = 8;
+              virtualisation.diskSize = 16 * 1024;
               virtualisation.additionalPaths = [
                 (toString nixpkgs)
                 (toString nixpkgs-unstable)
                 (toString home-manager)
                 (toString impermanence)
               ];
-              virtualisation.diskSize = 65536;
-              virtualisation.memorySize = 12288;
-              virtualisation.cores = 6;
+
+              security.pki.certificateFiles = [ share/agentsandbox/mitm-proxy-ca.pem ];
               networking.interfaces.eth1 = {
                 useDHCP = false;
                 ipv4.addresses = [{ address = "192.168.1.1"; prefixLength = 24; }];
               };
               networking.hosts."192.168.1.2" = [ "auth.docker.io" "registry-1.docker.io" ];
+
+              virtualisation.libvirtd.enable = true;
+              users.users.root = {
+                subUidRanges = [{ startUid = 100000; count = 65536; }];
+                subGidRanges = [{ startGid = 100000; count = 65536; }];
+              };
+
               nix.settings.experimental-features = [ "nix-command" "flakes" ];
               environment.variables.XDG_RUNTIME_DIR = "/run/user/0";
               environment.systemPackages = with pkgs; [
@@ -123,7 +91,6 @@
                 gnused
                 findutils
               ];
-              virtualisation.libvirtd.enable = true;
             };
             nodes.registry = { pkgs, ... }: {
               networking.firewall.enable = false;
@@ -134,14 +101,14 @@
               services.nginx.enable = true;
               services.nginx.virtualHosts."auth.docker.io" = {
                 onlySSL = true;
-                sslCertificate = ./mitm-proxy-ca.pem;
-                sslCertificateKey = ./mitm-proxy-ca.key;
+                sslCertificate = share/agentsandbox/mitm-proxy-ca.pem;
+                sslCertificateKey = share/agentsandbox/mitm-proxy-ca.key;
                 locations."= /token".return = ''200 '{"token":"test"}' '';
               };
               services.nginx.virtualHosts."registry-1.docker.io" = {
                 onlySSL = true;
-                sslCertificate = ./mitm-proxy-ca.pem;
-                sslCertificateKey = ./mitm-proxy-ca.key;
+                sslCertificate = share/agentsandbox/mitm-proxy-ca.pem;
+                sslCertificateKey = share/agentsandbox/mitm-proxy-ca.key;
                 locations."= /v2/nixos/nix/blobs/0".alias = pkgs.runCommand "docker-image-nix-layer" { } ''
                   tar xf ${pkgs.dockerTools.examples.nix} --wildcards '*/layer.tar' -O >layer.tar
                   mkdir -p work/nix/var/nix/profiles
@@ -162,6 +129,7 @@
               machine.succeed("curl -fsS --head https://registry-1.docker.io/v2/nixos/nix/blobs/0")
 
               machine.wait_for_unit("libvirtd.service")
+              machine.succeed("su -s /bin/sh -c 'unshare --map-auto --setuid=0 --setgid=0 true' root")
               machine.succeed("install -d /run/user/0")
               machine.succeed("agentsandbox init")
               machine.succeed("mkdir -p .agentsandbox/_pin .agentsandbox/agentsandbox/_pin")
@@ -193,7 +161,9 @@
               )
               machine.succeed(
                   "eval \"$(agentsandbox __resolve-instance \"$PWD\" \"$PWD/.agentsandbox\" agenthouse)\" && "
-                  + "[[ \"$INSTANCE_ID\" == \"''${INSTANCE_NAME}-''${MACHINE_ID}\" ]]"
+                  + "[[ \"$MACHINE_ID\" =~ ^[0-9a-f]{32}$ ]] && "
+                  + "[[ \"$INSTANCE_NAME\" == \"$(basename \"$PWD\")\" ]] && "
+                  + "[[ \"$DATA_DIR\" == */agentsandbox/\"$INSTANCE_ID\" ]]"
               )
               machine.succeed("agentsandbox allow-domain Example.COM")
               machine.succeed("agentsandbox allow-domain https://example.com/path")
@@ -227,10 +197,16 @@
                   + "[[ \"$machine_id_first\" == \"$machine_id_second\" ]]"
               )
               machine.succeed("agentsandbox up")
+              machine.succeed(
+                  "eval \"$(agentsandbox __resolve-instance \"$PWD\" \"$PWD/.agentsandbox\" agenthouse)\" && "
+                  + "[[ -f \"$STATE_DIR/logs/runtime.log\" && -f \"$STATE_DIR/logs/requests.jsonl\" ]] && "
+                  + "[[ -S \"$RUNTIME_DIR/virtiofs/nix.sock\" && -S \"$RUNTIME_DIR/virtiofs/persistent.sock\" ]]"
+              )
               machine.succeed("agentsandbox ps | grep -F running >/dev/null")
               machine.succeed("agentsandbox port >/dev/null")
               machine.succeed("agentsandbox port 22 tcp | grep -E '^[0-9]+$' >/dev/null")
-              machine.succeed("agentsandbox exec -- uname -a >/dev/null")
+              machine.succeed("agentsandbox ssh whoami | grep -Fx vscode >/dev/null")
+              machine.succeed("agentsandbox exec -- test -d /persistent/home/vscode")
               machine.succeed("agentsandbox logs >/dev/null")
               machine.succeed("agentsandbox stats | grep -F 'CPU %' >/dev/null")
               machine.succeed(
@@ -238,7 +214,7 @@
                   + "mkdir -p \"$STATE_DIR/logs\" && "
                   + "printf '%s\\n' '{\"time\":\"2026-04-15T00:00:00Z\",\"host\":\"old.example\"}' > "
                   + "\"$STATE_DIR/logs/requests-20260415T000000Z.jsonl\" && "
-                  + "zstd -fq \"$STATE_DIR/logs/requests-20260415T000000Z.jsonl\" && "
+                  + "zstd -fq --rm \"$STATE_DIR/logs/requests-20260415T000000Z.jsonl\" && "
                   + "printf '%s\\n' '{\"time\":\"2026-04-15T00:00:01Z\",\"host\":\"new.example\"}' > "
                   + "\"$STATE_DIR/logs/requests.jsonl\""
               )
@@ -263,14 +239,25 @@
                   + "[[ -f /tmp/agsb-wait.done ]]'"
               )
               machine.succeed("agentsandbox up")
+              machine.succeed(
+                  "eval \"$(agentsandbox __resolve-instance \"$PWD\" \"$PWD/.agentsandbox\" agenthouse)\" && "
+                  + "touch \"$DATA_DIR/persistent/canary\""
+              )
               machine.succeed("agentsandbox kill")
+              machine.succeed(
+                  "eval \"$(agentsandbox __resolve-instance \"$PWD\" \"$PWD/.agentsandbox\" agenthouse)\" && "
+                  + "[[ ! -e \"$RUNTIME_DIR/virtiofs/nix.sock\" && ! -e \"$RUNTIME_DIR/virtiofs/persistent.sock\" ]]"
+              )
               machine.succeed("agentsandbox destroy")
               machine.succeed(
                   "eval \"$(agentsandbox __resolve-instance \"$PWD\" \"$PWD/.agentsandbox\" agenthouse)\" && "
-                  + "[[ ! -d \"$DATA_DIR/sysroot\" ]] && [[ -d \"$DATA_DIR/persistent\" ]]"
+                  + "[[ ! -d \"$DATA_DIR/sysroot\" && -f \"$DATA_DIR/persistent/canary\" ]]"
               )
+              machine.succeed("agentsandbox up")
+              machine.succeed("agentsandbox exec -- test -f /persistent/canary")
+              machine.succeed("agentsandbox destroy")
               machine.succeed("agentsandbox wait")
-              machine.succeed("agentsandbox port 50052 tcp || true")
+              machine.succeed("[[ -z \"$(agentsandbox port 50052 tcp)\" ]]")
             '';
           };
         });

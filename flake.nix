@@ -55,10 +55,10 @@
             name = "agentsandbox-nixos-e2e";
             nodes.machine = { pkgs, ... }: {
               virtualisation.cores = 8;
+              virtualisation.memorySize = 8 * 1024;
               virtualisation.diskSize = 16 * 1024;
               virtualisation.additionalPaths = [
                 (toString nixpkgs)
-                (toString nixpkgs-unstable)
                 (toString home-manager)
                 (toString impermanence)
               ];
@@ -135,14 +135,13 @@
               machine.succeed("mkdir -p .agentsandbox/_pin .agentsandbox/agentsandbox/_pin")
               machine.succeed(
                   "cp -a ${toString nixpkgs} .agentsandbox/_pin/nixpkgs && "
-                  + "cp -a ${toString nixpkgs-unstable} .agentsandbox/_pin/nixpkgs-unstable && "
                   + "cp -a ${toString home-manager} .agentsandbox/_pin/home-manager && "
                   + "cp -a ${toString impermanence} .agentsandbox/agentsandbox/_pin/impermanence"
               )
               machine.succeed(
                   "sed -i "
                   + "-e 's|github:NixOS/nixpkgs/nixos-25.11|path:./_pin/nixpkgs|' "
-                  + "-e 's|github:NixOS/nixpkgs/nixos-unstable|path:./_pin/nixpkgs-unstable|' "
+                  + "-e 's|github:NixOS/nixpkgs/nixos-unstable|path:./_pin/nixpkgs|' "
                   + "-e 's|github:nix-community/home-manager/release-25.11|path:./_pin/home-manager|' "
                   + ".agentsandbox/flake.nix"
               )

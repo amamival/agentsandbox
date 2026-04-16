@@ -16,9 +16,25 @@
         portForwards = lib.mkOption {
           type = lib.types.attrsOf (lib.types.submodule {
             options = {
-              proto = lib.mkOption { type = lib.types.str; };
-              host = lib.mkOption { type = lib.types.int; };
-              guest = lib.mkOption { type = lib.types.int; };
+              proto = lib.mkOption { type = lib.types.enum [ "tcp" "udp" ]; };
+              host = lib.mkOption {
+                type = lib.types.addCheck
+                  (lib.types.coercedTo lib.types.int
+                    (n: { start = n; end = n; })
+                    (lib.types.submodule ({ config, ... }: {
+                      options = {
+                        start = lib.mkOption { type = lib.types.int; description = "Host-side port or range start."; };
+                        end = lib.mkOption { type = lib.types.int; description = "Host-side range end (inclusive)."; };
+                      };
+                      config.end = lib.mkDefault config.start;
+                    })))
+                  (h: h.start <= h.end);
+                description = "Published host port(s). Int or { start, end } inclusive range.";
+              };
+              guest = lib.mkOption {
+                type = lib.types.int;
+                description = "Guest port matching host start (libvirt range to; parallel offset for ranges).";
+              };
             };
           });
           default = { ssh = { proto = "tcp"; host = 2223; guest = 22; }; };
@@ -84,11 +100,19 @@
                     <interface type='user'>
                       <backend type='passt'/>
                       <model type='virtio'/>
-              ${lib.concatMapStrings (forward: ''
-                      <portForward proto='${forward.proto}'>
-                        <range start='${toString forward.host}' to='${toString forward.guest}'/>
+              ${lib.concatMapStrings (forward: let
+                h = forward.host;
+                g = forward.guest;
+                rangeXml =
+                  if h.start == h.end then
+                    "<range start='${toString h.start}' to='${toString g}'/>"
+                  else
+                    "<range start='${toString h.start}' end='${toString h.end}' to='${toString g}'/>";
+              in ''
+                      <portForward proto='${lib.escapeXML forward.proto}'>
+                        ${rangeXml}
                       </portForward>
-              '') portForwards}
+              '') (lib.attrValues portForwards)}
                     </interface>
                   </devices>
                 </domain>

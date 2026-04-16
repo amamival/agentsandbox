@@ -5,52 +5,16 @@ let
     wheelUser = "vscode";
   };
 
-  Boot.KVM = {
-    imports = [ "${nixpkgs}/nixos/modules/profiles/qemu-guest.nix" ];
-
-    boot.loader.external.enable = true;
-    boot.loader.external.installHook = "${pkgs.coreutils}/bin/true";
-    boot.kernelParams = [
-      "console=ttyS0,115200n8"
-      "systemd.journald.forward_to_console=1"
-    ];
-    fileSystems."/" = {
-      device = "none";
-      fsType = "tmpfs";
-      options = [ "mode=755" ];
-    };
-    fileSystems."/nix" = {
-      device = "nix";
-      fsType = "virtiofs";
-      neededForBoot = true;
-      options = [ "nodev" ];
-    };
-    fileSystems."/persistent" = {
-      device = "persistent";
-      fsType = "virtiofs";
-      neededForBoot = true;
-      options = [ "nodev" ];
-    };
-    systemd.services."serial-getty@ttyS0".enable = true;
-    services.qemuGuest.enable = true;
-  };
-  Boot.Minimal = {
-    # Closure size reduction.
-    imports = [ "${nixpkgs}/nixos/modules/profiles/minimal.nix" ];
-  };
   Boot.Impermanence = {
     environment.persistence."/persistent" = {
       hideMounts = true;
       allowTrash = true;
       directories = [
         "/etc/nixos"
-        "/var/lib/nixos"
         "/var/log"
         # { directory = "/workspace"; user = HostConf.wheelUser; group = "users"; mode = "u=rwx,g=rx,o="; }
       ];
       files = [
-        "/etc/machine-id"
-        "/etc/ssh/ssh_host_ed25519_key"
         # { file = ""; parentDirectory = { mode = "u=rwx,g=,o="; ... }; }
       ];
     };
@@ -59,18 +23,8 @@ let
 
   Networking = {
     networking.hostName = HostConf.hostName;
-    networking.useDHCP = true;
     networking.firewall.enable = false;
-    networking.proxy.default = "http://10.0.2.2:3128";
-    security.pki.certificateFiles = [ ./required-ca.pem ];
-    services.opensnitch = {
-      enable = false;
-      settings = {
-        Server.Address = "10.0.2.2:50052";
-        DefaultAction = "deny";
-        InterceptUnknown = true;
-      };
-    };
+    services.opensnitch.enable = false;
   };
 
   Shell = {
@@ -122,7 +76,6 @@ let
       enable = true;
       settings.PermitEmptyPasswords = true;
       settings.PermitRootLogin = "yes";
-      hostKeys = [{ type = "ed25519"; path = "/etc/ssh/ssh_host_ed25519_key"; }];
     };
   };
   Services = builtins.attrValues Service;
@@ -137,6 +90,7 @@ let
       extraGroups = [ "wheel" "systemd-journal" ];
     };
     security.sudo.wheelNeedsPassword = false;
+    services.getty.autologinUser = HostConf.wheelUser;
 
     home-manager.users.${HostConf.wheelUser} = { pkgs, ... }: {
       programs.bash.enable = true;
@@ -213,12 +167,14 @@ let
   };
 
   NixOS = {
+    nix.channel.enable = false; # In favor of Nix Flakes.
     nix.gc.automatic = true;
     nix.gc.dates = "Monday 04:00";
     nix.settings.auto-optimise-store = true;
     nix.settings.experimental-features = [ "nix-command" "flakes" ];
     nix.settings.max-jobs = "auto";
     nix.settings.system-features = [ "nixos-test" ];
+    nix.settings.trusted-users = [ HostConf.wheelUser ];
     system.stateVersion = "25.11";
   };
 in

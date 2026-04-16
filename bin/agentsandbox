@@ -7,9 +7,12 @@ TEMPLATE_DIR="$SRC_DIR/template"
 if [[ ! -d "$TEMPLATE_DIR" ]]; then
   TEMPLATE_DIR="$(cd -- "$SRC_DIR/../share/agentsandbox/template" && pwd -P)"
 fi
+FIXED_CA_DIR="$(dirname "$TEMPLATE_DIR")"
+MITM_PROXY_CA_KEY="$FIXED_CA_DIR/mitm-proxy-ca.key"
+MITM_PROXY_CA_PEM="$FIXED_CA_DIR/mitm-proxy-ca.pem"
 
 APP_NAME="agentsandbox"
-DEFAULT_PROFILE="${AGENTSANDBOX_PROFILE:-default}"
+DEFAULT_PROFILE="${AGENTSANDBOX_PROFILE:-agenthouse}"
 URI="${LIBVIRT_DEFAULT_URI:-qemu:///session}"
 VERSION="${AGENTSANDBOX_VERSION:-0.0.0-dev}"
 RUNTIME_LOG_ROTATE_BYTES="${AGENTSANDBOX_LOG_ROTATE_BYTES:-10485760}"
@@ -56,7 +59,11 @@ EOF
 }
 
 function nssudo() {
-  unshare --map-root-user --setuid=0 --setgid=0 "$@"
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$@"
+  else
+    unshare --map-root-user --setuid=0 --setgid=0 "$@"
+  fi
 }
 
 function prepare() {
@@ -289,22 +296,18 @@ function main() {
       printf 'DOMAIN_NAME=%q\n' "agentsandbox-${instance_id}"
       ;;
     __eval-profile)
-      local config_dir="$2" profile_name="$3" nixos_configuration="" mutable_json="" memory_json="" vcpus_json="" port_json=""
+      local config_dir="$2" profile_name="$3" nc="" mutable_json="" memory_json="" vcpus_json="" port_json=""
       local opensnitch_enabled_json="" opensnitch_address=""
 
-      nixos_configuration="$(nix eval --raw "${config_dir}#sandboxConfigurations.${profile_name}.nixosConfiguration")"
-      mutable_json="$(nix eval --json "${config_dir}#sandboxConfigurations.${profile_name}.mutableSandboxConfig")"
-      memory_json="$(nix eval --json "${config_dir}#sandboxConfigurations.${profile_name}.memoryMiB")"
-      vcpus_json="$(nix eval --json "${config_dir}#sandboxConfigurations.${profile_name}.vcpus")"
-      port_json="$(nix eval --json "${config_dir}#sandboxConfigurations.${profile_name}.portForwards")"
-      opensnitch_enabled_json="$(
-        nix eval --json "${config_dir}#nixosConfigurations.${nixos_configuration}.config.services.opensnitch.enable"
-      )"
-      opensnitch_address="$(
-        nix eval --raw "${config_dir}#nixosConfigurations.${nixos_configuration}.config.services.opensnitch.settings.Server.Address"
-      )"
+      nc="${config_dir}#nixosConfigurations.${profile_name}.config"
+      mutable_json="$(nix eval --json "${nc}.agentsandbox.mutableSandboxConfig")"
+      memory_json="$(nix eval --json "${nc}.agentsandbox.memoryMiB")"
+      vcpus_json="$(nix eval --json "${nc}.agentsandbox.vcpus")"
+      port_json="$(nix eval --json "${nc}.agentsandbox.portForwards")"
+      opensnitch_enabled_json="$(nix eval --json "${nc}.services.opensnitch.enable")"
+      opensnitch_address="$(nix eval --raw "${nc}.services.opensnitch.settings.Server.Address")"
 
-      printf 'NIXOS_CONFIGURATION=%q\n' "$nixos_configuration"
+      printf 'NIXOS_CONFIGURATION=%q\n' "$profile_name"
       printf 'MUTABLE_SANDBOX_CONFIG=%q\n' "$(jq -r . <<<"$mutable_json")"
       printf 'MEMORY_MIB=%q\n' "$(jq -r . <<<"$memory_json")"
       printf 'VCPUS=%q\n' "$(jq -r . <<<"$vcpus_json")"
@@ -459,10 +462,12 @@ function main() {
       fi
 
       install -d "$init_target"
-      for cmd in flake.nix configuration.nix allowed_hosts mounts; do
-        [[ ! -e "$init_target/$cmd" ]] || die "$init_target/$cmd already exists"
-        install -m 644 "$TEMPLATE_DIR/$cmd" "$init_target/$cmd"
+      for f in flake.nix configuration.nix allowed_hosts mounts; do
+        [[ ! -e "$init_target/$f" ]] || die "$init_target/$f already exists"
+        install -m 644 "$TEMPLATE_DIR/$f" "$init_target/$f"
       done
+      [[ ! -e "$init_target/agentsandbox" ]] || die "$init_target/agentsandbox already exists"
+      cp -a "$TEMPLATE_DIR/agentsandbox" "$init_target/agentsandbox"
       ;;
     doctor)
       eval "$("$SCRIPT_PATH" __resolve-active-config "$PWD" 2>/dev/null || true)"
@@ -599,6 +604,16 @@ function main() {
       proxy_confdir="$DATA_DIR/persistent/proxy/mitmproxy"
       rm -f "$proxy_addon" "$RUNTIME_DIR/proxy.pid"
       install -d "$proxy_confdir"
+      [[ -f "$MITM_PROXY_CA_KEY" && -f "$MITM_PROXY_CA_PEM" ]] \
+        || die "missing $MITM_PROXY_CA_KEY or $MITM_PROXY_CA_PEM"
+      cat "$MITM_PROXY_CA_KEY" "$MITM_PROXY_CA_PEM" >"$proxy_confdir/mitmproxy-ca.pem"
+      chmod 600 "$proxy_confdir/mitmproxy-ca.pem"
+      cp -f "$MITM_PROXY_CA_PEM" "$proxy_confdir/mitmproxy-ca-cert.pem"
+      rm -f \
+        "$proxy_confdir/mitmproxy-ca-cert.cer" \
+        "$proxy_confdir/mitmproxy-ca-cert.p12" \
+        "$proxy_confdir/mitmproxy-ca.p12" \
+        "$proxy_confdir/mitmproxy-dhparam.pem"
 
       # Proxy sidecar addon. Keep this block byte-for-byte aligned with future call sites.
       cat >"$proxy_addon" <<'EOF'
@@ -769,9 +784,9 @@ EOF
           let
             flake = builtins.getFlake (builtins.getEnv "CONFIG_DIR");
             pkgs = import flake.inputs.nixpkgs { system = builtins.currentSystem; config.allowUnfree = true; };
-            profile = builtins.getAttr (builtins.getEnv "PROFILE_NAME") flake.outputs.sandboxConfigurations;
+            cfg = (builtins.getAttr (builtins.getEnv "PROFILE_NAME") flake.outputs.nixosConfigurations).config.agentsandbox;
           in
-            profile.libvirtXml {
+            cfg.libvirtXml {
               inherit pkgs;
               name = builtins.getEnv "DOMAIN_NAME";
               uuid = builtins.getEnv "DOMAIN_UUID";
@@ -783,7 +798,7 @@ EOF
               runtimeDir = builtins.getEnv "RUNTIME_DIR";
               memoryMiB = builtins.fromJSON (builtins.getEnv "MEMORY_MIB_JSON");
               vcpus = builtins.fromJSON (builtins.getEnv "VCPUS_JSON");
-              portForwards = builtins.fromJSON (builtins.getEnv "PORT_FORWARDS_JSON");
+              portForwards = builtins.attrValues (builtins.fromJSON (builtins.getEnv "PORT_FORWARDS_JSON"));
             }
         '
       )"

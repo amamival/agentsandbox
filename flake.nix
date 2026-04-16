@@ -22,13 +22,11 @@
             dontUnpack = true;
             nativeBuildInputs = [ pkgs.makeWrapper ];
             installPhase = ''
-              install -Dm755 ${./agentsandbox} "$out/bin/agentsandbox"
+              mkdir "$out" && cp -a "$src"/{bin,share} "$out/"
               wrapProgram "$out/bin/agentsandbox" \
                 --prefix PATH : ${pkgs.lib.makeBinPath (with pkgs; [
                   bubblewrap curl jq libvirt mitmproxy openssh socat util-linux virtiofsd zstd
                 ])}
-              install -d "$out/share/agentsandbox"
-              cp -a ${./template} ${./mitm-proxy-ca.pem} ${./mitm-proxy-ca.key} "$out/share/agentsandbox/"
             '';
           };
         });
@@ -51,7 +49,7 @@
 
       checks = eachSystem (system:
         let pkgs = pkgsFor system; in {
-          lint = pkgs.runCommand "lint" { } ''${pkgs.shellcheck}/bin/shellcheck ${./agentsandbox} > "$out"'';
+          lint = pkgs.runCommand "lint" { } ''${pkgs.shellcheck}/bin/shellcheck ${./bin/agentsandbox} > "$out"'';
 
           nixos-userns-smoke = pkgs.testers.runNixOSTest {
             name = "agentsandbox-nixos-userns-smoke";

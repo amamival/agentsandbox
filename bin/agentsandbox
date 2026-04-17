@@ -115,10 +115,8 @@ function require_running() { is_domstate "$1" running || die "VM is not running"
 
 # Open an SSH session into the running guest VM.
 function guest_ssh() {
-  local SSH_USER="$1" SSH_PORT="$2"; shift 2
-  local SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$SSH_PORT" "$SSH_USER@127.0.0.1")
-  (($# == 0)) && exec ssh "${SSH_OPTS[@]}"
-  exec ssh -t "${SSH_OPTS[@]}" -- "$@"
+  local SSH_USER="$1" SSH_PORT="$2"
+  exec ssh "$SSH_USER@127.0.0.1" -p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "${@:3}"
 }
 
 # Attach to the guest virtio-console as emergency fallback when SSH is down.
@@ -156,72 +154,35 @@ function host_port_for_guest() {
   ' <<<"$json" | head -n 1
 }
 
+# Walk up from $1 to find .agentsandbox/flake.nix, else fall back to global config dir, auto-initializing it when absent. Echoes the resolved flake dir.
+function get_or_create_flake_dir() {
+  local d; d="$(readlink -f "$1")"
+  while :; do
+    [[ -f "$d/.agentsandbox/flake.nix" ]] && { echo "$d/.agentsandbox"; return; }
+    [[ "$d" == / ]] && break
+    d="$(dirname "$d")"
+  done
+  d="${XDG_CONFIG_HOME:-$HOME/.config}/agentsandbox"
+  [[ -f "$d/flake.nix" ]] || bash "$SCRIPT_PATH" init --global
+  echo "$d"
+}
+
+# Deterministically derive the per-profile instance id (dirname-profile-machineid), reusing any DATA_ROOT entry whose machine-id suffix matches. Echoes the instance id.
+function get_or_create_instance_id() {
+  local DIRNAME="$1" FLAKE_DIR="$2" PROFILE_NAME="$3" PREFIX_FILE="$2/machine-prefix" MACHINE_ID MATCH=()
+  [[ -f "$PREFIX_FILE" ]] || head -c 12 /dev/urandom | xxd -p > "$PREFIX_FILE"
+  MACHINE_ID="$(<"$PREFIX_FILE")$(printf '%s' "$PROFILE_NAME" | sha256sum | cut -c1-8)"
+  shopt -s nullglob; MATCH=("$DATA_ROOT"/*-"$MACHINE_ID"); shopt -u nullglob
+  basename "${MATCH[0]:-$DATA_ROOT/$DIRNAME-$PROFILE_NAME-$MACHINE_ID}"
+}
+
 function main() {
-  local cmd="${1:-}" global_flag="0"
-
+  local cmd="${1:-}"
   case "$cmd" in
-    help|-h|--help)
-      usage
-      ;;
-    version)
-      printf '%s\n' "$VERSION"
-      ;;
-    __resolve-active-config)
-      local resolve_from="${2:-$PWD}" search_dir="" local_config_dir="" global_config_dir=""
-      local startup_workspace_root="" startup_workspace_name="" config_scope=""
-
-      search_dir="$(readlink -f "$resolve_from")"
-      while :; do
-        if [[ -f "$search_dir/.agentsandbox/flake.nix" ]]; then
-          local_config_dir="$search_dir/.agentsandbox"
-          startup_workspace_root="$search_dir"
-          startup_workspace_name="$(basename "$search_dir")"
-          config_scope="local"
-          break
-        fi
-        [[ "$search_dir" == "/" ]] && break
-        search_dir="$(dirname "$search_dir")"
-      done
-
-      if [[ -n "$local_config_dir" ]]; then
-        printf 'FLAKE_DIR=%q\n' "$local_config_dir"
-        printf 'STARTUP_WORKSPACE_ROOT=%q\n' "$startup_workspace_root"
-        printf 'STARTUP_WORKSPACE_NAME=%q\n' "$startup_workspace_name"
-        printf 'CONFIG_SCOPE=%q\n' "$config_scope"
-        return 0
-      fi
-
-      global_config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/agentsandbox"
-      if [[ -f "$global_config_dir/flake.nix" ]]; then
-        startup_workspace_root="$(readlink -f "$resolve_from")"
-        startup_workspace_name="$(basename "$startup_workspace_root")"
-        printf 'FLAKE_DIR=%q\n' "$global_config_dir"
-        printf 'STARTUP_WORKSPACE_ROOT=%q\n' "$startup_workspace_root"
-        printf 'STARTUP_WORKSPACE_NAME=%q\n' "$startup_workspace_name"
-        printf 'CONFIG_SCOPE=%q\n' "global"
-        return 0
-      fi
-
-      die "no active config found; run '${APP_NAME} init' or '${APP_NAME} init --global'"
-      ;;
-    __ensure-active-config)
-      local ensure_from="${2:-$PWD}" search_dir="" global_config_dir=""
-
-      search_dir="$(readlink -f "$ensure_from")"
-      while :; do
-        if [[ -f "$search_dir/.agentsandbox/flake.nix" ]]; then
-          exec bash "$SCRIPT_PATH" __resolve-active-config "$ensure_from"
-        fi
-        [[ "$search_dir" == "/" ]] && break
-        search_dir="$(dirname "$search_dir")"
-      done
-
-      global_config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/agentsandbox"
-      if [[ ! -f "$global_config_dir/flake.nix" ]]; then
-        bash "$SCRIPT_PATH" init --global >/dev/null
-      fi
-      exec bash "$SCRIPT_PATH" __resolve-active-config "$ensure_from"
-      ;;
+    help|-h|--help) usage;;
+    version) echo "$VERSION";;
+    __get_or_create_flake_dir) get_or_create_flake_dir "${2:-$PWD}";;
+    __get_or_create_instance_id) get_or_create_instance_id "$2" "$3" "$4";;
     __resolve-instance)
       local startup_workspace_root="$2" flake_dir="$3" profile_name="$4"
       local prefix_file prefix profile_hash machine_id dirname instance_id uuid match=()
@@ -274,7 +235,7 @@ function main() {
       local RUNTIME_DIR="" FLAKE_ATTR="" MUTABLE_SANDBOX_CONFIG="" MEMORY_MIB="" VCPUS=""
       local PORT_FORWARDS_JSON="" OPENSNITCH_ENABLED="" OPENSNITCH_ADDRESS=""
 
-      eval "$("$SCRIPT_PATH" __resolve-active-config "$state_from")"
+      FLAKE_DIR="$(get_or_create_flake_dir "$state_from")"
       eval "$("$SCRIPT_PATH" __resolve-instance "$STARTUP_WORKSPACE_ROOT" "$FLAKE_DIR" "$profile_name")"
       eval "$("$SCRIPT_PATH" __eval-profile "$FLAKE_DIR" "$PROFILE_NAME")"
       printf 'FLAKE_DIR=%q\n' "$FLAKE_DIR"
@@ -399,29 +360,13 @@ function main() {
       done
       ;;
     init)
-      shift || true
-      if [[ "${1:-}" == "--global" ]]; then
-        global_flag="1"
-        shift || true
-      fi
-      local init_target=""
-
-      if [[ "$global_flag" == "1" ]]; then
-        init_target="${XDG_CONFIG_HOME:-$HOME/.config}/agentsandbox"
-      else
-        init_target="$PWD/.agentsandbox"
-      fi
-
-      install -d "$init_target"
-      for f in flake.nix configuration.nix allowed_hosts mounts; do
-        [[ ! -e "$init_target/$f" ]] || die "$init_target/$f already exists"
-        install -m 644 "$TEMPLATE_DIR/$f" "$init_target/$f"
-      done
-      [[ ! -e "$init_target/agentsandbox" ]] || die "$init_target/agentsandbox already exists"
-      cp -a "$TEMPLATE_DIR/agentsandbox" "$init_target/agentsandbox"
+      local INIT_TARGET="$PWD/.agentsandbox"
+      [[ "${2:-}" == "--global" ]] && INIT_TARGET="${XDG_CONFIG_HOME:-$HOME/.config}/agentsandbox"
+      [[ ! -e "$INIT_TARGET" ]] || die "$INIT_TARGET already exists"
+      cp -aT "$TEMPLATE_DIR" "$INIT_TARGET"
       ;;
     doctor)
-      eval "$("$SCRIPT_PATH" __resolve-active-config "$PWD" 2>/dev/null || true)"
+      FLAKE_DIR="$(get_or_create_flake_dir "$PWD" 2>/dev/null || true)"
       printf 'script: %s\n' "$SCRIPT_PATH"
       printf 'template: %s\n' "$TEMPLATE_DIR"
       printf 'uri: %s\n' "$URI"
@@ -436,7 +381,7 @@ function main() {
       fi
       ;;
     build)
-      eval "$("$SCRIPT_PATH" __ensure-active-config "$PWD")"
+      FLAKE_DIR="$(get_or_create_flake_dir "$PWD")"
       eval "$("$SCRIPT_PATH" __resolve-instance "$STARTUP_WORKSPACE_ROOT" "$FLAKE_DIR" "$AS_NIXOS_ATTR")"
       eval "$("$SCRIPT_PATH" __eval-profile "$FLAKE_DIR" "$PROFILE_NAME")"
       [[ -n "$RUNTIME_DIR" ]] || die "XDG_RUNTIME_DIR is required"
@@ -448,7 +393,7 @@ function main() {
       [[ -n "$cmd" ]] && shift || true
       local DETACH=0
       [[ "${1:-}" == "-d" ]] && { DETACH=1; }
-      eval "$("$SCRIPT_PATH" __ensure-active-config "$PWD")"
+      FLAKE_DIR="$(get_or_create_flake_dir "$PWD")"
       eval "$("$SCRIPT_PATH" __resolve-instance "$STARTUP_WORKSPACE_ROOT" "$FLAKE_DIR" "$AS_NIXOS_ATTR")"
       eval "$("$SCRIPT_PATH" __eval-profile "$FLAKE_DIR" "$PROFILE_NAME")"
       [[ -n "$RUNTIME_DIR" ]] || die "XDG_RUNTIME_DIR is required"
@@ -812,7 +757,7 @@ EOF
       rm -rf "$DATA_DIR/sysroot"
       ;;
     ps)
-      eval "$("$SCRIPT_PATH" __resolve-active-config "$PWD")"
+      FLAKE_DIR="$(get_or_create_flake_dir "$PWD")"
       eval "$("$SCRIPT_PATH" __resolve-instance "$STARTUP_WORKSPACE_ROOT" "$FLAKE_DIR" "$AS_NIXOS_ATTR")"
       local domain_state=""
       domain_state="$(virsh -c "$URI" domstate "$INSTANCE_ID" 2>/dev/null || printf 'stopped')"
@@ -969,7 +914,7 @@ EOF
     allow-domain)
       shift || true
       [[ -n "${1:-}" ]] || die "usage: ${APP_NAME} allow-domain DOMAIN"
-      eval "$("$SCRIPT_PATH" __resolve-active-config "$PWD")"
+      FLAKE_DIR="$(get_or_create_flake_dir "$PWD")"
       local allow_host=""
 
       # Normalize host/glob exactly like the proxy host matcher expects.
@@ -996,7 +941,7 @@ EOF
     unallow-domain)
       shift || true
       [[ -n "${1:-}" ]] || die "usage: ${APP_NAME} unallow-domain DOMAIN"
-      eval "$("$SCRIPT_PATH" __resolve-active-config "$PWD")"
+      FLAKE_DIR="$(get_or_create_flake_dir "$PWD")"
       local unallow_host="" unallow_tmp=""
 
       # Normalize host/glob exactly like the proxy host matcher expects.
@@ -1021,7 +966,7 @@ EOF
       ;;
     mount)
       shift || true
-      eval "$("$SCRIPT_PATH" __resolve-active-config "$PWD")"
+      FLAKE_DIR="$(get_or_create_flake_dir "$PWD")"
       bash "$SCRIPT_PATH" __ensure-startup-mount "$FLAKE_DIR" "$STARTUP_WORKSPACE_ROOT" "$STARTUP_WORKSPACE_NAME" >/dev/null
       if [[ "$#" -eq 0 ]]; then
         cat "$FLAKE_DIR/mounts"
@@ -1066,7 +1011,7 @@ EOF
       ;;
     unmount)
       shift || true
-      eval "$("$SCRIPT_PATH" __resolve-active-config "$PWD")"
+      FLAKE_DIR="$(get_or_create_flake_dir "$PWD")"
       bash "$SCRIPT_PATH" __ensure-startup-mount "$FLAKE_DIR" "$STARTUP_WORKSPACE_ROOT" "$STARTUP_WORKSPACE_NAME" >/dev/null
       [[ -n "${1:-}" ]] || die "usage: ${APP_NAME} unmount PATH"
       local unmount_src="" unmount_tmp="" helper_pid=""
@@ -1096,7 +1041,7 @@ EOF
       ;;
     proxy-logs)
       shift || true
-      eval "$("$SCRIPT_PATH" __resolve-active-config "$PWD")"
+      FLAKE_DIR="$(get_or_create_flake_dir "$PWD")"
       eval "$("$SCRIPT_PATH" __resolve-instance "$STARTUP_WORKSPACE_ROOT" "$FLAKE_DIR" "$AS_NIXOS_ATTR")"
       install -d "$STATE_DIR/logs"
       touch "$STATE_DIR/logs/requests.jsonl"

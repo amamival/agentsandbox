@@ -134,7 +134,18 @@
           "panic=1" # Since we can't manually respond to a panic, just reboot.
           "boot.panic_on_fail" # Panics on boot failure.
           "systemd.journald.forward_to_console=1" # Show progress while running tests.
+          "console=ttyS0,115200n8" # Used by console subcommand.
         ];
+        services.getty.autologinUser = "root";
+        # Service.OpenSSH, used by exec/ssh subcommand.
+        security.pam.services.sshd.allowNullPassword = true;
+        services.openssh = {
+          enable = true;
+          settings.PermitEmptyPasswords = true;
+          settings.PermitRootLogin = "yes";
+        };
+        users.allowNoPasswordLogin = true;
+
 
         # Impermanence
         fileSystems."/persistent" = { neededForBoot = true; device = "persistent"; fsType = "virtiofs"; options = [ "nosuid" "nodev" ]; };

@@ -26,6 +26,6 @@
       packages = eachSystem (system: {
         # Extra packages available.
       });
-      nixosConfigurations.agenthouse = nixosWithOverlay "x86_64-linux" [ ./configuration.nix ];
+      nixosConfigurations.default = nixosWithOverlay "x86_64-linux" [ ./configuration.nix ];
     };
 }

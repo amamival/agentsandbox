@@ -82,7 +82,6 @@ let
 
   Users = {
     users.mutableUsers = false;
-    users.allowNoPasswordLogin = true;
     users.users.${HostConf.wheelUser} = {
       isNormalUser = true;
       uid = 1000;
@@ -90,7 +89,6 @@ let
       extraGroups = [ "wheel" "systemd-journal" ];
     };
     security.sudo.wheelNeedsPassword = false;
-    services.getty.autologinUser = HostConf.wheelUser;
 
     home-manager.users.${HostConf.wheelUser} = { pkgs, ... }: {
       programs.bash.enable = true;

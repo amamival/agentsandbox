@@ -60,6 +60,7 @@ port                Prints the public port for a port binding.
 allow-domain        Add a firewall rule that allows outbound traffic to a domain
 unallow-domain      Remove the rule for the domain
 proxy-logs          Follow MITM proxy logs
+verify              Verify and repair build
 ```
 <!--[notimpl]
 #systemd             create systemd unit file and register its compose stacks
@@ -106,8 +107,18 @@ In our experiments, *gVisor* could not run *SystemD* as PID 1 because it lacks t
   the host `/nix`.
 - Host-side state lives only under `XDG_CONFIG_HOME`, `XDG_DATA_HOME`,
   `XDG_STATE_HOME`, and `XDG_RUNTIME_DIR`. `XDG_CACHE_HOME` is not used.
-- The instance id is `<dirname>-<machine-id>`. `machine-id` is persisted on the
-  host and used as the source for the guest machine-id and the libvirt UUID.
+- Instance identity is `machine-id` (32 hex chars): `machine-prefix` (24 hex,
+  persisted in `<active-config>/machine-prefix` on first resolve) + `profile-hash`
+  (sha256 of profile name, first 8 hex). `machine-id` is the guest machine-id
+  source and the libvirt UUID source.
+- `instance-id` is the dir/domain-name form `<dirname>-<profile>-<machine-id>`
+  (display prefix + match key). Lookup matches by `*-<machine-id>` so workspace
+  rename/move stays transparent; the libvirt domain name reuses `instance-id`.
+- Local scope (`<workspace>/.agentsandbox/machine-prefix`): worktree sharing vs.
+  isolation is controlled by git tracking of the prefix (tracked = shared,
+  untracked = each worktree regenerates on first use).
+- Global scope (`$XDG_CONFIG_HOME/agentsandbox/machine-prefix`): single instance
+  per profile shared across all workspaces using the global config.
 - No extra `current-system` link or host-state metadata JSON is kept.
 - Place `sysroot/` next to `persistent/`.
 - `allowed_hosts` and `mounts` are plain-text files and are always copied from
@@ -208,7 +219,6 @@ $XDG_CONFIG_HOME/agentsandbox/
   mounts
 
 $XDG_DATA_HOME/agentsandbox/<instance-id>/
-  machine-id
   sysroot/
   persistent/
 
@@ -234,7 +244,6 @@ $XDG_RUNTIME_DIR/agentsandbox/<instance-id>/
 - `sysroot/` contains an instance-specific Nix root and the source of guest boot
   artifacts.
 - `persistent/` is exported to the guest as `/persistent`.
-- `machine-id` is reused after it is created the first time.
 - `mounts` stores the dynamic mount set for the active config, including the
   initial workspace mount.
 - `logs/` stores the active log files and their rotated archives.
@@ -245,8 +254,7 @@ $XDG_RUNTIME_DIR/agentsandbox/<instance-id>/
 
 - The launcher resolves the active config dir and the selected
   `sandboxConfiguration`.
-- The launcher resolves the instance id and each XDG path, then ensures
-  `machine-id`.
+- The launcher resolves the instance id and each XDG path.
 - In the first bootstrap phase, the launcher creates the sysroot. The bootstrap
   source uses the same Nix base sysroot as `sandbox.sh`.
 - The build runs in a Nix environment that uses sysroot as its root and realizes
@@ -267,8 +275,8 @@ $XDG_RUNTIME_DIR/agentsandbox/<instance-id>/
   `/persistent/workspace/<dirname>`.
 - Additional mount entries managed by `mount` and `unmount` appear at
   `/persistent/workspace/<guest-name>`.
-- The guest `machine-id` uses the same value as instance `machine-id`
-  (`instance-id` is `<dirname>-<machine-id>`).
+- The guest `machine-id` is set via `systemd.machine_id=` on the kernel command
+  line, using the instance `machine-id` value (no host-side file).
 - The guest home-manager profile keeps shell and tool integration inside the
   guest, as in `v1_bwrap`.
 - The guest persistent home uses `/persistent/home/vscode`.

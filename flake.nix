@@ -156,12 +156,13 @@
               machine.succeed("agentsandbox doctor | grep -F uri: >/dev/null")
               machine.succeed(
                   "eval \"$(agentsandbox __resolve-active-config \"$PWD\")\" && "
-                  + "[[ \"$ACTIVE_CONFIG_DIR\" == \"$PWD/.agentsandbox\" ]]"
+                  + "[[ \"$FLAKE_DIR\" == \"$PWD/.agentsandbox\" ]]"
               )
               machine.succeed(
                   "eval \"$(agentsandbox __resolve-instance \"$PWD\" \"$PWD/.agentsandbox\" agenthouse)\" && "
                   + "[[ \"$MACHINE_ID\" =~ ^[0-9a-f]{32}$ ]] && "
                   + "[[ \"$INSTANCE_NAME\" == \"$(basename \"$PWD\")\" ]] && "
+                  + "[[ \"$INSTANCE_ID\" == \"$INSTANCE_NAME-$PROFILE_NAME-$MACHINE_ID\" ]] && "
                   + "[[ \"$DATA_DIR\" == */agentsandbox/\"$INSTANCE_ID\" ]]"
               )
               machine.succeed("agentsandbox allow-domain Example.COM")
@@ -190,10 +191,10 @@
               )
               machine.succeed(
                   "eval \"$(agentsandbox __resolve-instance \"$PWD\" \"$PWD/.agentsandbox\" agenthouse)\" && "
-                  + "machine_id_first=\"$(cat \"$DATA_DIR/machine-id\")\" && "
+                  + "machine_id_first=\"$MACHINE_ID\" && "
                   + "agentsandbox build && "
-                  + "machine_id_second=\"$(cat \"$DATA_DIR/machine-id\")\" && "
-                  + "[[ \"$machine_id_first\" == \"$machine_id_second\" ]]"
+                  + "eval \"$(agentsandbox __resolve-instance \"$PWD\" \"$PWD/.agentsandbox\" agenthouse)\" && "
+                  + "[[ \"$machine_id_first\" == \"$MACHINE_ID\" ]]"
               )
               machine.succeed("agentsandbox up")
               machine.succeed(

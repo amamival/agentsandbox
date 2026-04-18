@@ -5,6 +5,10 @@ let
     wheelUser = "vscode";
   };
 
+  Boot.QEMU = {
+    virtualisation.cores = lib.mkDefault 4;
+    virtualisation.memorySize = lib.mkDefault 8192;
+  };
   Boot.Impermanence = {
     environment.persistence."/persistent" = {
       hideMounts = true;
@@ -87,6 +91,8 @@ let
       uid = 1000;
       initialPassword = "";
       extraGroups = [ "wheel" "systemd-journal" ];
+      subUidRanges = [{ startUid = 32768; count = 32768; }];
+      subGidRanges = [{ startGid = 32768; count = 32768; }];
     };
     security.sudo.wheelNeedsPassword = false;
 

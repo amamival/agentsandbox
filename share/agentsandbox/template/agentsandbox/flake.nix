@@ -1,18 +1,20 @@
 {
   inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
     impermanence.url = "github:nix-community/impermanence";
     impermanence.inputs.nixpkgs.follows = ""; # Only used in tests.
     impermanence.inputs.home-manager.follows = "";
   };
 
-  outputs = { self, impermanence, ... }: {
-    nixosModules.default = { lib, pkgs, ... }: {
-      imports = [ impermanence.nixosModules.impermanence ];
+  outputs = { self, nixpkgs, impermanence, ... }: {
+    nixosModules.default = { config, lib, pkgs, ... }: {
+      imports = [
+        "${nixpkgs.outPath}/nixos/modules/virtualisation/qemu-vm.nix"
+        impermanence.nixosModules.impermanence
+      ];
 
       options.agentsandbox = {
         mutableSandboxConfig = lib.mkOption { type = lib.types.bool; default = false; };
-        memoryMiB = lib.mkOption { type = lib.types.int; default = 8192; };
-        vcpus = lib.mkOption { type = lib.types.int; default = 4; };
         portForwards = lib.mkOption {
           type = lib.types.attrsOf (lib.types.submodule {
             options = {
@@ -39,96 +41,132 @@
           });
           default = { ssh = { proto = "tcp"; host = 2223; guest = 22; }; };
         };
-        libvirtXml = lib.mkOption {
-          type = lib.types.raw;
-          default =
-            { pkgs
-            , name
-            , uuid
-            , machineId
-            , toplevel
-            , kernelParams
-            , sysrootNixDir
-            , persistentDir
-            , runtimeDir
-            , memoryMiB
-            , vcpus
-            , portForwards
-            }:
-            pkgs.writeText "${name}.xml" ''
-                <domain type='kvm'>
-                  <name>${name}</name>
-                  <uuid>${uuid}</uuid>
-                  <memory unit='MiB'>${toString memoryMiB}</memory>
-                  <currentMemory unit='MiB'>${toString memoryMiB}</currentMemory>
-                  <vcpu placement='static'>${toString vcpus}</vcpu>
-                  <os>
-                    <type arch='x86_64' machine='q35'>hvm</type>
-                    <kernel>${toplevel}/kernel</kernel>
-                    <initrd>${toplevel}/initrd</initrd>
-                    <cmdline>${lib.escapeXML (lib.removeSuffix "\n" kernelParams)} systemd.machine_id=${machineId}</cmdline>
-                  </os>
-                  <cpu mode='host-passthrough' migratable='off'/>
-                  <memoryBacking>
-                    <source type='memfd'/>
-                    <access mode='shared'/>
-                  </memoryBacking>
-                  <features>
-                    <acpi/>
-                    <apic/>
-                  </features>
-                  <devices>
-                    <filesystem type='mount' accessmode='passthrough'>
-                      <driver type='virtiofs' queue='1024'/>
-                      <source socket='${runtimeDir}/virtiofs/nix.sock'/>
-                      <target dir='nix'/>
-                    </filesystem>
-                    <filesystem type='mount' accessmode='passthrough'>
-                      <driver type='virtiofs' queue='1024'/>
-                      <source socket='${runtimeDir}/virtiofs/persistent.sock'/>
-                      <target dir='persistent'/>
-                    </filesystem>
-                    <serial type='pty'>
-                      <target port='0'/>
-                    </serial>
-                    <console type='pty'>
-                      <target type='serial' port='0'/>
-                    </console>
-                    <rng model='virtio'>
-                      <backend model='random'>/dev/urandom</backend>
-                    </rng>
-                    <interface type='user'>
-                      <backend type='passt'/>
-                      <model type='virtio'/>
-              ${lib.concatMapStrings (forward: let
-                h = forward.host;
-                g = forward.guest;
-                rangeXml =
-                  if h.start == h.end then
-                    "<range start='${toString h.start}' to='${toString g}'/>"
-                  else
-                    "<range start='${toString h.start}' end='${toString h.end}' to='${toString g}'/>";
-              in ''
-                      <portForward proto='${lib.escapeXML forward.proto}'>
-                        ${rangeXml}
-                      </portForward>
-              '') (lib.attrValues portForwards)}
-                    </interface>
-                  </devices>
-                </domain>
-            '';
-        };
       };
 
       config = {
         # Boot.QEMUDirectKernelBoot
-        boot.initrd.availableKernelModules = [ "virtio_net" "virtio_pci" "virtio_mmio" "virtio_blk" "virtio_scsi" "9p" "9pnet_virtio" ];
-        boot.initrd.kernelModules = [ "virtio_balloon" "virtio_console" "virtio_rng" "virtio_gpu" ];
-        boot.loader.external = { enable = true; installHook = "${pkgs.coreutils}/bin/true"; };
+        virtualisation.directBoot.enable = true;
+        virtualisation.diskImage = null;
+        #virtualisation.fileSystems = lib.mkForce { };
+        #virtualisation.fileSystems = lib.mkForce config.fileSystems;
+        virtualisation.sharedDirectories = lib.mkForce { };
+        virtualisation.mountHostNixStore = false;
+        virtualisation.useDefaultFilesystems = false;
+        virtualisation.useNixStoreImage = false;
+        virtualisation.useBootLoader = false;
+        system.systemBuilderCommands = let
+          kernelParams = lib.escapeXML (lib.concatStringsSep " " config.boot.kernelParams);
+          portForwardsXml = lib.concatMapStrings (forward: let
+            h = forward.host;
+            g = forward.guest;
+          in ''
+                      <portForward proto='${lib.escapeXML forward.proto}'>
+                        ${
+                          if h.start == h.end then
+                            "<range start='${toString h.start}' to='${toString g}'/>"
+                          else
+                            "<range start='${toString h.start}' end='${toString h.end}' to='${toString g}'/>"
+                        }
+                      </portForward>
+          '') (lib.attrValues config.agentsandbox.portForwards);
+          libvirtDomainXmlGen = pkgs.writeShellScript "domain.xml.sh" ''
+            TOPLEVEL="$(cd -- "$(dirname -- "$0")" && pwd -P)"
+            SYSROOT="''${NIX_DIR%/nix}"
+            KERNEL="$(readlink "$TOPLEVEL/kernel")"
+            INITRD="$(readlink "$TOPLEVEL/initrd")"
+            UID_IDMAP_XML="$(
+              while read -r START TARGET COUNT; do
+                echo "                    <uid start='$START' target='$TARGET' count='$COUNT'/>"
+              done <<<"$UID_MAP"
+            )"
+            GID_IDMAP_XML="$(
+              while read -r START TARGET COUNT; do
+                echo "                    <gid start='$START' target='$TARGET' count='$COUNT'/>"
+              done <<<"$GID_MAP"
+            )"
+            [[ "$KERNEL" == /* ]] && KERNEL="$SYSROOT$KERNEL" || KERNEL="$TOPLEVEL/$KERNEL"
+            [[ "$INITRD" == /* ]] && INITRD="$SYSROOT$INITRD" || INITRD="$TOPLEVEL/$INITRD"
+            cat <<EOF
+            <domain type='kvm'>
+              <name>$INSTANCE_ID</name>
+              <uuid>$DOMAIN_UUID</uuid>
+              <memory unit='MiB'>${toString config.virtualisation.memorySize}</memory>
+              <currentMemory unit='MiB'>${toString config.virtualisation.memorySize}</currentMemory>
+              <vcpu placement='static'>${toString config.virtualisation.cores}</vcpu>
+              <os>
+                <type arch='x86_64' machine='q35'>hvm</type>
+                <kernel>$KERNEL</kernel>
+                <initrd>$INITRD</initrd>
+                <cmdline>${kernelParams} init=/nix/var/nix/profiles/system/init systemd.machine_id=$MACHINE_ID</cmdline>
+              </os>
+              <cpu mode='host-passthrough' migratable='off'/>
+              <memoryBacking>
+                <source type='memfd'/>
+                <access mode='shared'/>
+              </memoryBacking>
+              <features>
+                <acpi/>
+                <apic/>
+              </features>
+              <devices>
+                <filesystem type='mount'>
+                  <driver type='virtiofs' queue='1024'/>
+                  <binary path='${pkgs.virtiofsd}/bin/virtiofsd' xattr='on'>
+                    <cache mode='always'/>
+                    <sandbox mode='namespace'/>
+                    <!-- Rust virtiofsd 1.13.x does not advertise lock support to libvirt:
+                         https://virtio-fs.gitlab.io/virtiofsd/doc/virtiofsd/fuse/struct.FsOptions.html -->
+                    <thread_pool size='0'/>
+                  </binary>
+                  <source dir='$NIX_DIR'/>
+                  <target dir='nix'/>
+                  <idmap>
+            $UID_IDMAP_XML
+            $GID_IDMAP_XML
+                  </idmap>
+                </filesystem>
+                <filesystem type='mount'>
+                  <driver type='virtiofs' queue='1024'/>
+                  <binary path='${pkgs.virtiofsd}/bin/virtiofsd' xattr='on'>
+                    <cache mode='always'/>
+                    <sandbox mode='namespace'/>
+                    <!-- Rust virtiofsd 1.13.x does not advertise lock support to libvirt:
+                         https://virtio-fs.gitlab.io/virtiofsd/doc/virtiofsd/fuse/struct.FsOptions.html -->
+                    <thread_pool size='0'/>
+                  </binary>
+                  <source dir='$PERSISTENT_DIR'/>
+                  <target dir='persistent'/>
+                  <idmap>
+            $UID_IDMAP_XML
+            $GID_IDMAP_XML
+                  </idmap>
+                </filesystem>
+                <serial type='pty'>
+                  <target port='0'/>
+                </serial>
+                <console type='pty'>
+                  <target type='serial' port='0'/>
+                </console>
+                <rng model='virtio'>
+                  <backend model='random'>/dev/urandom</backend>
+                </rng>
+                <interface type='user'>
+                  <backend type='passt'/>
+                  <model type='virtio'/>
+            ${portForwardsXml}
+                </interface>
+              </devices>
+            </domain>
+            EOF
+          '';
+        in lib.mkAfter "cp ${libvirtDomainXmlGen} $out/domain.xml.sh";
+        # Keep initrd module set minimal; root and early mounts only need virtiofs here.
+        boot.initrd.kernelModules = [ "virtiofs" ];
+        #boot.loader.external = { enable = true; installHook = "${pkgs.coreutils}/bin/true"; };
 
         # Boot.AgentSandbox
-        fileSystems."/" = { device = "none"; fsType = "tmpfs"; options = [ "mode=755" "nosuid" "nodev" "noexec" ]; };
-        fileSystems."/nix" = { device = "nix"; fsType = "virtiofs"; options = [ "nosuid" "nodev" "noexec" ]; };
+        virtualisation.fileSystems."/" = { device = "none"; fsType = "tmpfs"; options = [ "mode=755" "nosuid" "nodev" "noexec" ]; };
+        virtualisation.fileSystems."/nix" = { device = "nix"; fsType = "virtiofs"; options = [ "nosuid" "nodev" ]; };
         boot.kernel.sysctl."vm.overcommit_memory" = lib.mkDefault "1"; # Stability in low memory situations.
         boot.kernelParams = [
           "panic=1" # Since we can't manually respond to a panic, just reboot.
@@ -137,6 +175,7 @@
           "console=ttyS0,115200n8" # Used by console subcommand.
         ];
         services.getty.autologinUser = "root";
+
         # Service.OpenSSH, used by exec/ssh subcommand.
         security.pam.services.sshd.allowNullPassword = true;
         services.openssh = {
@@ -148,7 +187,7 @@
 
 
         # Impermanence
-        fileSystems."/persistent" = { neededForBoot = true; device = "persistent"; fsType = "virtiofs"; options = [ "nosuid" "nodev" ]; };
+        virtualisation.fileSystems."/persistent" = { neededForBoot = true; device = "persistent"; fsType = "virtiofs"; options = [ "nosuid" "nodev" ]; };
         environment.persistence."/persistent" = {
           directories = [ "/var/lib/nixos" ];
           files = [

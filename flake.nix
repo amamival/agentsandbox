@@ -27,7 +27,7 @@
                 mkdir "$out" && cp -r "$src"/{bin,share} "$out/" && chmod -R u+w "$out"
                 wrapProgram "$out/bin/agentsandbox" \
                   --prefix PATH : ${pkgs.lib.makeBinPath (with pkgs; [
-                    bubblewrap curl jq libvirt mitmproxy openssh socat util-linux virtiofsd zstd
+                    bubblewrap curl jq libvirt mitmproxy openssh passt socat util-linux virtiofsd zstd
                   ])} 
               '';
             };
@@ -79,7 +79,7 @@
                 home-manager.nixosModules.home-manager
                 ((import ./share/agentsandbox/template/agentsandbox/flake.nix).outputs {
                   self = builtins.getFlake (toString ./share/agentsandbox/template/agentsandbox);
-                  inherit impermanence;
+                  inherit nixpkgs impermanence;
                 }).nixosModules.default
                 (_: { nixpkgs.overlays = [ (_: _: { }) ]; })
                 ({ ... }: { config.nixpkgs.flake.source = testNixpkgs.outPath; })
@@ -91,22 +91,26 @@
             } // { inherit system; })
           ).config;
           testGuestToplevel = testGuestConfig.system.build.toplevel;
-          testKernelParams = pkgs.lib.removeSuffix " "
-            (builtins.replaceStrings [ "\n" ] [ " " ] (builtins.readFile "${testGuestToplevel}/kernel-params"));
-          testLibvirtXml = testGuestConfig.agentsandbox.libvirtXml {
-            inherit pkgs;
-            name = testInstanceId;
-            uuid = testDomainUuid;
-            machineId = testShortMachineId;
-            toplevel = testGuestToplevel;
-            kernelParams = testKernelParams;
-            sysrootNixDir = "${testDataDir}/sysroot/nix";
-            persistentDir = "${testDataDir}/persistent";
-            runtimeDir = testRuntimeDir;
-            memoryMiB = testGuestConfig.agentsandbox.memoryMiB;
-            vcpus = testGuestConfig.agentsandbox.vcpus;
-            portForwards = testGuestConfig.agentsandbox.portForwards;
-          };
+          testLibvirtXml = pkgs.runCommand "${testInstanceId}.xml" {
+            DOMAIN_UUID = testDomainUuid;
+            GID_MAP = ''
+                     100        100          1
+                       0     100000        100
+                     101     100100     165435
+            '';
+            INSTANCE_ID = testInstanceId;
+            MACHINE_ID = testShortMachineId;
+            NIX_DIR = "${testDataDir}/sysroot/nix";
+            PERSISTENT_DIR = "${testDataDir}/persistent";
+            RUNTIME_DIR = testRuntimeDir;
+            UID_MAP = ''
+                      1000       1000          1
+                         0     100000       1000
+                      1001     101000     164535
+            '';
+          } ''
+            "${testGuestToplevel}/domain.xml.sh" > "$out"
+          '';
           rootLock = builtins.fromJSON (builtins.readFile ./flake.lock);
           impermanenceLock = builtins.fromJSON (builtins.readFile "${impermanence.outPath}/flake.lock");
           homeManagerPathLock = {
@@ -138,7 +142,10 @@
             root = "root";
             nodes = {
               agentsandbox = {
-                inputs.impermanence = "impermanence";
+                inputs = {
+                  impermanence = "impermanence";
+                  nixpkgs = "nixpkgs_2";
+                };
                 locked = { path = "./agentsandbox"; type = "path"; };
                 original = { path = "./agentsandbox"; type = "path"; };
                 parent = [ ];
@@ -191,7 +198,6 @@
               virtualisation.diskSize = 16 * 1024;
               virtualisation.additionalPaths = [
                 testFlakeLock
-                testGuestToplevel
                 testLibvirtXml
                 home-manager.outPath
                 nixpkgs.outPath

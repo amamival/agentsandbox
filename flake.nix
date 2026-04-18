@@ -57,11 +57,6 @@
               virtualisation.cores = 8;
               virtualisation.memorySize = 8 * 1024;
               virtualisation.diskSize = 16 * 1024;
-              virtualisation.additionalPaths = [
-                (toString nixpkgs)
-                (toString home-manager)
-                (toString impermanence)
-              ];
 
               security.pki.certificateFiles = [ share/agentsandbox/mitm-proxy-ca.pem ];
               networking.interfaces.eth1 = {
@@ -111,8 +106,10 @@
                 sslCertificateKey = share/agentsandbox/mitm-proxy-ca.key;
                 locations."= /v2/nixos/nix/blobs/0".alias = pkgs.runCommand "docker-image-nix-layer" { } ''
                   tar xf ${pkgs.dockerTools.examples.nix} --wildcards '*/layer.tar' -O >layer.tar
-                  mkdir -p work/nix/var/nix/profiles
+                  mkdir -p work/nix/var/nix/profiles work/etc/nixos
                   ln -sfn / work/nix/var/nix/profiles/default
+                  printf 'root:x:0:0::/root:/bin/sh\nnixbld1:x:30001:30000::/:/bin/sh' >work/etc/passwd
+                  printf 'root:x:0:\nnixbld:x:30000:nixbld1' >work/etc/group
                   (cd work && ${pkgs.gnutar}/bin/tar -rf ../layer.tar .)
                   ${pkgs.gzip}/bin/gzip -9n <layer.tar >"$out"
                 '';
@@ -132,6 +129,18 @@
               machine.succeed("su -s /bin/sh -c 'unshare --map-auto --setuid=0 --setgid=0 true' root")
               machine.succeed("install -d /run/user/0")
               machine.succeed("agentsandbox init")
+              workspace = machine.succeed("pwd").strip()
+              workspace_name = machine.succeed('basename "$PWD"').strip()
+              flake_dir = machine.succeed('agentsandbox __get_or_create_flake_dir "$PWD"').strip()
+              instance_id = machine.succeed(
+                  'agentsandbox __get_or_create_instance_id "$PWD/.agentsandbox" default'
+              ).strip()
+              machine_id = instance_id.rsplit("-", 1)[-1]
+              data_dir = f"/root/.local/share/agentsandbox/{instance_id}"
+              state_dir = f"/root/.local/state/agentsandbox/{instance_id}"
+              runtime_dir = f"/run/user/0/agentsandbox/{instance_id}"
+
+              assert flake_dir == f"{workspace}/.agentsandbox"
               machine.succeed("mkdir -p .agentsandbox/_pin .agentsandbox/agentsandbox/_pin")
               machine.succeed(
                   "cp -a ${toString nixpkgs} .agentsandbox/_pin/nixpkgs && "
@@ -151,20 +160,36 @@
                   + ".agentsandbox/agentsandbox/flake.nix"
               )
               machine.succeed("nix flake lock .agentsandbox")
-              machine.succeed("agentsandbox help | grep -F proxy-logs >/dev/null")
+              machine.succeed("agentsandbox help | grep -F verify >/dev/null")
               machine.succeed("agentsandbox version | grep -E '^[^[:space:]]+$' >/dev/null")
-              machine.succeed("agentsandbox doctor | grep -F uri: >/dev/null")
-              machine.succeed(
-                  "eval \"$(agentsandbox __resolve-active-config \"$PWD\")\" && "
-                  + "[[ \"$FLAKE_DIR\" == \"$PWD/.agentsandbox\" ]]"
-              )
-              machine.succeed(
-                  "eval \"$(agentsandbox __resolve-instance \"$PWD\" \"$PWD/.agentsandbox\" agenthouse)\" && "
-                  + "[[ \"$MACHINE_ID\" =~ ^[0-9a-f]{32}$ ]] && "
-                  + "[[ \"$INSTANCE_NAME\" == \"$(basename \"$PWD\")\" ]] && "
-                  + "[[ \"$INSTANCE_ID\" == \"$INSTANCE_NAME-$PROFILE_NAME-$MACHINE_ID\" ]] && "
-                  + "[[ \"$DATA_DIR\" == */agentsandbox/\"$INSTANCE_ID\" ]]"
-              )
+              doctor = machine.succeed("agentsandbox doctor")
+              assert "libvirt-uri: qemu:///session" in doctor
+              assert "profile: default" in doctor
+              assert f"active-config: {flake_dir}" in doctor
+              assert "config-scope: local" in doctor
+              assert f"instance-id: {instance_id}" in doctor
+              assert f"machine-id: {machine_id[-20:]}" in doctor
+              assert f"data-dir: {data_dir}" in doctor
+              assert f"state-dir: {state_dir}" in doctor
+              assert f"runtime-dir: {runtime_dir}" in doctor
+              for key in [
+                  "nix:",
+                  "virsh:",
+                  "qemu:",
+                  "virtiofsd:",
+                  "mitmdump:",
+                  "bwrap:",
+                  "jq:",
+                  "curl:",
+                  "zstd:",
+                  "socat:",
+              ]:
+                  assert key in doctor
+              machine.succeed('grep -Fx "# <host-path><TAB><guest-name>" .agentsandbox/mounts >/dev/null')
+              machine.succeed(f'grep -F "{workspace}\t{workspace_name}" .agentsandbox/mounts >/dev/null')
+              machine.succeed("agentsandbox verify | tee /tmp/agentsandbox-verify.out >/dev/null")
+              machine.succeed("grep -F 'nixos-rebuild --repair' /tmp/agentsandbox-verify.out >/dev/null")
+              machine.succeed("grep -F 'nix store verify --repair' /tmp/agentsandbox-verify.out >/dev/null")
               machine.succeed("agentsandbox allow-domain Example.COM")
               machine.succeed("agentsandbox allow-domain https://example.com/path")
               machine.succeed("agentsandbox allow-domain 'https://*.Example.COM.:8443/path'")
@@ -177,46 +202,40 @@
               machine.succeed("agentsandbox mount ./beta sandbox-beta")
               machine.succeed("grep -F \"$(realpath alpha)\talpha\" .agentsandbox/mounts >/dev/null")
               machine.succeed("grep -F \"$(realpath beta)\tsandbox-beta\" .agentsandbox/mounts >/dev/null")
-              machine.succeed("agentsandbox mount >/dev/null")
+              machine.succeed("agentsandbox mount | grep -F sandbox-beta >/dev/null")
               machine.succeed("agentsandbox unmount ./alpha")
               machine.succeed("! grep -F \"$(realpath alpha)\talpha\" .agentsandbox/mounts >/dev/null")
               machine.succeed("agentsandbox build")
-              machine.succeed(
-                  "eval \"$(agentsandbox __resolve-instance \"$PWD\" \"$PWD/.agentsandbox\" agenthouse)\" && "
-                  + "[[ -d \"$DATA_DIR/sysroot\" ]]"
-              )
-              machine.succeed(
-                  "eval \"$(agentsandbox __resolve-instance \"$PWD\" \"$PWD/.agentsandbox\" agenthouse)\" && "
-                  + "[[ -d \"$DATA_DIR/sysroot/nix/store\" ]]"
-              )
-              machine.succeed(
-                  "eval \"$(agentsandbox __resolve-instance \"$PWD\" \"$PWD/.agentsandbox\" agenthouse)\" && "
-                  + "machine_id_first=\"$MACHINE_ID\" && "
-                  + "agentsandbox build && "
-                  + "eval \"$(agentsandbox __resolve-instance \"$PWD\" \"$PWD/.agentsandbox\" agenthouse)\" && "
-                  + "[[ \"$machine_id_first\" == \"$MACHINE_ID\" ]]"
-              )
+              machine.succeed(f"[[ -d '{data_dir}/sysroot' ]]")
+              machine.succeed(f"[[ -L '{data_dir}/sysroot/nix/var/nix/profiles/system' ]]")
+              machine.succeed(f"[[ -d '{data_dir}/sysroot/nix/store' ]]")
+              machine.succeed("agentsandbox build")
+              assert instance_id == machine.succeed(
+                  'agentsandbox __get_or_create_instance_id "$PWD/.agentsandbox" default'
+              ).strip()
               machine.succeed("agentsandbox up")
               machine.succeed(
-                  "eval \"$(agentsandbox __resolve-instance \"$PWD\" \"$PWD/.agentsandbox\" agenthouse)\" && "
-                  + "[[ -f \"$STATE_DIR/logs/runtime.log\" && -f \"$STATE_DIR/logs/requests.jsonl\" ]] && "
-                  + "[[ -S \"$RUNTIME_DIR/virtiofs/nix.sock\" && -S \"$RUNTIME_DIR/virtiofs/persistent.sock\" ]]"
+                  f"[[ -f '{state_dir}/logs/runtime.log' && -f '{state_dir}/logs/requests.jsonl' ]] && "
+                  + f"[[ -S '{runtime_dir}/virtiofs/nix.sock' && -S '{runtime_dir}/virtiofs/persistent.sock' ]]"
               )
               machine.succeed("agentsandbox ps | grep -F running >/dev/null")
-              machine.succeed("agentsandbox port >/dev/null")
-              machine.succeed("agentsandbox port 22 tcp | grep -E '^[0-9]+$' >/dev/null")
+              default_port = machine.succeed("agentsandbox port").strip()
+              ssh_port = machine.succeed("agentsandbox port 22 tcp").strip()
+              assert default_port == ssh_port
+              assert ssh_port.isdigit()
               machine.succeed("agentsandbox ssh whoami | grep -Fx vscode >/dev/null")
-              machine.succeed("agentsandbox exec -- test -d /persistent/home/vscode")
+              machine.succeed("agentsandbox exec test -d /persistent/home/vscode")
+              machine.succeed(f"agentsandbox exec test -d /persistent/workspace/{workspace_name}")
+              machine.succeed("agentsandbox exec test -d /persistent/workspace/sandbox-beta")
               machine.succeed("agentsandbox logs >/dev/null")
               machine.succeed("agentsandbox stats | grep -F 'CPU %' >/dev/null")
               machine.succeed(
-                  "eval \"$(agentsandbox __resolve-instance \"$PWD\" \"$PWD/.agentsandbox\" agenthouse)\" && "
-                  + "mkdir -p \"$STATE_DIR/logs\" && "
+                  f"mkdir -p '{state_dir}/logs' && "
                   + "printf '%s\\n' '{\"time\":\"2026-04-15T00:00:00Z\",\"host\":\"old.example\"}' > "
-                  + "\"$STATE_DIR/logs/requests-20260415T000000Z.jsonl\" && "
-                  + "zstd -fq --rm \"$STATE_DIR/logs/requests-20260415T000000Z.jsonl\" && "
+                  + f"'{state_dir}/logs/requests-20260415T000000Z.jsonl' && "
+                  + f"zstd -fq --rm '{state_dir}/logs/requests-20260415T000000Z.jsonl' && "
                   + "printf '%s\\n' '{\"time\":\"2026-04-15T00:00:01Z\",\"host\":\"new.example\"}' > "
-                  + "\"$STATE_DIR/logs/requests.jsonl\""
+                  + f"'{state_dir}/logs/requests.jsonl'"
               )
               machine.succeed(
                   "bash -c 'set +e; timeout 2 agentsandbox proxy-logs > /tmp/proxy-logs.out; "
@@ -238,25 +257,25 @@
                   + "for _ in $(seq 1 45); do [[ -f /tmp/agsb-wait.done ]] && break; sleep 1; done; "
                   + "[[ -f /tmp/agsb-wait.done ]]'"
               )
-              machine.succeed("agentsandbox up")
               machine.succeed(
-                  "eval \"$(agentsandbox __resolve-instance \"$PWD\" \"$PWD/.agentsandbox\" agenthouse)\" && "
-                  + "touch \"$DATA_DIR/persistent/canary\""
+                  f"[[ ! -e '{runtime_dir}/mount-helper.pid' && ! -e '{runtime_dir}/proxy.pid' ]] && "
+                  + f"[[ ! -e '{runtime_dir}/virtiofs/nix.sock' && ! -e '{runtime_dir}/virtiofs/persistent.sock' ]]"
               )
+              machine.succeed("agentsandbox wait")
+              machine.succeed("agentsandbox up")
+              machine.succeed(f"touch '{data_dir}/persistent/canary'")
               machine.succeed("agentsandbox kill")
               machine.succeed(
-                  "eval \"$(agentsandbox __resolve-instance \"$PWD\" \"$PWD/.agentsandbox\" agenthouse)\" && "
-                  + "[[ ! -e \"$RUNTIME_DIR/virtiofs/nix.sock\" && ! -e \"$RUNTIME_DIR/virtiofs/persistent.sock\" ]]"
+                  f"[[ ! -e '{runtime_dir}/mount-helper.pid' && ! -e '{runtime_dir}/proxy.pid' ]] && "
+                  + f"[[ ! -e '{runtime_dir}/virtiofs/nix.sock' && ! -e '{runtime_dir}/virtiofs/persistent.sock' ]]"
               )
               machine.succeed("agentsandbox destroy")
               machine.succeed(
-                  "eval \"$(agentsandbox __resolve-instance \"$PWD\" \"$PWD/.agentsandbox\" agenthouse)\" && "
-                  + "[[ ! -d \"$DATA_DIR/sysroot\" && -f \"$DATA_DIR/persistent/canary\" ]]"
+                  f"[[ ! -d '{data_dir}/sysroot' && -f '{data_dir}/persistent/canary' ]]"
               )
               machine.succeed("agentsandbox up")
-              machine.succeed("agentsandbox exec -- test -f /persistent/canary")
+              machine.succeed("agentsandbox exec test -f /persistent/canary")
               machine.succeed("agentsandbox destroy")
-              machine.succeed("agentsandbox wait")
               machine.succeed("[[ -z \"$(agentsandbox port 50052 tcp)\" ]]")
             '';
           };

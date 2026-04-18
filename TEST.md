@@ -12,11 +12,14 @@ This file defines a single end-to-end scenario sequence that exercises every `ag
    - Run `agentsandbox init`.
    - Verify that `.agentsandbox/flake.nix`, `.agentsandbox/configuration.nix`, `.agentsandbox/allowed_hosts`, and `.agentsandbox/mounts` were created.
    - Verify that `allowed_hosts` is deny-by-default and `mounts` contains only the template header.
+   - Here, deny-by-default means that removing every active `allowed_hosts` entry must still block unmatched hosts rather than falling back to allow-all.
 
 3. Inspect launcher metadata.
    - Run `agentsandbox help`.
    - Run `agentsandbox version`.
    - Run `agentsandbox doctor`.
+   - Run `agentsandbox verify`.
+   - Verify that the current `verify` stub announces the planned repair commands `nixos-rebuild --repair` and `nix store verify --repair`.
    - Verify that the command list, version string, and dependency diagnostics are printed.
 
 4. Confirm config resolution.

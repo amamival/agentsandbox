@@ -5,7 +5,8 @@
     home-manager.url = "github:nix-community/home-manager/release-25.11";
     home-manager.inputs.nixpkgs.follows = "nixpkgs";
     impermanence.url = "github:nix-community/impermanence";
-    impermanence.inputs.nixpkgs.follows = "";
+    impermanence.inputs.nixpkgs.follows = "nixpkgs";
+    impermanence.inputs.home-manager.follows = "home-manager";
   };
   outputs = { self, nixpkgs, nixpkgs-unstable, home-manager, impermanence, ... }:
     let
@@ -49,7 +50,138 @@
         });
 
       checks = eachSystem (system:
-        let pkgs = pkgsFor system; in {
+        let
+          pkgs = pkgsFor system;
+          testNixpkgs = let outPath = nixpkgs.outPath; in {
+            inherit outPath;
+            lib = (import (outPath + "/lib")).extend
+              ((import (outPath + "/lib/flake-version-info.nix")) { inherit outPath; });
+          };
+          testProfileName = "default";
+          testProjectName = "tmp";
+          testMachinePrefix = "000000000000000000000000";
+          testInstanceMachineId =
+            testMachinePrefix + builtins.substring 0 8 (builtins.hashString "sha256" testProfileName);
+          testInstanceId = "${testProjectName}-${testProfileName}-${testInstanceMachineId}";
+          testShortMachineId = builtins.substring (builtins.stringLength testInstanceId - 20) 20 testInstanceId;
+          testDomainUuid =
+            "${builtins.substring 0 8 testShortMachineId}-${builtins.substring 8 4 testShortMachineId}"
+            + "-${builtins.substring 12 4 testShortMachineId}-${builtins.substring 16 4 testShortMachineId}"
+            + "-${builtins.substring 20 12 testShortMachineId}";
+          testDataDir = "/root/.local/share/agentsandbox/${testInstanceId}";
+          testRuntimeDir = "/run/user/0/agentsandbox/${testInstanceId}";
+          testGuestConfig = (
+            import (nixpkgs.outPath + "/nixos/lib/eval-config.nix") ({
+              lib = testNixpkgs.lib;
+              system = null;
+              modules = [
+                ./share/agentsandbox/template/configuration.nix
+                home-manager.nixosModules.home-manager
+                ((import ./share/agentsandbox/template/agentsandbox/flake.nix).outputs {
+                  self = builtins.getFlake (toString ./share/agentsandbox/template/agentsandbox);
+                  inherit impermanence;
+                }).nixosModules.default
+                (_: { nixpkgs.overlays = [ (_: _: { }) ]; })
+                ({ ... }: { config.nixpkgs.flake.source = testNixpkgs.outPath; })
+              ];
+              specialArgs = {
+                pkgs-unstable = import nixpkgs-unstable { inherit system; config.allowUnfree = true; };
+                nixpkgs = testNixpkgs;
+              };
+            } // { inherit system; })
+          ).config;
+          testGuestToplevel = testGuestConfig.system.build.toplevel;
+          testKernelParams = pkgs.lib.removeSuffix " "
+            (builtins.replaceStrings [ "\n" ] [ " " ] (builtins.readFile "${testGuestToplevel}/kernel-params"));
+          testLibvirtXml = testGuestConfig.agentsandbox.libvirtXml {
+            inherit pkgs;
+            name = testInstanceId;
+            uuid = testDomainUuid;
+            machineId = testShortMachineId;
+            toplevel = testGuestToplevel;
+            kernelParams = testKernelParams;
+            sysrootNixDir = "${testDataDir}/sysroot/nix";
+            persistentDir = "${testDataDir}/persistent";
+            runtimeDir = testRuntimeDir;
+            memoryMiB = testGuestConfig.agentsandbox.memoryMiB;
+            vcpus = testGuestConfig.agentsandbox.vcpus;
+            portForwards = testGuestConfig.agentsandbox.portForwards;
+          };
+          rootLock = builtins.fromJSON (builtins.readFile ./flake.lock);
+          impermanenceLock = builtins.fromJSON (builtins.readFile "${impermanence.outPath}/flake.lock");
+          homeManagerPathLock = {
+            lastModified = 0;
+            narHash = rootLock.nodes.home-manager.locked.narHash;
+            path = home-manager.outPath;
+            type = "path";
+          };
+          impermanencePathLock = {
+            lastModified = 0;
+            narHash = rootLock.nodes.impermanence.locked.narHash;
+            path = impermanence.outPath;
+            type = "path";
+          };
+          nixpkgsPathLock = {
+            lastModified = 0;
+            narHash = rootLock.nodes.nixpkgs.locked.narHash;
+            path = nixpkgs.outPath;
+            type = "path";
+          };
+          nixpkgsUnstablePathLock = {
+            lastModified = 0;
+            narHash = rootLock.nodes."nixpkgs-unstable".locked.narHash;
+            path = nixpkgs-unstable.outPath;
+            type = "path";
+          };
+          testFlakeLock = pkgs.writeText "agentsandbox-test-flake.lock" (builtins.toJSON {
+            version = 7;
+            root = "root";
+            nodes = {
+              agentsandbox = {
+                inputs.impermanence = "impermanence";
+                locked = { path = "./agentsandbox"; type = "path"; };
+                original = { path = "./agentsandbox"; type = "path"; };
+                parent = [ ];
+              };
+              home-manager = {
+                inputs.nixpkgs = [ "agentsandbox" "impermanence" "nixpkgs" ];
+                locked = homeManagerPathLock;
+                original = impermanenceLock.nodes.home-manager.original;
+              };
+              home-manager_2 = {
+                inputs.nixpkgs = [ "nixpkgs" ];
+                locked = homeManagerPathLock;
+                original = rootLock.nodes.home-manager.original;
+              };
+              impermanence = {
+                inputs = {
+                  home-manager = "home-manager";
+                  nixpkgs = "nixpkgs";
+                };
+                locked = impermanencePathLock;
+                original = rootLock.nodes.impermanence.original;
+              };
+              nixpkgs = {
+                locked = nixpkgsPathLock;
+                original = impermanenceLock.nodes.nixpkgs.original;
+              };
+              nixpkgs_2 = {
+                locked = nixpkgsPathLock;
+                original = rootLock.nodes.nixpkgs.original;
+              };
+              nixpkgs-unstable = {
+                locked = nixpkgsUnstablePathLock;
+                original = rootLock.nodes."nixpkgs-unstable".original;
+              };
+              root.inputs = {
+                agentsandbox = "agentsandbox";
+                home-manager = "home-manager_2";
+                nixpkgs = "nixpkgs_2";
+                nixpkgs-unstable = "nixpkgs-unstable";
+              };
+            };
+          });
+        in {
           lint = pkgs.runCommand "lint" { } ''${pkgs.shellcheck}/bin/shellcheck ${./bin}/* > "$out"'';
           nixos-e2e = pkgs.testers.runNixOSTest {
             name = "agentsandbox-nixos-e2e";
@@ -57,6 +189,15 @@
               virtualisation.cores = 8;
               virtualisation.memorySize = 8 * 1024;
               virtualisation.diskSize = 16 * 1024;
+              virtualisation.additionalPaths = [
+                testFlakeLock
+                testGuestToplevel
+                testLibvirtXml
+                home-manager.outPath
+                nixpkgs.outPath
+                nixpkgs-unstable.outPath
+                impermanence.outPath
+              ];
 
               security.pki.certificateFiles = [ share/agentsandbox/mitm-proxy-ca.pem ];
               networking.interfaces.eth1 = {
@@ -113,11 +254,14 @@
                   (cd work && ${pkgs.gnutar}/bin/tar -rf ../layer.tar .)
                   ${pkgs.gzip}/bin/gzip -9n <layer.tar >"$out"
                 '';
-                locations."= /v2/nixos/nix/manifests/latest".return = ''200 '{"manifests":[{"digest":"main","platform":{"architecture":"amd64","os":"linux"}}]}' '';
+                locations."= /v2/nixos/nix/manifests/latest".return =
+                  ''200 '{"manifests":[{"digest":"main","platform":{"architecture":"amd64","os":"linux"}}]}' '';
                 locations."= /v2/nixos/nix/manifests/main".return = ''200 '{"layers":[{"digest":"0"}]}' '';
               };
             };
             testScript = ''
+              label = "25.11.19700101.dirty"
+
               start_all()
               registry.wait_for_unit("nginx.service")
               machine.succeed("curl -fsS https://auth.docker.io/token | grep -q test")
@@ -129,6 +273,7 @@
               machine.succeed("su -s /bin/sh -c 'unshare --map-auto --setuid=0 --setgid=0 true' root")
               machine.succeed("install -d /run/user/0")
               machine.succeed("agentsandbox init")
+              machine.succeed("printf '%s' '${testMachinePrefix}' > .agentsandbox/machine-prefix")
               workspace = machine.succeed("pwd").strip()
               workspace_name = machine.succeed('basename "$PWD"').strip()
               flake_dir = machine.succeed('agentsandbox __get_or_create_flake_dir "$PWD"').strip()
@@ -141,25 +286,13 @@
               runtime_dir = f"/run/user/0/agentsandbox/{instance_id}"
 
               assert flake_dir == f"{workspace}/.agentsandbox"
-              machine.succeed("mkdir -p .agentsandbox/_pin .agentsandbox/agentsandbox/_pin")
+              machine.succeed("cp ${testFlakeLock} .agentsandbox/flake.lock")
               machine.succeed(
-                  "cp -a ${toString nixpkgs} .agentsandbox/_pin/nixpkgs && "
-                  + "cp -a ${toString home-manager} .agentsandbox/_pin/home-manager && "
-                  + "cp -a ${toString impermanence} .agentsandbox/agentsandbox/_pin/impermanence"
+                  "nix-store --export $(nix-store -qR '${testGuestToplevel}') "
+                  + "${home-manager.outPath} ${nixpkgs.outPath} "
+                  + "${nixpkgs-unstable.outPath} ${impermanence.outPath} "
+                  + "> /tmp/agentsandbox-guest.nar"
               )
-              machine.succeed(
-                  "sed -i "
-                  + "-e 's|github:NixOS/nixpkgs/nixos-25.11|path:./_pin/nixpkgs|' "
-                  + "-e 's|github:NixOS/nixpkgs/nixos-unstable|path:./_pin/nixpkgs|' "
-                  + "-e 's|github:nix-community/home-manager/release-25.11|path:./_pin/home-manager|' "
-                  + ".agentsandbox/flake.nix"
-              )
-              machine.succeed(
-                  "sed -i "
-                  + "-e 's|github:nix-community/impermanence|path:./_pin/impermanence|' "
-                  + ".agentsandbox/agentsandbox/flake.nix"
-              )
-              machine.succeed("nix flake lock .agentsandbox")
               machine.succeed("agentsandbox help | grep -F verify >/dev/null")
               machine.succeed("agentsandbox version | grep -E '^[^[:space:]]+$' >/dev/null")
               doctor = machine.succeed("agentsandbox doctor")
@@ -205,15 +338,25 @@
               machine.succeed("agentsandbox mount | grep -F sandbox-beta >/dev/null")
               machine.succeed("agentsandbox unmount ./alpha")
               machine.succeed("! grep -F \"$(realpath alpha)\talpha\" .agentsandbox/mounts >/dev/null")
-              machine.succeed("agentsandbox build")
+              machine.succeed(
+                  f"mkdir -p '{data_dir}/sysroot' && "
+                  + "curl -fsSI -H 'Authorization: Bearer test' "
+                  + "https://registry-1.docker.io/v2/nixos/nix/blobs/0 >/dev/null && "
+                  + "curl -fsSL -H 'Authorization: Bearer test' "
+                  + "https://registry-1.docker.io/v2/nixos/nix/blobs/0 | "
+                  + f"unshare --map-auto --map-root-user --wd '{data_dir}/sysroot' tar zxf - && "
+                  + f"unshare --map-auto --map-root-user --wd '{data_dir}/sysroot' "
+                  + f"nix-store --store '{data_dir}/sysroot' --import < /tmp/agentsandbox-guest.nar"
+              )
+              machine.succeed(f"NIXOS_LABEL={label} agentsandbox build")
               machine.succeed(f"[[ -d '{data_dir}/sysroot' ]]")
               machine.succeed(f"[[ -L '{data_dir}/sysroot/nix/var/nix/profiles/system' ]]")
               machine.succeed(f"[[ -d '{data_dir}/sysroot/nix/store' ]]")
-              machine.succeed("agentsandbox build")
+              machine.succeed(f"NIXOS_LABEL={label} agentsandbox build")
               assert instance_id == machine.succeed(
                   'agentsandbox __get_or_create_instance_id "$PWD/.agentsandbox" default'
               ).strip()
-              machine.succeed("agentsandbox up")
+              machine.succeed(f"NIXOS_LABEL={label} agentsandbox up")
               machine.succeed(
                   f"[[ -f '{state_dir}/logs/runtime.log' && -f '{state_dir}/logs/requests.jsonl' ]] && "
                   + f"[[ -S '{runtime_dir}/virtiofs/nix.sock' && -S '{runtime_dir}/virtiofs/persistent.sock' ]]"

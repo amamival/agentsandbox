@@ -365,196 +365,196 @@ function main() {
       MEMORY_MIB="$(jq -r . <<<"$(nix eval --json "${NC}.agentsandbox.memoryMiB")")"
       VCPUS="$(jq -r . <<<"$(nix eval --json "${NC}.agentsandbox.vcpus")")"
       PORT_FORWARDS_JSON="$(nix eval --json "${NC}.agentsandbox.portForwards")"
-      OPENSNITCH_ENABLED="$(jq -r . <<<"$(nix eval --json "${NC}.services.opensnitch.enable")")"
-      OPENSNITCH_ADDRESS="$(nix eval --raw "${NC}.services.opensnitch.settings.Server.Address")"
+      # OPENSNITCH_ENABLED="$(jq -r . <<<"$(nix eval --json "${NC}.services.opensnitch.enable")")"
+      # OPENSNITCH_ADDRESS="$(nix eval --raw "${NC}.services.opensnitch.settings.Server.Address")"
       if is_domstate "$INSTANCE_ID" running; then
         (( DETACH )) && die "VM is already running"
         guest_ssh root "$(host_port_for_guest "$PORT_FORWARDS_JSON" 22 tcp)"
         return 0
       fi
       prepare "$INSTANCE_ID"
-      [[ -e "$FLAKE_DIR/allowed_hosts" ]] || cp "$TEMPLATE_DIR/allowed_hosts" "$FLAKE_DIR/allowed_hosts"
+      # [[ -e "$FLAKE_DIR/allowed_hosts" ]] || cp "$TEMPLATE_DIR/allowed_hosts" "$FLAKE_DIR/allowed_hosts"
 
       exec 9>"$RUNTIME_DIR/lock"
       flock -n 9 || die "another agentsandbox process already owns $RUNTIME_DIR/lock"
 
-      # Log rotation block. Keep this block byte-for-byte aligned with future call sites.
-      log_file="$STATE_DIR/logs/runtime.log"
-      if [[ -f "$log_file" ]]; then
-        size_bytes="$(stat -c %s "$log_file")"
-        if (( size_bytes >= AS_LOG_ROTATE_BYTES )); then
-          timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-          case "$log_file" in
-            *.jsonl) archive_base="${log_file%.jsonl}-${timestamp}.jsonl" ;;
-            *.log) archive_base="${log_file%.log}-${timestamp}.log" ;;
-            *) archive_base="${log_file}-${timestamp}" ;;
-          esac
-          mv "$log_file" "$archive_base"
-          zstd -fq --rm "$archive_base"
-        fi
-      fi
-      touch "$log_file"
+      # # Log rotation block. Keep this block byte-for-byte aligned with future call sites.
+      # log_file="$STATE_DIR/logs/runtime.log"
+      # if [[ -f "$log_file" ]]; then
+      #   size_bytes="$(stat -c %s "$log_file")"
+      #   if (( size_bytes >= AS_LOG_ROTATE_BYTES )); then
+      #     timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+      #     case "$log_file" in
+      #       *.jsonl) archive_base="${log_file%.jsonl}-${timestamp}.jsonl" ;;
+      #       *.log) archive_base="${log_file%.log}-${timestamp}.log" ;;
+      #       *) archive_base="${log_file}-${timestamp}" ;;
+      #     esac
+      #     mv "$log_file" "$archive_base"
+      #     zstd -fq --rm "$archive_base"
+      #   fi
+      # fi
+      # touch "$log_file"
 
       # Log rotation block. Keep this block byte-for-byte aligned with future call sites.
-      log_file="$STATE_DIR/logs/requests.jsonl"
-      if [[ -f "$log_file" ]]; then
-        size_bytes="$(stat -c %s "$log_file")"
-        if (( size_bytes >= AS_LOG_ROTATE_BYTES )); then
-          timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-          case "$log_file" in
-            *.jsonl) archive_base="${log_file%.jsonl}-${timestamp}.jsonl" ;;
-            *.log) archive_base="${log_file%.log}-${timestamp}.log" ;;
-            *) archive_base="${log_file}-${timestamp}" ;;
-          esac
-          mv "$log_file" "$archive_base"
-          zstd -fq --rm "$archive_base"
-        fi
-      fi
-      touch "$log_file"
+      # log_file="$STATE_DIR/logs/requests.jsonl"
+      # if [[ -f "$log_file" ]]; then
+      #   size_bytes="$(stat -c %s "$log_file")"
+      #   if (( size_bytes >= AS_LOG_ROTATE_BYTES )); then
+      #     timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+      #     case "$log_file" in
+      #       *.jsonl) archive_base="${log_file%.jsonl}-${timestamp}.jsonl" ;;
+      #       *.log) archive_base="${log_file%.log}-${timestamp}.log" ;;
+      #       *) archive_base="${log_file}-${timestamp}" ;;
+      #     esac
+      #     mv "$log_file" "$archive_base"
+      #     zstd -fq --rm "$archive_base"
+      #   fi
+      # fi
+      # touch "$log_file"
 
-      cleanup_runtime_helpers "$RUNTIME_DIR"
+      # cleanup_runtime_helpers "$RUNTIME_DIR"
 
-      local toplevel_host="" helper_pid="" ssh_port="" xml_path="" kernel_params="" opensnitch_port=""
-      local github_token="" proxy_addon="" proxy_confdir="" proxy_pid="" log_file="" size_bytes="" timestamp=""
-      local archive_base="" pid_file="" pid=""
+      local toplevel_host="" helper_pid="" xml_path="" kernel_params=""
+      # local ssh_port="" opensnitch_port="" github_token="" proxy_addon="" proxy_confdir=""
+      # local proxy_pid="" log_file="" size_bytes="" timestamp="" archive_base="" pid_file="" pid=""
 
       toplevel_host="$(ensure_system "$DATA_DIR/sysroot" "$FLAKE_DIR" "$FLAKE_ATTR")"
-      github_token="${AGENTSANDBOX_GITHUB_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
-      proxy_addon="$RUNTIME_DIR/proxy-addon.py"
-      proxy_confdir="$DATA_DIR/persistent/proxy/mitmproxy"
-      rm -f "$proxy_addon" "$RUNTIME_DIR/proxy.pid"
-      install -d "$proxy_confdir"
-      [[ -f "$TEMPLATE_DIR/../mitm-proxy-ca.key" && -f "$TEMPLATE_DIR/../mitm-proxy-ca.pem" ]] \
-        || die "missing mitm-proxy-ca.{key,pem} next to $TEMPLATE_DIR"
-      cat "$TEMPLATE_DIR/../mitm-proxy-ca.key" "$TEMPLATE_DIR/../mitm-proxy-ca.pem" >"$proxy_confdir/mitmproxy-ca.pem"
-      chmod 600 "$proxy_confdir/mitmproxy-ca.pem"
-      cp -f "$TEMPLATE_DIR/../mitm-proxy-ca.pem" "$proxy_confdir/mitmproxy-ca-cert.pem"
-      rm -f \
-        "$proxy_confdir/mitmproxy-ca-cert.cer" \
-        "$proxy_confdir/mitmproxy-ca-cert.p12" \
-        "$proxy_confdir/mitmproxy-ca.p12" \
-        "$proxy_confdir/mitmproxy-dhparam.pem"
+      # github_token="${AGENTSANDBOX_GITHUB_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
+      # proxy_addon="$RUNTIME_DIR/proxy-addon.py"
+      # proxy_confdir="$DATA_DIR/persistent/proxy/mitmproxy"
+      # rm -f "$proxy_addon" "$RUNTIME_DIR/proxy.pid"
+      # install -d "$proxy_confdir"
+      # [[ -f "$TEMPLATE_DIR/../mitm-proxy-ca.key" && -f "$TEMPLATE_DIR/../mitm-proxy-ca.pem" ]] \
+      #   || die "missing mitm-proxy-ca.{key,pem} next to $TEMPLATE_DIR"
+      # cat "$TEMPLATE_DIR/../mitm-proxy-ca.key" "$TEMPLATE_DIR/../mitm-proxy-ca.pem" >"$proxy_confdir/mitmproxy-ca.pem"
+      # chmod 600 "$proxy_confdir/mitmproxy-ca.pem"
+      # cp -f "$TEMPLATE_DIR/../mitm-proxy-ca.pem" "$proxy_confdir/mitmproxy-ca-cert.pem"
+      # rm -f \
+      #   "$proxy_confdir/mitmproxy-ca-cert.cer" \
+      #   "$proxy_confdir/mitmproxy-ca-cert.p12" \
+      #   "$proxy_confdir/mitmproxy-ca.p12" \
+      #   "$proxy_confdir/mitmproxy-dhparam.pem"
 
       # Proxy sidecar addon. Keep this block byte-for-byte aligned with future call sites.
-      cat >"$proxy_addon" <<'EOF'
-from __future__ import annotations
+#       cat >"$proxy_addon" <<'EOF'
+# from __future__ import annotations
 
-import fnmatch
-import json
-import os
-from datetime import datetime, timezone
+# import fnmatch
+# import json
+# import os
+# from datetime import datetime, timezone
 
-from mitmproxy import http
+# from mitmproxy import http
 
-ALLOWED_HOSTS_FILE = os.environ["AGENTSANDBOX_ALLOWED_HOSTS"]
-REQUEST_LOG = os.environ["AGENTSANDBOX_REQUEST_LOG"]
-GITHUB_TOKEN = os.environ.get("AGENTSANDBOX_GITHUB_TOKEN", "")
-
-
-def normalize_host(value: str) -> str:
-    host = value.strip().lower().rstrip(".")
-    if host.startswith("[") and "]" in host:
-        host = host[1 : host.index("]")]
-    elif ":" in host:
-        host = host.split(":", 1)[0]
-    return host
+# ALLOWED_HOSTS_FILE = os.environ["AGENTSANDBOX_ALLOWED_HOSTS"]
+# REQUEST_LOG = os.environ["AGENTSANDBOX_REQUEST_LOG"]
+# GITHUB_TOKEN = os.environ.get("AGENTSANDBOX_GITHUB_TOKEN", "")
 
 
-class AgentSandboxProxy:
-    def __init__(self) -> None:
-        self.allowed_hosts = []
-        self.allowed_hosts_mtime = None
-
-    def load_allowed_hosts(self) -> None:
-        try:
-            stat_result = os.stat(ALLOWED_HOSTS_FILE)
-        except FileNotFoundError:
-            self.allowed_hosts = []
-            self.allowed_hosts_mtime = None
-            return
-        if self.allowed_hosts_mtime == stat_result.st_mtime_ns:
-            return
-        loaded = []
-        with open(ALLOWED_HOSTS_FILE, "r", encoding="utf-8") as handle:
-            for raw_line in handle:
-                line = raw_line.strip().lower()
-                if not line or line.startswith("#"):
-                    continue
-                loaded.append(line)
-        self.allowed_hosts = loaded
-        self.allowed_hosts_mtime = stat_result.st_mtime_ns
-
-    def allow_host(self, host: str) -> bool:
-        self.load_allowed_hosts()
-        return any(fnmatch.fnmatch(host, pattern) for pattern in self.allowed_hosts)
-
-    def log_request(self, flow: http.HTTPFlow, filter_action: str, filter_reason: str) -> None:
-        injected = flow.metadata.get("agentsandbox_injected", [])
-        entry = {
-            "time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "method": flow.request.method,
-            "url": flow.request.pretty_url,
-            "host": flow.metadata.get("agentsandbox_host", normalize_host(flow.request.pretty_host)),
-            "status": flow.response.status_code if flow.response else None,
-            "filter": {"action": filter_action, "reason": filter_reason},
-            "credential_injection": injected,
-            "redaction": [],
-        }
-        with open(REQUEST_LOG, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(entry, sort_keys=True))
-            handle.write("\n")
-        flow.metadata["agentsandbox_logged"] = True
-
-    def requestheaders(self, flow: http.HTTPFlow) -> None:
-        host = normalize_host(flow.request.pretty_host)
-        flow.metadata["agentsandbox_host"] = host
-        flow.metadata["agentsandbox_injected"] = []
-        if flow.request.method != "CONNECT" and host == "api.github.com" and GITHUB_TOKEN:
-            if "authorization" not in flow.request.headers:
-                flow.request.headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
-                flow.metadata["agentsandbox_injected"] = [{"name": "github", "target": "api.github.com"}]
-        if self.allow_host(host):
-            flow.metadata["agentsandbox_filter"] = ("allow", "")
-            return
-        flow.metadata["agentsandbox_filter"] = ("block", "host_not_allowed")
-        flow.response = http.Response.make(
-            403,
-            b"blocked by agentsandbox\n",
-            {"Content-Type": "text/plain; charset=utf-8"},
-        )
-        self.log_request(flow, "block", "host_not_allowed")
-
-    def response(self, flow: http.HTTPFlow) -> None:
-        if flow.metadata.get("agentsandbox_logged"):
-            return
-        filter_action, filter_reason = flow.metadata.get("agentsandbox_filter", ("allow", ""))
-        self.log_request(flow, filter_action, filter_reason)
+# def normalize_host(value: str) -> str:
+#     host = value.strip().lower().rstrip(".")
+#     if host.startswith("[") and "]" in host:
+#         host = host[1 : host.index("]")]
+#     elif ":" in host:
+#         host = host.split(":", 1)[0]
+#     return host
 
 
-addons = [AgentSandboxProxy()]
-EOF
-      PROXY_PORT=3128
-      AGENTSANDBOX_ALLOWED_HOSTS="$FLAKE_DIR/allowed_hosts" \
-        AGENTSANDBOX_REQUEST_LOG="$STATE_DIR/logs/requests.jsonl" \
-        AGENTSANDBOX_GITHUB_TOKEN="$github_token" \
-        mitmdump \
-          --listen-host 0.0.0.0 \
-          --listen-port "$PROXY_PORT" \
-          --set block_global=false \
-          --set confdir="$proxy_confdir" \
-          --set flow_detail=0 \
-          --set termlog_verbosity=warn \
-          -s "$proxy_addon" >>"$STATE_DIR/logs/runtime.log" 2>&1 &
-      proxy_pid="$!"
-      printf '%s\n' "$proxy_pid" > "$RUNTIME_DIR/proxy.pid"
-      for proxy_pid in $(seq 1 50); do
-        if [[ -f "$proxy_confdir/mitmproxy-ca-cert.pem" ]] \
-          && ss -ltnH "( sport = :${PROXY_PORT} )" | grep -q .; then
-          break
-        fi
-        sleep 0.1
-      done
-      [[ "$proxy_pid" != 50 ]] || die "timed out waiting for proxy on port ${PROXY_PORT}"
+# class AgentSandboxProxy:
+#     def __init__(self) -> None:
+#         self.allowed_hosts = []
+#         self.allowed_hosts_mtime = None
+
+#     def load_allowed_hosts(self) -> None:
+#         try:
+#             stat_result = os.stat(ALLOWED_HOSTS_FILE)
+#         except FileNotFoundError:
+#             self.allowed_hosts = []
+#             self.allowed_hosts_mtime = None
+#             return
+#         if self.allowed_hosts_mtime == stat_result.st_mtime_ns:
+#             return
+#         loaded = []
+#         with open(ALLOWED_HOSTS_FILE, "r", encoding="utf-8") as handle:
+#             for raw_line in handle:
+#                 line = raw_line.strip().lower()
+#                 if not line or line.startswith("#"):
+#                     continue
+#                 loaded.append(line)
+#         self.allowed_hosts = loaded
+#         self.allowed_hosts_mtime = stat_result.st_mtime_ns
+
+#     def allow_host(self, host: str) -> bool:
+#         self.load_allowed_hosts()
+#         return any(fnmatch.fnmatch(host, pattern) for pattern in self.allowed_hosts)
+
+#     def log_request(self, flow: http.HTTPFlow, filter_action: str, filter_reason: str) -> None:
+#         injected = flow.metadata.get("agentsandbox_injected", [])
+#         entry = {
+#             "time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+#             "method": flow.request.method,
+#             "url": flow.request.pretty_url,
+#             "host": flow.metadata.get("agentsandbox_host", normalize_host(flow.request.pretty_host)),
+#             "status": flow.response.status_code if flow.response else None,
+#             "filter": {"action": filter_action, "reason": filter_reason},
+#             "credential_injection": injected,
+#             "redaction": [],
+#         }
+#         with open(REQUEST_LOG, "a", encoding="utf-8") as handle:
+#             handle.write(json.dumps(entry, sort_keys=True))
+#             handle.write("\n")
+#         flow.metadata["agentsandbox_logged"] = True
+
+#     def requestheaders(self, flow: http.HTTPFlow) -> None:
+#         host = normalize_host(flow.request.pretty_host)
+#         flow.metadata["agentsandbox_host"] = host
+#         flow.metadata["agentsandbox_injected"] = []
+#         if flow.request.method != "CONNECT" and host == "api.github.com" and GITHUB_TOKEN:
+#             if "authorization" not in flow.request.headers:
+#                 flow.request.headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+#                 flow.metadata["agentsandbox_injected"] = [{"name": "github", "target": "api.github.com"}]
+#         if self.allow_host(host):
+#             flow.metadata["agentsandbox_filter"] = ("allow", "")
+#             return
+#         flow.metadata["agentsandbox_filter"] = ("block", "host_not_allowed")
+#         flow.response = http.Response.make(
+#             403,
+#             b"blocked by agentsandbox\n",
+#             {"Content-Type": "text/plain; charset=utf-8"},
+#         )
+#         self.log_request(flow, "block", "host_not_allowed")
+
+#     def response(self, flow: http.HTTPFlow) -> None:
+#         if flow.metadata.get("agentsandbox_logged"):
+#             return
+#         filter_action, filter_reason = flow.metadata.get("agentsandbox_filter", ("allow", ""))
+#         self.log_request(flow, filter_action, filter_reason)
+
+
+# addons = [AgentSandboxProxy()]
+# EOF
+#       PROXY_PORT=3128
+#       AGENTSANDBOX_ALLOWED_HOSTS="$FLAKE_DIR/allowed_hosts" \
+#         AGENTSANDBOX_REQUEST_LOG="$STATE_DIR/logs/requests.jsonl" \
+#         AGENTSANDBOX_GITHUB_TOKEN="$github_token" \
+#         mitmdump \
+#           --listen-host 0.0.0.0 \
+#           --listen-port "$PROXY_PORT" \
+#           --set block_global=false \
+#           --set confdir="$proxy_confdir" \
+#           --set flow_detail=0 \
+#           --set termlog_verbosity=warn \
+#           -s "$proxy_addon" >>"$STATE_DIR/logs/runtime.log" 2>&1 &
+#       proxy_pid="$!"
+#       printf '%s\n' "$proxy_pid" > "$RUNTIME_DIR/proxy.pid"
+#       for proxy_pid in $(seq 1 50); do
+#         if [[ -f "$proxy_confdir/mitmproxy-ca-cert.pem" ]] \
+#           && ss -ltnH "( sport = :${PROXY_PORT} )" | grep -q .; then
+#           break
+#         fi
+#         sleep 0.1
+#       done
+#       [[ "$proxy_pid" != 50 ]] || die "timed out waiting for proxy on port ${PROXY_PORT}"
       unshare --mount --fork --pid -- bash "$SCRIPT_PATH" __mount-helper "$DATA_DIR/persistent" "$STATE_DIR/logs/runtime.log" &
       helper_pid="$!"
       printf '%s\n' "$helper_pid" > "$RUNTIME_DIR/mount-helper.pid"
@@ -578,12 +578,12 @@ EOF
         0 \
         "$STATE_DIR/logs/runtime.log"
 
-      if [[ "$OPENSNITCH_ENABLED" == "true" ]]; then
-        opensnitch_port="${OPENSNITCH_ADDRESS##*:}"
-        socat "TCP-LISTEN:${opensnitch_port},bind=0.0.0.0,reuseaddr,fork" "TCP:127.0.0.1:50051" \
-          >>"$STATE_DIR/logs/runtime.log" 2>&1 &
-        printf '%s\n' "$!" > "$RUNTIME_DIR/opensnitch-forward.pid"
-      fi
+      # if [[ "$OPENSNITCH_ENABLED" == "true" ]]; then
+      #   opensnitch_port="${OPENSNITCH_ADDRESS##*:}"
+      #   socat "TCP-LISTEN:${opensnitch_port},bind=0.0.0.0,reuseaddr,fork" "TCP:127.0.0.1:50051" \
+      #     >>"$STATE_DIR/logs/runtime.log" 2>&1 &
+      #   printf '%s\n' "$!" > "$RUNTIME_DIR/opensnitch-forward.pid"
+      # fi
 
       kernel_params="$(tr '\n' ' ' < "$toplevel_host/kernel-params" | sed -e 's/[[:space:]]*$//')"
       xml_path="$(
@@ -626,24 +626,24 @@ EOF
       virsh create "$xml_path" >/dev/null
       printf '%s\n' "$INSTANCE_ID"
 
-      if [[ "$OPENSNITCH_ENABLED" == "true" ]]; then
-        bash "$SCRIPT_PATH" __opensnitch-watchdog \
-          "$INSTANCE_ID" \
-          "$STATE_DIR/logs/runtime.log" \
-          "$RUNTIME_DIR/opensnitch-forward.pid" \
-          "$opensnitch_port" \
-          15 &
-        printf '%s\n' "$!" > "$RUNTIME_DIR/opensnitch-watchdog.pid"
-      fi
+      # if [[ "$OPENSNITCH_ENABLED" == "true" ]]; then
+      #   bash "$SCRIPT_PATH" __opensnitch-watchdog \
+      #     "$INSTANCE_ID" \
+      #     "$STATE_DIR/logs/runtime.log" \
+      #     "$RUNTIME_DIR/opensnitch-forward.pid" \
+      #     "$opensnitch_port" \
+      #     15 &
+      #   printf '%s\n' "$!" > "$RUNTIME_DIR/opensnitch-watchdog.pid"
+      # fi
 
-      (( DETACH )) && return 0
-      ssh_port="$(host_port_for_guest "$PORT_FORWARDS_JSON" 22 tcp)"
-      for helper_pid in $(seq 1 90); do
-        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=2 \
-          -p "$ssh_port" root@127.0.0.1 true >/dev/null 2>&1 && { guest_ssh root "$ssh_port"; return 0; }
-        sleep 2
-      done
-      die "guest did not become reachable over ssh"
+      # (( DETACH )) && return 0
+      # ssh_port="$(host_port_for_guest "$PORT_FORWARDS_JSON" 22 tcp)"
+      # for helper_pid in $(seq 1 90); do
+      #   ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=2 \
+      #     -p "$ssh_port" root@127.0.0.1 true >/dev/null 2>&1 && { guest_ssh root "$ssh_port"; return 0; }
+      #   sleep 2
+      # done
+      # die "guest did not become reachable over ssh"
       ;;
     down)
       FLAKE_DIR="$(get_or_create_flake_dir "$PWD")"

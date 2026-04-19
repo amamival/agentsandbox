@@ -16,7 +16,15 @@
     {
       packages = eachSystem
         (system:
-          let pkgs = pkgsFor system; in {
+          let
+            pkgs = pkgsFor system;
+            agentsandbox-rs = pkgs.rustPlatform.buildRustPackage {
+              pname = "agentsandbox_rs";
+              version = "0.0.0";
+              src = ./.;
+              cargoLock.lockFile = ./Cargo.lock;
+            };
+          in {
             default = pkgs.stdenvNoCC.mkDerivation {
               pname = "agentsandbox";
               version = "0.0.0-dev";
@@ -25,6 +33,7 @@
               nativeBuildInputs = [ pkgs.makeWrapper ];
               installPhase = ''
                 mkdir "$out" && cp -r "$src"/{bin,share} "$out/" && chmod -R u+w "$out"
+                install -Dm755 ${agentsandbox-rs}/bin/agentsandbox_rs "$out/bin/agentsandbox_rs"
                 wrapProgram "$out/bin/agentsandbox" \
                   --prefix PATH : ${pkgs.lib.makeBinPath (with pkgs; [
                     bubblewrap curl jq libvirt mitmproxy openssh passt socat util-linux virtiofsd zstd

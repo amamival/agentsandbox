@@ -2,3 +2,6 @@
 name = "agentsandbox_rs"
 version = "0.0.0"
 edition = "2024"
+
+[dependencies]
+clap = { version = "4.5.38", default-features = false, features = ["derive", "help", "std", "usage"] }

@@ -1,3 +1,4 @@
+target/
 share/agentsandbox/template/flake.lock
 result*
 *.bpf

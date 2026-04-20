@@ -1,11 +1,21 @@
 use clap::{Parser, Subcommand};
 use flate2::read::GzDecoder;
 use reqwest::{blocking::Client, header};
-use rustix::process::getuid;
+use rustix::{
+    io::{read, write},
+    mount::{MountFlags, MountPropagationFlags, UnmountFlags},
+    mount::{mount, mount_bind, mount_bind_recursive, mount_change, mount_remount, unmount},
+    pipe::{PipeFlags, pipe_with},
+    process::{WaitOptions, chdir, fchdir, getuid, pivot_root, waitpid},
+    runtime::{Fork, exit_group, kernel_fork},
+    thread::{UnshareFlags, unshare_unsafe},
+};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     env, fs,
+    io::ErrorKind,
+    os::unix::{fs::symlink, process::CommandExt},
     path::{Path, PathBuf},
     process::{self, Stdio},
 };
@@ -24,11 +34,11 @@ struct Cli {
     #[arg(short = 'g', long, global = true)]
     global: bool,
     /// Select sandbox hostname.
-    #[arg(short = 'h', long, global = true, default_value = "default")]
+    #[arg(short = 'n', long, global = true, default_value = "default")]
     hostname: String,
     /// Resolve the active workspace and config as if running from this directory.
-    #[arg(short = 't', long = "target", global = true, env = "PWD")]
-    target_dir: Option<PathBuf>,
+    #[arg(short = 'w', global = true, env = "PWD")]
+    workspace: Option<PathBuf>,
 
     #[arg(long, hide = true, env = "HOME")]
     home: Option<PathBuf>,
@@ -129,7 +139,7 @@ enum Command {
 struct Env {
     is_global: bool,
     hostname: String,
-    target_dir: PathBuf,
+    workspace: PathBuf,
     config_root: PathBuf,
     data_root: PathBuf,
     state_root: PathBuf,
@@ -168,6 +178,7 @@ fn main() {
         Some(Command::Unpause) => run_unpause(&env),
         Some(Command::Ps) => run_ps(&env),
         Some(Command::Destroy { system, data, logs, conf }) => run_destroy(&env, system, data, logs, conf),
+        Some(Command::Ssh { args }) => run_ssh(&env, &args),
         None | Some(_) => Ok(()),
     } {
         eprintln!("{err}");
@@ -177,12 +188,12 @@ fn main() {
 
 fn resolve_env(cli: &Cli) -> Result<Env, String> {
     let uid = getuid().as_raw();
-    let target_dir = cli.target_dir.clone().ok_or("PWD is not set; pass --target".to_owned())?;
-    let home = cli.home.clone().unwrap_or_else(|| target_dir.clone());
+    let workspace = cli.workspace.clone().ok_or("PWD is not set; pass --target".to_owned())?;
+    let home = cli.home.clone().unwrap_or_else(|| workspace.clone());
     Ok(Env {
         is_global: cli.global,
         hostname: cli.hostname.clone(),
-        target_dir,
+        workspace,
         config_root: cli.xdg_config_home.clone().unwrap_or_else(|| home.join(".config")).join(APP_NAME),
         data_root: cli.xdg_data_home.clone().unwrap_or_else(|| home.join(".local/share")).join(APP_NAME),
         state_root: cli.xdg_state_home.clone().unwrap_or_else(|| home.join(".local/state")).join(APP_NAME),
@@ -199,30 +210,10 @@ fn run_init(env: &Env, force: bool) -> Result<(), String> {
     let target = if env.is_global {
         env.config_root.clone()
     } else {
-        env.target_dir.join(LOCAL_CONFIG_DIR)
+        env.workspace.join(LOCAL_CONFIG_DIR)
     };
-    if target.exists() && !force {
-        return Err(format!("{} already exists", target.display()));
-    }
-    fs::create_dir_all(&target).map_err(|err| err.to_string())?;
-    let target_dir = env.target_dir.canonicalize().map_err(|err| err.to_string())?;
-    let workspace_name = target_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or("failed to derive workspace name".to_owned())?;
-    fs::create_dir_all(target.join("agentsandbox")).map_err(|err| err.to_string())?;
-    for (name, contents) in [
-        ("flake.nix", include_str!("../share/agentsandbox/template/flake.nix").to_owned()),
-        ("configuration.nix", include_str!("../share/agentsandbox/template/configuration.nix").to_owned()),
-        ("allowed_hosts", String::new()),
-        ("mounts", format!("# <host-path><TAB><guest-name>\n{}\t{workspace_name}\n", target_dir.display())),
-        (
-            "agentsandbox/flake.nix",
-            include_str!("../share/agentsandbox/template/agentsandbox/flake.nix").to_owned(),
-        ),
-    ] {
-        fs::write(target.join(name), contents).map_err(|err| err.to_string())?;
-    }
+    let workspace = env.workspace.canonicalize().map_err(|err| err.to_string())?;
+    write_template_config(&target, &workspace, force)?;
     eprintln!("init: wrote template files to {}", target.display());
     Ok(())
 }
@@ -234,6 +225,7 @@ fn run_build(env: &Env) -> Result<(), String> {
     if !instance.sysroot.join("nix/store").is_dir() {
         fetch_nix_dockerhub(&instance.sysroot)?;
     }
+    install_initial_nixos_profile(env, &instance.sysroot, &flake_dir, &env.hostname)?;
     Ok(())
 }
 
@@ -292,6 +284,146 @@ fn fetch_nix_dockerhub(sysroot: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn install_initial_nixos_profile(env: &Env, sysroot: &Path, _flake_dir: &Path, hostname: &str) -> Result<(), String> {
+    let config_target = sysroot.join("etc/nixos");
+    eprintln!("install: writing template config into {}", config_target.display());
+    write_template_config(&config_target, &env.workspace.canonicalize().map_err(|err| err.to_string())?, true)?;
+    // Remove previous out-link so `nix build --out-link /nix/var/nix/profiles/system` can overwrite it.
+    match fs::remove_file(sysroot.join("nix/var/nix/profiles/system")) {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => return Err(err.to_string()),
+    }
+    eprintln!("install: capturing uid/gid maps via unshare");
+    let uid_map = run_capture("unshare", &["--user", "--map-root-user", "--map-auto", "cat", "/proc/self/uid_map"])?;
+    let gid_map = run_capture("unshare", &["--user", "--map-root-user", "--map-auto", "cat", "/proc/self/gid_map"])?;
+    let (child_ready_read, child_ready_write) = pipe_with(PipeFlags::CLOEXEC).map_err(|err| err.to_string())?;
+    let (parent_done_read, parent_done_write) = pipe_with(PipeFlags::CLOEXEC).map_err(|err| err.to_string())?;
+    match unsafe { kernel_fork() }.map_err(|err| err.to_string())? {
+        Fork::Child(_) => {
+            drop(child_ready_read);
+            drop(parent_done_write);
+            let status = match install_initial_nixos_profile_child(sysroot, hostname, &child_ready_write, &parent_done_read) {
+                Ok(()) => 0,
+                Err(err) => {
+                    eprintln!("{err}");
+                    1
+                }
+            };
+            exit_group(status)
+        }
+        Fork::ParentOf(child_pid) => {
+            drop(child_ready_write);
+            drop(parent_done_read);
+            let parent_error = (|| {
+                wait_for_pipe_signal(&child_ready_read, "child namespace setup")?;
+                install_user_namespace_maps(child_pid, &uid_map, &gid_map)?;
+                write_all_fd(&parent_done_write, &[1])
+            })()
+            .err();
+            drop(parent_done_write);
+            let (_, status) = waitpid(Some(child_pid), WaitOptions::empty())
+                .map_err(|err| err.to_string())?
+                .ok_or("install child disappeared before waitpid reported status".to_owned())?;
+            if let Some(err) = parent_error {
+                return Err(err);
+            }
+            if let Some(code) = status.exit_status() {
+                if code == 0 {
+                    Ok(())
+                } else {
+                    Err(format!("install child exited with status {code}"))
+                }
+            } else if let Some(signal) = status.terminating_signal() {
+                Err(format!("install child terminated by signal {signal}"))
+            } else {
+                Err(format!("install child ended unexpectedly: {status:?}"))
+            }
+        }
+    }
+}
+
+fn install_initial_nixos_profile_child(
+    sysroot: &Path,
+    hostname: &str,
+    child_ready_write: &std::os::fd::OwnedFd,
+    parent_done_read: &std::os::fd::OwnedFd,
+) -> Result<(), String> {
+    eprintln!("install: entering user+mount namespace");
+    unsafe { unshare_unsafe(UnshareFlags::NEWUSER | UnshareFlags::NEWNS) }.map_err(|err| err.to_string())?;
+    write_all_fd(child_ready_write, &[1])?;
+    wait_for_pipe_signal(parent_done_read, "parent uid/gid map install")?;
+    eprintln!("install: changing mount propagation to slave | recursive");
+    mount_change("/", MountPropagationFlags::DOWNSTREAM | MountPropagationFlags::REC).map_err(|err| err.to_string())?;
+    eprintln!("install: mounting tmpfs staging root on /tmp");
+    mount("tmpfs", "/tmp", "tmpfs", MountFlags::NODEV | MountFlags::NOSUID, c"").map_err(|err| err.to_string())?;
+    chdir("/tmp").map_err(|err| err.to_string())?;
+    fs::create_dir_all("newroot").map_err(|err| err.to_string())?;
+    mount_bind_recursive("newroot", "newroot").map_err(|err| err.to_string())?;
+    fs::create_dir_all("oldroot").map_err(|err| err.to_string())?;
+    eprintln!("install: pivoting into tmpfs staging root");
+    pivot_root(".", "oldroot").map_err(|err| err.to_string())?;
+    chdir("/").map_err(|err| err.to_string())?;
+
+    eprintln!("install: binding sysroot to /newroot");
+    bind_tree(&oldroot_path(sysroot)?, Path::new("/newroot"))?;
+    eprintln!("install: binding host /etc/resolv.conf to /newroot/etc/resolv.conf");
+    bind_tree(&oldroot_path(Path::new("/etc/resolv.conf"))?, Path::new("/newroot/etc/resolv.conf"))?;
+    eprintln!("install: remounting /newroot/etc/resolv.conf read-only");
+    mount_remount("/newroot/etc/resolv.conf", MountFlags::BIND | MountFlags::RDONLY, c"").map_err(|err| err.to_string())?;
+    eprintln!("install: binding host /proc to /newroot/proc");
+    bind_tree(&oldroot_path(Path::new("/proc"))?, Path::new("/newroot/proc"))?;
+
+    fs::create_dir_all("/newroot/dev").map_err(|err| err.to_string())?;
+    eprintln!("install: mounting tmpfs /newroot/dev");
+    mount("tmpfs", "/newroot/dev", "tmpfs", MountFlags::NODEV | MountFlags::NOSUID, c"mode=0755").map_err(|err| err.to_string())?;
+    for node in ["null", "zero", "full", "random", "urandom", "tty"] {
+        bind_tree(&oldroot_path(&Path::new("/dev").join(node))?, &Path::new("/newroot/dev").join(node))?;
+    }
+    for (fd, node) in [(0, "stdin"), (1, "stdout"), (2, "stderr")] {
+        symlink(format!("/proc/self/fd/{fd}"), Path::new("/newroot/dev").join(node)).map_err(|err| err.to_string())?;
+    }
+    symlink("/proc/self/fd", "/newroot/dev/fd").map_err(|err| err.to_string())?;
+    symlink("/proc/kcore", "/newroot/dev/core").map_err(|err| err.to_string())?;
+    fs::create_dir_all("/newroot/dev/shm").map_err(|err| err.to_string())?;
+    fs::create_dir_all("/newroot/dev/pts").map_err(|err| err.to_string())?;
+    eprintln!("install: mounting devpts to /newroot/dev/pts");
+    mount(
+        "devpts",
+        "/newroot/dev/pts",
+        "devpts",
+        MountFlags::NOSUID | MountFlags::NOEXEC,
+        c"newinstance,ptmxmode=0666,mode=620",
+    )
+    .map_err(|err| err.to_string())?;
+    symlink("pts/ptmx", "/newroot/dev/ptmx").map_err(|err| err.to_string())?;
+    eprintln!("install: mounting tmpfs to /newroot/dev/shm");
+    mount("tmpfs", "/newroot/dev/shm", "tmpfs", MountFlags::NODEV | MountFlags::NOSUID, c"mode=01777").map_err(|err| err.to_string())?;
+
+    eprintln!("install: detaching old root");
+    mount_change("/oldroot", MountPropagationFlags::PRIVATE | MountPropagationFlags::REC).map_err(|err| err.to_string())?;
+    unmount("/oldroot", UnmountFlags::DETACH).map_err(|err| err.to_string())?;
+    let oldroot = fs::File::open("/").map_err(|err| err.to_string())?;
+    chdir("/newroot").map_err(|err| err.to_string())?;
+    pivot_root(".", ".").map_err(|err| err.to_string())?;
+    fchdir(&oldroot).map_err(|err| err.to_string())?;
+    unmount(".", UnmountFlags::DETACH).map_err(|err| err.to_string())?;
+    chdir("/").map_err(|err| err.to_string())?;
+
+    eprintln!("install: execing nix build for hostname={hostname}");
+    Err(process::Command::new("/nix/var/nix/profiles/default/bin/nix")
+        .args([
+            "--extra-experimental-features",
+            "nix-command flakes",
+            "build",
+            &format!("/etc/nixos#nixosConfigurations.{hostname}.config.system.build.toplevel"),
+            "--out-link",
+            "/nix/var/nix/profiles/system",
+        ])
+        .exec()
+        .to_string())
+}
+
 fn run_down(env: &Env) -> Result<(), String> {
     let flake_dir = resolve_flake_dir(env)?;
     let instance = resolve_instance(env, &flake_dir, &env.hostname)?;
@@ -323,21 +455,38 @@ fn run_unpause(env: &Env) -> Result<(), String> {
 fn run_ps(env: &Env) -> Result<(), String> {
     let flake_dir = resolve_flake_dir(env)?;
     let instance = resolve_instance(env, &flake_dir, &env.hostname)?;
-    let output = process::Command::new("virsh")
-        .arg("domstate")
-        .arg(instance.id.as_str())
-        .output()
-        .map_err(|err| err.to_string())?;
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    let state = if output.status.success() {
-        String::from_utf8_lossy(&output.stdout).trim().to_owned()
-    } else if stderr.contains("failed to get domain") {
-        "down".to_owned()
-    } else {
-        stderr
+    let state = match domstate(instance.id.as_str())? {
+        Some(state) => state,
+        None => "down".to_owned(),
     };
     println!("{}\t{}", instance.id, state);
     Ok(())
+}
+
+fn run_ssh(env: &Env, args: &[String]) -> Result<(), String> {
+    let flake_dir = resolve_flake_dir(env)?;
+    let instance = resolve_instance(env, &flake_dir, &env.hostname)?;
+    if domstate(&instance.id)?.as_deref() != Some("running") {
+        return Err("VM is not running".to_owned());
+    }
+    let ssh_port = host_port_for_guest(&eval_port_forwards(&flake_dir, &env.hostname)?, 22, "tcp")
+        .ok_or("ssh port forward for guest tcp/22 is not configured".to_owned())?;
+    Err(process::Command::new("ssh")
+        .arg("vscode@127.0.0.1")
+        .arg("-p")
+        .arg(ssh_port.to_string())
+        .arg("-o")
+        .arg("LogLevel=ERROR")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg("UserKnownHostsFile=/dev/null")
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .exec()
+        .to_string())
 }
 
 fn run_destroy(env: &Env, system: bool, data: bool, logs: bool, conf: bool) -> Result<(), String> {
@@ -369,6 +518,164 @@ fn virsh(args: &[&str]) {
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status();
+}
+
+fn run_capture(command: &str, args: &[&str]) -> Result<String, String> {
+    let output = process::Command::new(command).args(args).output().map_err(|err| err.to_string())?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+    }
+}
+
+fn run_inherit_strings(command: &str, args: &[String]) -> Result<(), String> {
+    let status = process::Command::new(command)
+        .args(args)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|err| err.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{command} failed with status {}",
+            status.code().map_or("signal".to_owned(), |code| code.to_string())
+        ))
+    }
+}
+
+fn install_user_namespace_maps(child_pid: rustix::process::Pid, uid_map: &str, gid_map: &str) -> Result<(), String> {
+    eprintln!("install: writing uid map via newuidmap for child {child_pid}");
+    run_inherit_strings("newuidmap", &id_map_command_args(child_pid, uid_map)?)?;
+    eprintln!("install: writing setgroups deny for child {child_pid}");
+    fs::write(format!("/proc/{}/setgroups", child_pid.as_raw_pid()), "deny\n").map_err(|err| err.to_string())?;
+    eprintln!("install: writing gid map via newgidmap for child {child_pid}");
+    run_inherit_strings("newgidmap", &id_map_command_args(child_pid, gid_map)?)
+}
+
+fn id_map_command_args(child_pid: rustix::process::Pid, id_map: &str) -> Result<Vec<String>, String> {
+    let mut args = vec![child_pid.as_raw_pid().to_string()];
+    for line in id_map.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() != 3 {
+            return Err(format!("invalid id map line: {line}"));
+        }
+        args.extend(fields.into_iter().map(str::to_owned));
+    }
+    if args.len() == 1 {
+        return Err("captured id map was empty".to_owned());
+    }
+    Ok(args)
+}
+
+fn write_all_fd(fd: &std::os::fd::OwnedFd, mut buf: &[u8]) -> Result<(), String> {
+    while !buf.is_empty() {
+        let written = write(fd, buf).map_err(|err| err.to_string())?;
+        if written == 0 {
+            return Err("short write to pipe".to_owned());
+        }
+        buf = &buf[written..];
+    }
+    Ok(())
+}
+
+fn wait_for_pipe_signal(fd: &std::os::fd::OwnedFd, stage: &str) -> Result<(), String> {
+    let mut byte = [0_u8; 1];
+    if read(fd, &mut byte).map_err(|err| err.to_string())? == 1 {
+        Ok(())
+    } else {
+        Err(format!("{stage} failed before signaling readiness"))
+    }
+}
+
+fn oldroot_path(path: &Path) -> Result<PathBuf, String> {
+    Ok(Path::new("/oldroot").join(path.strip_prefix("/").map_err(|_| format!("{} is not absolute", path.display()))?))
+}
+
+fn bind_tree(source: &Path, target: &Path) -> Result<(), String> {
+    if ensure_mount_target(source, target)? {
+        mount_bind_recursive(source, target).map_err(|err| err.to_string())
+    } else {
+        mount_bind(source, target).map_err(|err| err.to_string())
+    }
+}
+
+fn ensure_mount_target(source: &Path, target: &Path) -> Result<bool, String> {
+    let metadata = fs::metadata(source).map_err(|err| err.to_string())?;
+    if metadata.is_dir() {
+        fs::create_dir_all(target).map_err(|err| err.to_string())?;
+        Ok(true)
+    } else {
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        }
+        if !target.exists() {
+            fs::write(target, "").map_err(|err| err.to_string())?;
+        }
+        Ok(false)
+    }
+}
+
+fn domstate(instance_id: &str) -> Result<Option<String>, String> {
+    let output = process::Command::new("virsh")
+        .arg("domstate")
+        .arg(instance_id)
+        .output()
+        .map_err(|err| err.to_string())?;
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if output.status.success() {
+        Ok(Some(String::from_utf8_lossy(&output.stdout).trim().to_owned()))
+    } else if stderr.contains("failed to get domain") {
+        Ok(None)
+    } else {
+        Err(stderr)
+    }
+}
+
+fn eval_port_forwards(flake_dir: &Path, hostname: &str) -> Result<Value, String> {
+    let output = process::Command::new("nix")
+        .arg("eval")
+        .arg("--json")
+        .arg(format!(
+            "{}#nixosConfigurations.{hostname}.config.agentsandbox.portForwards",
+            flake_dir.display()
+        ))
+        .output()
+        .map_err(|err| err.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    serde_json::from_slice(&output.stdout).map_err(|err| err.to_string())
+}
+
+fn host_port_for_guest(port_forwards: &Value, guest_port: u16, proto: &str) -> Option<u16> {
+    for forward in port_forwards.as_object()?.values() {
+        if forward.get("proto")?.as_str()? != proto {
+            continue;
+        }
+        let start = if forward.get("host")?.is_number() {
+            forward.get("host")?.as_u64()?
+        } else {
+            forward.get("host")?.get("start")?.as_u64()?
+        };
+        let end = if forward.get("host")?.is_number() {
+            start
+        } else {
+            forward.get("host")?.get("end")?.as_u64()?
+        };
+        let guest = forward.get("guest")?.as_u64()?;
+        let guest_port = u64::from(guest_port);
+        if guest_port >= guest && guest_port <= guest + (end - start) {
+            return u16::try_from(start + guest_port - guest).ok();
+        }
+    }
+    None
 }
 
 fn resolve_instance(env: &Env, flake_dir: &Path, hostname: &str) -> Result<Instance, String> {
@@ -427,9 +734,34 @@ fn remove_dir_all_if_exists(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn write_template_config(target: &Path, workspace: &Path, force: bool) -> Result<(), String> {
+    if target.exists() && !force {
+        return Err(format!("{} already exists", target.display()));
+    }
+    fs::create_dir_all(target).map_err(|err| err.to_string())?;
+    let workspace_name = workspace
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("failed to derive workspace name".to_owned())?;
+    fs::create_dir_all(target.join("agentsandbox")).map_err(|err| err.to_string())?;
+    for (name, contents) in [
+        ("flake.nix", include_str!("../share/agentsandbox/template/flake.nix").to_owned()),
+        ("configuration.nix", include_str!("../share/agentsandbox/template/configuration.nix").to_owned()),
+        ("allowed_hosts", String::new()),
+        ("mounts", format!("# <host-path><TAB><guest-name>\n{}\t{workspace_name}\n", workspace.display())),
+        (
+            "agentsandbox/flake.nix",
+            include_str!("../share/agentsandbox/template/agentsandbox/flake.nix").to_owned(),
+        ),
+    ] {
+        fs::write(target.join(name), contents).map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
 fn resolve_flake_dir(env: &Env) -> Result<PathBuf, String> {
     if !env.is_global {
-    let mut dir = env.target_dir.canonicalize().map_err(|err| err.to_string())?;
+        let mut dir = env.workspace.canonicalize().map_err(|err| err.to_string())?;
         loop {
             if dir.join(format!("{LOCAL_CONFIG_DIR}/flake.nix")).is_file() {
                 return Ok(dir.join(LOCAL_CONFIG_DIR));
@@ -450,8 +782,7 @@ fn resolve_flake_dir(env: &Env) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        APP_NAME, Cli, Instance, LOCAL_CONFIG_DIR, prepare, remove_dir_all_if_exists, resolve_env, resolve_flake_dir, resolve_instance, run_destroy,
-        run_init,
+        APP_NAME, Cli, Instance, LOCAL_CONFIG_DIR, prepare, remove_dir_all_if_exists, resolve_env, resolve_flake_dir, resolve_instance, run_destroy, run_init,
     };
     use sha2::{Digest, Sha256};
     use std::{
@@ -466,12 +797,7 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
-    fn env_from_input(
-        target_dir: PathBuf,
-        home: PathBuf,
-        global: bool,
-        xdg: Option<(PathBuf, PathBuf, PathBuf, PathBuf)>,
-    ) -> super::Env {
+    fn env_from_input(workspace: PathBuf, home: PathBuf, global: bool, xdg: Option<(PathBuf, PathBuf, PathBuf, PathBuf)>) -> super::Env {
         let (xdg_config_home, xdg_data_home, xdg_state_home, xdg_runtime_dir) = match xdg {
             Some((config, data, state, runtime)) => (Some(config), Some(data), Some(state), Some(runtime)),
             None => (None, None, None, None),
@@ -479,7 +805,7 @@ mod tests {
         resolve_env(&Cli {
             global,
             hostname: "default".into(),
-            target_dir: Some(target_dir),
+            workspace: Some(workspace),
             home: Some(home),
             xdg_config_home,
             xdg_data_home,
@@ -509,7 +835,6 @@ mod tests {
         let bin_dir = root.join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
         write_executable(&bin_dir.join("virsh"), "#!/bin/sh\nexit 1\n");
-        write_executable(&bin_dir.join("kill"), "#!/bin/sh\nexit 0\n");
         bin_dir
     }
 
@@ -577,12 +902,13 @@ mod tests {
         let workspace_root = root.join("workspace");
         let workspace = workspace_root.join("subdir");
         let flake_dir = workspace_root.join(LOCAL_CONFIG_DIR);
-        let data_root = root.join("data");
-        assert_dirs(&[&home, &workspace, &data_root]);
+        assert_dirs(&[&home, &workspace]);
         run_init(&env_from_input(workspace_root.clone(), home.clone(), false, None), false).unwrap();
         assert_dirs(&[&global]);
         fs::write(global.join("flake.nix"), "").unwrap();
         let env = env_from_input(workspace.clone(), home.clone(), false, None);
+        let data_root = env.data_root.clone();
+        assert_dirs(&[&data_root]);
         assert_eq!(resolve_flake_dir(&env).unwrap(), flake_dir);
         fs::write(flake_dir.join("machine-prefix"), "0123456789abcdef01234567").unwrap();
         let machine_id = Sha256::digest(b"default").iter().map(|byte| format!("{byte:02x}")).collect::<String>();
@@ -597,7 +923,7 @@ mod tests {
                 "/target".into(),
                 "/home".into(),
                 false,
-                Some(("/config".into(), "/".into(), "/".into(), "/".into())),
+                Some(("/config".into(), "/data".into(), "/state".into(), "/runtime".into())),
             ),
             &other_flake_dir,
             "demo",
@@ -605,9 +931,9 @@ mod tests {
         .unwrap();
         let demo_machine_id = Sha256::digest(b"demo").iter().map(|byte| format!("{byte:02x}")).collect::<String>();
         assert_eq!(paths.id, "other-demo-0123456789abcdef01234567".to_owned() + &demo_machine_id[..8]);
-        assert_eq!(paths.data_dir, PathBuf::from("/data").join(&paths.id));
-        assert_eq!(paths.state_dir, PathBuf::from("/state").join(&paths.id));
-        assert_eq!(paths.runtime_dir, PathBuf::from("/runtime").join(&paths.id));
+        assert_eq!(paths.data_dir, PathBuf::from("/data").join(APP_NAME).join(&paths.id));
+        assert_eq!(paths.state_dir, PathBuf::from("/state").join(APP_NAME).join(&paths.id));
+        assert_eq!(paths.runtime_dir, PathBuf::from("/runtime").join(APP_NAME).join(&paths.id));
         assert_eq!(paths.sysroot, paths.data_dir.join("sysroot"));
         assert_eq!(paths.persistent, paths.data_dir.join("persistent"));
         assert_eq!(paths.logs_dir, paths.state_dir.join("logs"));
@@ -630,7 +956,7 @@ mod tests {
     #[test]
     fn destroy_respects_flag_combinations() {
         let _guard = env_lock().lock().unwrap();
-        let (root, home, global) = test_root("destroy");
+        let (root, home, _global) = test_root("destroy");
         let workspace = root.join("workspace");
         assert_dirs(&[&home, &workspace]);
         let original_path = with_fake_path(&root);

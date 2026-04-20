@@ -382,6 +382,10 @@ $XDG_RUNTIME_DIR/agentsandbox/<instance-id>/
   `virsh create`.
 - `down` requests guest shutdown.
 - `kill` immediately destroys the transient domain.
-- `destroy` stops the transient domain, removes the instance `sysroot/`, and
-  keeps `persistent/`.
+- `destroy` stops the transient domain and removes runtime helper state only.
+- `destroy --system` removes the instance `sysroot/`.
+- `destroy --data` removes the instance `persistent/`.
+- `destroy --system --data` removes the whole instance data dir.
+- `destroy --logs` removes the whole instance state dir.
+- `destroy --conf` removes the resolved config dir.
 - `port` resolves the host port from the selected `portForwards`.

@@ -257,14 +257,17 @@ fn resolve_instance_id(flake_dir: &Path, profile: &str, data_root: &Path) -> Res
     let prefix_file = flake_dir.join("machine-prefix");
     let mut prefix = fs::read_to_string(&prefix_file).unwrap_or_default();
     if prefix.is_empty() {
-        prefix = format!(
-            "{:x}",
-            Sha256::digest(flake_dir.canonicalize().map_err(|err| err.to_string())?.display().to_string().as_bytes())
-        )[..24]
+        prefix = Sha256::digest(flake_dir.canonicalize().map_err(|err| err.to_string())?.display().to_string().as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()[..24]
             .into();
         fs::write(&prefix_file, &prefix).map_err(|err| err.to_string())?;
     }
-    let machine_id = format!("{prefix}{:x}", Sha256::digest(profile.as_bytes()));
+    let machine_id = format!(
+        "{prefix}{}",
+        Sha256::digest(profile.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+    );
     let machine_id = &machine_id[..32];
     let name = if flake_dir.ends_with(LOCAL_CONFIG_DIR) {
         flake_dir
@@ -407,7 +410,7 @@ mod tests {
         let env = test_env(&root, workspace.clone(), global.clone());
         assert_eq!(resolve_flake_dir(&env).unwrap(), flake_dir);
         fs::write(flake_dir.join("machine-prefix"), "0123456789abcdef01234567").unwrap();
-        let machine_id = format!("{:x}", Sha256::digest(b"default"));
+        let machine_id = Sha256::digest(b"default").iter().map(|byte| format!("{byte:02x}")).collect::<String>();
         let existing = format!("renamed-default-0123456789abcdef01234567{}", &machine_id[..8]);
         fs::create_dir_all(data_root.join(&existing)).unwrap();
         assert_eq!(resolve_instance_id(&flake_dir, "default", &data_root).unwrap(), existing);

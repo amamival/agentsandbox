@@ -311,7 +311,14 @@ fn run_ps(env: &Env) -> Result<(), String> {
         .arg(instance.id.as_str())
         .output()
         .map_err(|err| err.to_string())?;
-    let state = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let state = if output.status.success() {
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    } else if stderr.contains("failed to get domain") {
+        "down".to_owned()
+    } else {
+        stderr
+    };
     println!("{}\t{}", instance.id, state);
     Ok(())
 }

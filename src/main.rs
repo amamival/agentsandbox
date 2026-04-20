@@ -23,9 +23,13 @@ struct Cli {
     /// Use the global sandbox scope instead of resolving the active workspace's local `.agentsandbox`.
     #[arg(short = 'g', long, global = true)]
     global: bool,
+    /// Select sandbox hostname.
+    #[arg(short = 'h', long, global = true, default_value = "default")]
+    hostname: String,
     /// Resolve the active workspace and config as if running from this directory.
     #[arg(short = 't', long = "target", global = true, env = "PWD")]
-    cwd: Option<PathBuf>,
+    target_dir: Option<PathBuf>,
+
     #[arg(long, hide = true, env = "HOME")]
     home: Option<PathBuf>,
     #[arg(long, hide = true, env = "XDG_CONFIG_HOME")]
@@ -36,6 +40,7 @@ struct Cli {
     xdg_state_home: Option<PathBuf>,
     #[arg(long, hide = true, env = "XDG_RUNTIME_DIR")]
     xdg_runtime_dir: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -68,6 +73,7 @@ enum Command {
     /// Unpause all running VMs
     Unpause,
     /// Delete the guest system while preserving persistent data
+    #[command(alias = "destory")]
     Destroy {
         /// Remove sysroot
         #[arg(short = 's', long)]
@@ -122,7 +128,8 @@ enum Command {
 #[derive(Debug, PartialEq, Eq)]
 struct Env {
     is_global: bool,
-    cwd: PathBuf,
+    hostname: String,
+    target_dir: PathBuf,
     config_root: PathBuf,
     data_root: PathBuf,
     state_root: PathBuf,
@@ -160,12 +167,7 @@ fn main() {
         Some(Command::Pause) => run_pause(&env),
         Some(Command::Unpause) => run_unpause(&env),
         Some(Command::Ps) => run_ps(&env),
-        Some(Command::Destroy {
-            system,
-            data,
-            logs,
-            conf,
-        }) => run_destroy(&env, system, data, logs, conf),
+        Some(Command::Destroy { system, data, logs, conf }) => run_destroy(&env, system, data, logs, conf),
         None | Some(_) => Ok(()),
     } {
         eprintln!("{err}");
@@ -175,11 +177,12 @@ fn main() {
 
 fn resolve_env(cli: &Cli) -> Result<Env, String> {
     let uid = getuid().as_raw();
-    let cwd = cli.cwd.clone().ok_or("PWD is not set; pass --target".to_owned())?;
-    let home = cli.home.clone().unwrap_or_else(|| cwd.clone());
+    let target_dir = cli.target_dir.clone().ok_or("PWD is not set; pass --target".to_owned())?;
+    let home = cli.home.clone().unwrap_or_else(|| target_dir.clone());
     Ok(Env {
         is_global: cli.global,
-        cwd,
+        hostname: cli.hostname.clone(),
+        target_dir,
         config_root: cli.xdg_config_home.clone().unwrap_or_else(|| home.join(".config")).join(APP_NAME),
         data_root: cli.xdg_data_home.clone().unwrap_or_else(|| home.join(".local/share")).join(APP_NAME),
         state_root: cli.xdg_state_home.clone().unwrap_or_else(|| home.join(".local/state")).join(APP_NAME),
@@ -193,13 +196,17 @@ fn resolve_env(cli: &Cli) -> Result<Env, String> {
 
 // Create the config dir and initial files for local/global init, or return a displayable error.
 fn run_init(env: &Env, force: bool) -> Result<(), String> {
-    let target = if env.is_global { env.config_root.clone() } else { env.cwd.join(LOCAL_CONFIG_DIR) };
+    let target = if env.is_global {
+        env.config_root.clone()
+    } else {
+        env.target_dir.join(LOCAL_CONFIG_DIR)
+    };
     if target.exists() && !force {
         return Err(format!("{} already exists", target.display()));
     }
     fs::create_dir_all(&target).map_err(|err| err.to_string())?;
-    let cwd = env.cwd.canonicalize().map_err(|err| err.to_string())?;
-    let workspace_name = cwd
+    let target_dir = env.target_dir.canonicalize().map_err(|err| err.to_string())?;
+    let workspace_name = target_dir
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or("failed to derive workspace name".to_owned())?;
@@ -208,7 +215,7 @@ fn run_init(env: &Env, force: bool) -> Result<(), String> {
         ("flake.nix", include_str!("../share/agentsandbox/template/flake.nix").to_owned()),
         ("configuration.nix", include_str!("../share/agentsandbox/template/configuration.nix").to_owned()),
         ("allowed_hosts", String::new()),
-        ("mounts", format!("# <host-path><TAB><guest-name>\n{}\t{workspace_name}\n", cwd.display())),
+        ("mounts", format!("# <host-path><TAB><guest-name>\n{}\t{workspace_name}\n", target_dir.display())),
         (
             "agentsandbox/flake.nix",
             include_str!("../share/agentsandbox/template/agentsandbox/flake.nix").to_owned(),
@@ -222,7 +229,7 @@ fn run_init(env: &Env, force: bool) -> Result<(), String> {
 
 fn run_build(env: &Env) -> Result<(), String> {
     let flake_dir = resolve_flake_dir(env)?;
-    let instance = resolve_instance(env, &flake_dir, "default")?;
+    let instance = resolve_instance(env, &flake_dir, &env.hostname)?;
     prepare(&instance)?;
     if !instance.sysroot.join("nix/store").is_dir() {
         fetch_nix_dockerhub(&instance.sysroot)?;
@@ -287,35 +294,35 @@ fn fetch_nix_dockerhub(sysroot: &Path) -> Result<(), String> {
 
 fn run_down(env: &Env) -> Result<(), String> {
     let flake_dir = resolve_flake_dir(env)?;
-    let instance = resolve_instance(env, &flake_dir, "default")?;
+    let instance = resolve_instance(env, &flake_dir, &env.hostname)?;
     virsh(&["shutdown", instance.id.as_str()]);
     Ok(())
 }
 
 fn run_kill(env: &Env) -> Result<(), String> {
     let flake_dir = resolve_flake_dir(env)?;
-    let instance = resolve_instance(env, &flake_dir, "default")?;
+    let instance = resolve_instance(env, &flake_dir, &env.hostname)?;
     virsh(&["destroy", instance.id.as_str()]);
     Ok(())
 }
 
 fn run_pause(env: &Env) -> Result<(), String> {
     let flake_dir = resolve_flake_dir(env)?;
-    let instance = resolve_instance(env, &flake_dir, "default")?;
+    let instance = resolve_instance(env, &flake_dir, &env.hostname)?;
     virsh(&["suspend", instance.id.as_str()]);
     Ok(())
 }
 
 fn run_unpause(env: &Env) -> Result<(), String> {
     let flake_dir = resolve_flake_dir(env)?;
-    let instance = resolve_instance(env, &flake_dir, "default")?;
+    let instance = resolve_instance(env, &flake_dir, &env.hostname)?;
     virsh(&["resume", instance.id.as_str()]);
     Ok(())
 }
 
 fn run_ps(env: &Env) -> Result<(), String> {
     let flake_dir = resolve_flake_dir(env)?;
-    let instance = resolve_instance(env, &flake_dir, "default")?;
+    let instance = resolve_instance(env, &flake_dir, &env.hostname)?;
     let output = process::Command::new("virsh")
         .arg("domstate")
         .arg(instance.id.as_str())
@@ -335,7 +342,7 @@ fn run_ps(env: &Env) -> Result<(), String> {
 
 fn run_destroy(env: &Env, system: bool, data: bool, logs: bool, conf: bool) -> Result<(), String> {
     let flake_dir = resolve_flake_dir(env)?;
-    let instance = resolve_instance(env, &flake_dir, "default")?;
+    let instance = resolve_instance(env, &flake_dir, &env.hostname)?;
     virsh(&["destroy", instance.id.as_str()]);
     if instance.is_global && !env.is_global {
         return Err("destroy files for the non-project instance requires --global".to_owned());
@@ -364,7 +371,7 @@ fn virsh(args: &[&str]) {
         .status();
 }
 
-fn resolve_instance(env: &Env, flake_dir: &Path, profile: &str) -> Result<Instance, String> {
+fn resolve_instance(env: &Env, flake_dir: &Path, hostname: &str) -> Result<Instance, String> {
     let prefix_file = flake_dir.join("machine-prefix");
     let mut prefix = fs::read_to_string(&prefix_file).unwrap_or_default();
     if prefix.is_empty() {
@@ -377,7 +384,7 @@ fn resolve_instance(env: &Env, flake_dir: &Path, profile: &str) -> Result<Instan
     }
     let machine_id = format!(
         "{prefix}{}",
-        Sha256::digest(profile.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+        Sha256::digest(hostname.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect::<String>()
     );
     let machine_id = &machine_id[..32];
     let name = if flake_dir.ends_with(LOCAL_CONFIG_DIR) {
@@ -396,7 +403,7 @@ fn resolve_instance(env: &Env, flake_dir: &Path, profile: &str) -> Result<Instan
         .filter_map(Result::ok)
         .filter_map(|entry| entry.file_name().into_string().ok())
         .find(|entry| entry.ends_with(machine_id))
-        .unwrap_or_else(|| format!("{name}-{profile}-{machine_id}"));
+        .unwrap_or_else(|| format!("{name}-{hostname}-{machine_id}"));
     let data_dir = env.data_root.join(&id);
     let state_dir = env.state_root.join(&id);
     let runtime_dir = env.runtime_root.join(&id);
@@ -421,32 +428,31 @@ fn remove_dir_all_if_exists(path: &Path) -> Result<(), String> {
 }
 
 fn resolve_flake_dir(env: &Env) -> Result<PathBuf, String> {
-    if env.is_global {
-        if env.config_root.join("flake.nix").is_file() {
-            return Ok(env.config_root.clone());
-        }
-        return Err(format!("{} not found", env.config_root.display()));
-    }
-    let mut dir = env.cwd.canonicalize().map_err(|err| err.to_string())?;
-    loop {
-        if dir.join(format!("{LOCAL_CONFIG_DIR}/flake.nix")).is_file() {
-            return Ok(dir.join(LOCAL_CONFIG_DIR));
-        }
-        if !dir.pop() {
-            break;
+    if !env.is_global {
+    let mut dir = env.target_dir.canonicalize().map_err(|err| err.to_string())?;
+        loop {
+            if dir.join(format!("{LOCAL_CONFIG_DIR}/flake.nix")).is_file() {
+                return Ok(dir.join(LOCAL_CONFIG_DIR));
+            }
+            if !dir.pop() {
+                break;
+            }
         }
     }
-    let flake_dir = env.config_root.clone();
-    if flake_dir.join("flake.nix").is_file() {
-        Ok(flake_dir)
+    let config_dir = env.config_root.clone();
+    if config_dir.join("flake.nix").is_file() {
+        Ok(config_dir)
     } else {
-        Err(format!("{} not found", flake_dir.display()))
+        Err(format!("{} not found", config_dir.display()))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{APP_NAME, Env, Instance, LOCAL_CONFIG_DIR, prepare, remove_dir_all_if_exists, resolve_flake_dir, resolve_instance, run_destroy, run_init};
+    use super::{
+        APP_NAME, Cli, Instance, LOCAL_CONFIG_DIR, prepare, remove_dir_all_if_exists, resolve_env, resolve_flake_dir, resolve_instance, run_destroy,
+        run_init,
+    };
     use sha2::{Digest, Sha256};
     use std::{
         env, fs,
@@ -455,22 +461,33 @@ mod tests {
         sync::{Mutex, OnceLock},
     };
 
-    const TEST_ENV_DIRS: [&str; 3] = ["data", "state", "runtime"];
-
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
-    fn test_env(root: &std::path::Path, cwd: std::path::PathBuf, config_root: std::path::PathBuf, is_global: bool) -> Env {
-        Env {
-            is_global,
-            cwd,
-            config_root,
-            data_root: root.join(TEST_ENV_DIRS[0]),
-            state_root: root.join(TEST_ENV_DIRS[1]),
-            runtime_root: root.join(TEST_ENV_DIRS[2]),
-        }
+    fn env_from_input(
+        target_dir: PathBuf,
+        home: PathBuf,
+        global: bool,
+        xdg: Option<(PathBuf, PathBuf, PathBuf, PathBuf)>,
+    ) -> super::Env {
+        let (xdg_config_home, xdg_data_home, xdg_state_home, xdg_runtime_dir) = match xdg {
+            Some((config, data, state, runtime)) => (Some(config), Some(data), Some(state), Some(runtime)),
+            None => (None, None, None, None),
+        };
+        resolve_env(&Cli {
+            global,
+            hostname: "default".into(),
+            target_dir: Some(target_dir),
+            home: Some(home),
+            xdg_config_home,
+            xdg_data_home,
+            xdg_state_home,
+            xdg_runtime_dir,
+            command: None,
+        })
+        .unwrap()
     }
 
     fn test_root(name: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
@@ -478,7 +495,6 @@ mod tests {
         let home = root.join("home");
         let config = home.join(".config").join(APP_NAME);
         let _ = fs::remove_dir_all(&root);
-        unsafe { env::set_var("HOME", &home) };
         (root, home, config)
     }
 
@@ -508,23 +524,6 @@ mod tests {
         unsafe { env::set_var("PATH", path) };
     }
 
-    fn write_runtime_helper_files(runtime_dir: &Path) {
-        fs::create_dir_all(runtime_dir.join("virtiofs")).unwrap();
-        for file in [
-            runtime_dir.join("mount-helper.pid"),
-            runtime_dir.join("proxy.pid"),
-            runtime_dir.join("opensnitch-forward.pid"),
-            runtime_dir.join("opensnitch-watchdog.pid"),
-            runtime_dir.join("virtiofs/nix.pid"),
-            runtime_dir.join("virtiofs/persistent.pid"),
-            runtime_dir.join("proxy-addon.py"),
-            runtime_dir.join("virtiofs/nix.sock"),
-            runtime_dir.join("virtiofs/persistent.sock"),
-        ] {
-            fs::write(file, "123\n").unwrap();
-        }
-    }
-
     fn assert_template(dir: &std::path::Path, mounts: &str) {
         for file in ["flake.nix", "configuration.nix", "allowed_hosts", "agentsandbox/flake.nix"] {
             assert!(dir.join(file).is_file());
@@ -538,6 +537,15 @@ mod tests {
         }
     }
 
+    fn reset_instance_dirs(paths: &Instance) {
+        remove_dir_all_if_exists(&paths.data_dir).unwrap();
+        remove_dir_all_if_exists(&paths.state_dir).unwrap();
+        remove_dir_all_if_exists(&paths.runtime_dir).unwrap();
+        fs::create_dir_all(&paths.sysroot).unwrap();
+        fs::create_dir_all(&paths.persistent).unwrap();
+        fs::create_dir_all(&paths.logs_dir).unwrap();
+    }
+
     #[test]
     fn init_writes_expected_files_and_honors_force() {
         let _guard = env_lock().lock().unwrap();
@@ -545,16 +553,19 @@ mod tests {
         let workspace = root.join("workspace");
         assert_dirs(&[&workspace, &home]);
         let mounts = format!("# <host-path><TAB><guest-name>\n{}\tworkspace\n", workspace.canonicalize().unwrap().display());
-        let env = test_env(&root, workspace.clone(), global.clone(), false);
-        run_init(&env, false).unwrap();
+        let (local_env, global_env) = (
+            env_from_input(workspace.clone(), home.clone(), false, None),
+            env_from_input(workspace.clone(), home.clone(), true, None),
+        );
+        run_init(&local_env, false).unwrap();
         let local = workspace.join(LOCAL_CONFIG_DIR);
-        run_init(&test_env(&root, workspace.clone(), global.clone(), true), false).unwrap();
+        run_init(&global_env, false).unwrap();
         for dir in [&local, &global] {
             assert_template(dir, &mounts);
         }
-        assert_eq!(run_init(&env, false).unwrap_err(), format!("{} already exists", local.display()));
+        assert_eq!(run_init(&local_env, false).unwrap_err(), format!("{} already exists", local.display()));
         fs::write(global.join("allowed_hosts"), "stale\n").unwrap();
-        run_init(&test_env(&root, workspace.clone(), global.clone(), true), true).unwrap();
+        run_init(&global_env, true).unwrap();
         assert_eq!(fs::read_to_string(global.join("allowed_hosts")).unwrap(), "");
         fs::remove_dir_all(root).unwrap();
     }
@@ -568,10 +579,10 @@ mod tests {
         let flake_dir = workspace_root.join(LOCAL_CONFIG_DIR);
         let data_root = root.join("data");
         assert_dirs(&[&home, &workspace, &data_root]);
-        run_init(&test_env(&root, workspace_root.clone(), global.clone(), false), false).unwrap();
+        run_init(&env_from_input(workspace_root.clone(), home.clone(), false, None), false).unwrap();
         assert_dirs(&[&global]);
         fs::write(global.join("flake.nix"), "").unwrap();
-        let env = test_env(&root, workspace.clone(), global.clone(), false);
+        let env = env_from_input(workspace.clone(), home.clone(), false, None);
         assert_eq!(resolve_flake_dir(&env).unwrap(), flake_dir);
         fs::write(flake_dir.join("machine-prefix"), "0123456789abcdef01234567").unwrap();
         let machine_id = Sha256::digest(b"default").iter().map(|byte| format!("{byte:02x}")).collect::<String>();
@@ -581,9 +592,17 @@ mod tests {
         let other_flake_dir = root.join("other").join(LOCAL_CONFIG_DIR);
         assert_dirs(&[&other_flake_dir, &root.join("data"), &root.join("state"), &root.join("runtime")]);
         fs::write(other_flake_dir.join("machine-prefix"), "0123456789abcdef01234567").unwrap();
-        let paths =
-            resolve_instance(&test_env(std::path::Path::new("/"), "/cwd".into(), "/config".into(), false), &other_flake_dir, "demo")
-                .unwrap();
+        let paths = resolve_instance(
+            &env_from_input(
+                "/target".into(),
+                "/home".into(),
+                false,
+                Some(("/config".into(), "/".into(), "/".into(), "/".into())),
+            ),
+            &other_flake_dir,
+            "demo",
+        )
+        .unwrap();
         let demo_machine_id = Sha256::digest(b"demo").iter().map(|byte| format!("{byte:02x}")).collect::<String>();
         assert_eq!(paths.id, "other-demo-0123456789abcdef01234567".to_owned() + &demo_machine_id[..8]);
         assert_eq!(paths.data_dir, PathBuf::from("/data").join(&paths.id));
@@ -604,7 +623,7 @@ mod tests {
         })
         .unwrap();
         fs::remove_file(flake_dir.join("flake.nix")).unwrap();
-        assert_eq!(resolve_flake_dir(&test_env(&root, workspace.clone(), global.clone(), true)).unwrap(), global);
+        assert_eq!(resolve_flake_dir(&env_from_input(workspace.clone(), home.clone(), true, None)).unwrap(), global);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -615,8 +634,8 @@ mod tests {
         let workspace = root.join("workspace");
         assert_dirs(&[&home, &workspace]);
         let original_path = with_fake_path(&root);
-        run_init(&test_env(&root, workspace.clone(), global.clone(), false), false).unwrap();
-        let env = test_env(&root, workspace.clone(), global.clone(), false);
+        run_init(&env_from_input(workspace.clone(), home.clone(), false, None), false).unwrap();
+        let env = env_from_input(workspace.clone(), home.clone(), false, None);
         let flake_dir = workspace.join(LOCAL_CONFIG_DIR);
         fs::write(flake_dir.join("machine-prefix"), "0123456789abcdef01234567").unwrap();
         let paths = resolve_instance(&env, &flake_dir, "default").unwrap();
@@ -627,35 +646,21 @@ mod tests {
             (false, true, true, false, true),
             (true, true, false, false, false),
         ] {
-            remove_dir_all_if_exists(&paths.data_dir).unwrap();
-            remove_dir_all_if_exists(&paths.state_dir).unwrap();
-            remove_dir_all_if_exists(&paths.runtime_dir).unwrap();
-            fs::create_dir_all(&paths.sysroot).unwrap();
-            fs::create_dir_all(&paths.persistent).unwrap();
-            fs::create_dir_all(&paths.logs_dir).unwrap();
-            write_runtime_helper_files(&paths.runtime_dir);
+            reset_instance_dirs(&paths);
 
             run_destroy(&env, system, data, false, false).unwrap();
 
             assert_eq!(paths.sysroot.exists(), expect_sysroot);
             assert_eq!(paths.persistent.exists(), expect_persistent);
             assert_eq!(paths.data_dir.exists(), expect_data_dir);
-            assert!(!paths.runtime_dir.join("mount-helper.pid").exists());
-            assert!(!paths.runtime_dir.join("proxy-addon.py").exists());
         }
 
-        fs::create_dir_all(&paths.sysroot).unwrap();
-        fs::create_dir_all(&paths.persistent).unwrap();
-        fs::create_dir_all(&paths.logs_dir).unwrap();
-        write_runtime_helper_files(&paths.runtime_dir);
+        reset_instance_dirs(&paths);
         run_destroy(&env, false, false, true, false).unwrap();
         assert!(!paths.state_dir.exists());
         assert!(flake_dir.exists());
 
-        fs::create_dir_all(&paths.sysroot).unwrap();
-        fs::create_dir_all(&paths.persistent).unwrap();
-        fs::create_dir_all(&paths.logs_dir).unwrap();
-        write_runtime_helper_files(&paths.runtime_dir);
+        reset_instance_dirs(&paths);
         run_destroy(&env, false, false, false, true).unwrap();
         assert!(!flake_dir.exists());
 

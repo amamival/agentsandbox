@@ -95,7 +95,7 @@ In our experiments, *gVisor* could not run *SystemD* as PID 1 because it lacks t
 
 ## Design decisions
 
-- Guest builds live under `nixosConfigurations.<name>`, and runtime profiles live
+- Guest builds live under `nixosConfigurations.<hostname>`, and runtime hostnames live
   under `sandboxConfigurations.<name>`. Each `sandboxConfiguration` selects the
   `nixosConfiguration` it uses.
 - The execution path is fixed to Linux `qemu:///session`, KVM, libvirt, virtiofs,
@@ -108,17 +108,17 @@ In our experiments, *gVisor* could not run *SystemD* as PID 1 because it lacks t
 - Host-side state lives only under `XDG_CONFIG_HOME`, `XDG_DATA_HOME`,
   `XDG_STATE_HOME`, and `XDG_RUNTIME_DIR`. `XDG_CACHE_HOME` is not used.
 - Instance identity is `machine-id` (32 hex chars): `machine-prefix` (24 hex,
-  persisted in `<active-config>/machine-prefix` on first resolve) + `profile-hash`
-  (sha256 of profile name, first 8 hex). `machine-id` is the guest machine-id
+  persisted in `<active-config>/machine-prefix` on first resolve) + `hostname-hash`
+  (sha256 of hostname, first 8 hex). `machine-id` is the guest machine-id
   source and the libvirt UUID source.
-- `instance-id` is the dir/domain-name form `<dirname>-<profile>-<machine-id>`
+- `instance-id` is the dir/domain-name form `<dirname>-<hostname>-<machine-id>`
   (display prefix + match key). Lookup matches by `*-<machine-id>` so workspace
   rename/move stays transparent; the libvirt domain name reuses `instance-id`.
 - Local scope (`<workspace>/.agentsandbox/machine-prefix`): worktree sharing vs.
   isolation is controlled by git tracking of the prefix (tracked = shared,
   untracked = each worktree regenerates on first use).
 - Global scope (`$XDG_CONFIG_HOME/agentsandbox/machine-prefix`): single instance
-  per profile shared across all workspaces using the global config.
+  per hostname shared across all workspaces using the global config.
 - No extra `current-system` link or host-state metadata JSON is kept.
 - Place `sysroot/` next to `persistent/`.
 - `allowed_hosts` and `mounts` are plain-text files and are always copied from
@@ -162,13 +162,10 @@ In our experiments, *gVisor* could not run *SystemD* as PID 1 because it lacks t
 
 ## Flake contract
 
-- `nixosConfigurations.<name>` represents a guest system build.
-- `nixosConfigurations.<name>` is self-contained and usable directly as
+- `nixosConfigurations.<hostname>` represents a guest system build.
+- `nixosConfigurations.<hostname>` is self-contained and usable directly as
   `nixos-rebuild --flake <config-dir>#name`, where `<config-dir>` is either
   `.agentsandbox` or `$XDG_CONFIG_HOME/agentsandbox`.
-- `sandboxConfigurations.<name>` represents a runtime profile.
-- `sandboxConfigurations.<name>` contains at least the following.
-
 ```nix
 # Evaluated by launcher with AgentSandbox's nixosModule.
 {
@@ -198,7 +195,7 @@ In our experiments, *gVisor* could not run *SystemD* as PID 1 because it lacks t
 ```
 
 - `toplevel` uses the selected
-  `nixosConfigurations.<name>.config.system.build.toplevel`.
+  `nixosConfigurations.<hostname>.config.system.build.toplevel`.
 - `libvirtXml` returns an XML path in the Nix store.
 - The launcher builds the dynamic mount set from the active config dir's
   `mounts` file. It includes the initial workspace mount and any additional
@@ -258,7 +255,7 @@ $XDG_RUNTIME_DIR/agentsandbox/<instance-id>/
 - In the first bootstrap phase, the launcher creates the sysroot. The bootstrap
   source uses the same Nix base sysroot as `sandbox.sh`.
 - The build runs in a Nix environment that uses sysroot as its root and realizes
-  the selected `nixosConfigurations.<name>` `toplevel` into `sysroot/nix/store`.
+  the selected `nixosConfigurations.<hostname>` `toplevel` into `sysroot/nix/store`.
 - The guest boot path uses `init`, `kernel-params`, kernel, and initrd under the
   selected `toplevel`.
 - The launcher evaluates the selected `sandboxConfiguration.libvirtXml`, gets an

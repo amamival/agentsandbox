@@ -141,14 +141,17 @@ fn run_init(env: &Env, global: bool, force: bool) -> Result<(), String> {
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or("failed to derive workspace name".to_owned())?;
+    fs::create_dir_all(target.join("agentsandbox")).map_err(|err| err.to_string())?;
     for (name, contents) in [
         ("flake.nix", include_str!("../share/agentsandbox/template/flake.nix").to_owned()),
         ("configuration.nix", include_str!("../share/agentsandbox/template/configuration.nix").to_owned()),
         ("allowed_hosts", String::new()),
         ("mounts", format!("# <host-path><TAB><guest-name>\n{}\t{workspace_name}\n", cwd.display())),
+        ("agentsandbox/flake.nix", include_str!("../share/agentsandbox/template/agentsandbox/flake.nix").to_owned()),
     ] {
         fs::write(target.join(name), contents).map_err(|err| err.to_string())?;
     }
+    eprintln!("init: wrote template files to {}", target.display());
     Ok(())
 }
 
@@ -211,6 +214,7 @@ fn instance_paths(env: &Env, instance_id: &str) -> InstancePaths {
 fn fetch_nix_dockerhub(sysroot: &Path) -> Result<(), String> {
     let repo = "nixos/nix";
     let registry = "https://registry-1.docker.io/v2";
+    eprintln!("fetch: requesting docker auth token for {repo}");
     let client = Client::builder().build().map_err(|err| err.to_string())?;
     let token = client
         .get(format!("https://auth.docker.io/token?service=registry.docker.io&scope=repository:{repo}:pull"))
@@ -220,6 +224,7 @@ fn fetch_nix_dockerhub(sysroot: &Path) -> Result<(), String> {
     let token = token.json::<Value>().map_err(|err| err.to_string())?;
     let token = token["token"].as_str().ok_or("docker token missing".to_owned())?;
     let auth = format!("Bearer {token}");
+    eprintln!("fetch: resolving image manifest list (latest)");
     let manifests = client.get(format!("{registry}/{repo}/manifests/latest")).header(header::AUTHORIZATION, &auth);
     let manifests = manifests.send().map_err(|err| err.to_string())?;
     let manifests = manifests.error_for_status().map_err(|err| err.to_string())?;
@@ -231,16 +236,15 @@ fn fetch_nix_dockerhub(sysroot: &Path) -> Result<(), String> {
         .find(|manifest| manifest["platform"]["architecture"] == "amd64" && manifest["platform"]["os"] == "linux")
         .ok_or("linux/amd64 docker manifest missing".to_owned())?;
     let digest = digest["digest"].as_str().ok_or("linux/amd64 docker manifest missing".to_owned())?;
+    eprintln!("fetch: selected linux/amd64 image digest {digest}");
     let manifest = client.get(format!("{registry}/{repo}/manifests/{digest}")).header(header::AUTHORIZATION, &auth);
     let manifest = manifest.send().map_err(|err| err.to_string())?;
     let manifest = manifest.error_for_status().map_err(|err| err.to_string())?;
     let manifest = manifest.json::<Value>().map_err(|err| err.to_string())?;
-    for blob in manifest["layers"]
-        .as_array()
-        .ok_or("docker layers missing".to_owned())?
-        .iter()
-        .filter_map(|layer| layer["digest"].as_str())
-    {
+    let layers = manifest["layers"].as_array().ok_or("docker layers missing".to_owned())?;
+    eprintln!("fetch: extracting {} layers into {}", layers.len(), sysroot.display());
+    for (index, blob) in layers.iter().filter_map(|layer| layer["digest"].as_str()).enumerate() {
+        eprintln!("fetch: layer {}/{} {}", index + 1, layers.len(), blob);
         let url = format!("{registry}/{repo}/blobs/{blob}");
         let response = client.head(&url).header(header::AUTHORIZATION, &auth);
         let response = response.send().map_err(|err| err.to_string())?;
@@ -250,6 +254,7 @@ fn fetch_nix_dockerhub(sysroot: &Path) -> Result<(), String> {
         let response = response.error_for_status().map_err(|err| err.to_string())?;
         tar::Archive::new(GzDecoder::new(response)).unpack(sysroot).map_err(|err| err.to_string())?;
     }
+    eprintln!("fetch: completed docker image extraction");
     Ok(())
 }
 
@@ -362,7 +367,7 @@ mod tests {
     }
 
     fn assert_template(dir: &std::path::Path, mounts: &str) {
-        for file in ["flake.nix", "configuration.nix", "allowed_hosts"] {
+        for file in ["flake.nix", "configuration.nix", "allowed_hosts", "agentsandbox/flake.nix"] {
             assert!(dir.join(file).is_file());
         }
         assert_eq!(fs::read_to_string(dir.join("mounts")).unwrap(), mounts);

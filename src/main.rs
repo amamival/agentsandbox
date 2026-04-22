@@ -168,12 +168,9 @@ fn main() {
         process::exit(1);
     });
     if let Err(err) = match cli.command {
-        Some(Command::Version) => {
-            println!("{}", env!("CARGO_PKG_VERSION"));
-            Ok(())
-        }
+        Some(Command::Version) => Ok(println!("{}", env!("CARGO_PKG_VERSION"))),
         Some(Command::Init { force }) => run_init(&env, force),
-        Some(Command::Build { bootstrap }) => run_build(&env, bootstrap).map(|_| ()),
+        Some(Command::Build { bootstrap }) => run_build(&env, bootstrap).map(|p| println!("{}", p.display())),
         Some(Command::Up { detach }) => run_up(&env, detach),
         Some(Command::Down) => run_virsh_action(&env, "shutdown"),
         Some(Command::Kill) => run_virsh_action(&env, "destroy"),
@@ -182,7 +179,7 @@ fn main() {
         Some(Command::Ps) => run_ps(&env),
         Some(Command::Destroy { system, data, logs, conf }) => run_destroy(&env, system, data, logs, conf),
         Some(Command::Ssh { args }) => run_ssh(&env, &args),
-        None | Some(_) => Ok(()),
+        None | Some(_) => Ok(println!("Comming soon(tm)...")),
     } {
         eprintln!("{err}");
         process::exit(1);
@@ -267,10 +264,8 @@ fn run_build(env: &Env, bootstrap: bool) -> Result<PathBuf, String> {
     //    Ok(other) => Err(format!("VM is not shut off: {other}")),
     //    Err(err) => err,
     //}
-    let profile = fs::read_link(instance.sysroot.join("nix/var/nix/profiles/system")).map_err(|err| err.to_string())?;
-    let system_profile = instance.sysroot.join(profile);
-    eprintln!("{}", system_profile.display());
-    Ok(system_profile)
+    let system_profile = fs::read_link(instance.sysroot.join("nix/var/nix/profiles/system")).map_err(|err| err.to_string())?;
+    Ok(instance.sysroot.join(system_profile))
 
     // if "build" and not running,
     // *start_vm to build-system-only.target*.

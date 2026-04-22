@@ -54,6 +54,7 @@ let
       util-linux
       wget
       yq
+      opencode-dev
     ];
     environment.shellAliases = {
       ll = "ls -l";

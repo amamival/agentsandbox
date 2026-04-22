@@ -5,9 +5,11 @@
     home-manager.url = "github:nix-community/home-manager/release-25.11";
     home-manager.inputs.nixpkgs.follows = "nixpkgs";
     agentsandbox.url = "path:./agentsandbox";
+    opencode.url = "github:anomalyco/opencode/dev";
+    opencode.inputs.nixpkgs.follows = "nixpkgs-unstable";
   };
 
-  outputs = { self, nixpkgs, nixpkgs-unstable, home-manager, agentsandbox, ... }:
+  outputs = { self, nixpkgs, nixpkgs-unstable, home-manager, agentsandbox, opencode, ... }:
     let
       nixosWithOverlay = system: modules:
         nixpkgs.lib.nixosSystem {
@@ -25,6 +27,14 @@
     {
       packages = eachSystem (system: {
         # Extra packages available.
+        opencode-dev = opencode.packages.${system}.opencode.overrideAttrs (old: {
+          preBuild = (old.preBuild or "") + ''
+            substituteInPlace packages/opencode/src/cli/cmd/generate.ts \
+              --replace-fail 'const prettier = await import("prettier")' 'const prettier: any = { format: async (s: string) => s }' \
+              --replace-fail 'const babel = await import("prettier/plugins/babel")' 'const babel = {}' \
+              --replace-fail 'const estree = await import("prettier/plugins/estree")' 'const estree = {}'
+          '';
+        });
       });
       nixosConfigurations.default = nixosWithOverlay "x86_64-linux" [ ./configuration.nix ];
     };

@@ -265,7 +265,8 @@ fn run_build(env: &Env, bootstrap: bool) -> Result<PathBuf, String> {
     //    Err(err) => err,
     //}
     let system_profile = fs::read_link(instance.sysroot.join("nix/var/nix/profiles/system")).map_err(|err| err.to_string())?;
-    Ok(instance.sysroot.join(system_profile))
+    let rel_system_profile_path = system_profile.strip_prefix("/").expect("system profile symlink is not absolute path");
+    Ok(instance.sysroot.join(rel_system_profile_path))
 
     // if "build" and not running,
     // *start_vm to build-system-only.target*.
@@ -423,21 +424,10 @@ fn install_initial_nixos_profile(workspace: &Path, sysroot: &Path, hostname: &st
     // Remove previous out-link so `nix build --out-link /nix/var/nix/profiles/system` can overwrite it.
     let _ = fs::remove_file(sysroot.join("nix/var/nix/profiles/system"));
 
-    // Get compatible uid/gid maps from host.
-    let capture_map = |label: &str, path: &str| -> Result<String, String> {
-        eprintln!("install: capturing {label} map via unshare");
-        let output = process::Command::new("unshare")
-            .args(["--user", "--map-root-user", "--map-auto", "cat", path])
-            .output()
-            .map_err(|err| err.to_string())?;
-        if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-        } else {
-            Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
-        }
-    };
-    let uid_map = capture_map("uid", "/proc/self/uid_map")?;
-    let gid_map = capture_map("gid", "/proc/self/gid_map")?;
+    eprintln!("install: capturing uid map via unshare");
+    let uid_map = capture_host_idmap("/proc/self/uid_map")?;
+    eprintln!("install: capturing gid map via unshare");
+    let gid_map = capture_host_idmap("/proc/self/gid_map")?;
 
     // Create pipe for child/parent communication.
     let (child_ready_read, child_ready_write) = pipe_with(PipeFlags::CLOEXEC).map_err(|err| err.to_string())?;
@@ -577,27 +567,15 @@ fn wait_for_pipe_signal(fd: &std::os::fd::OwnedFd, stage: &str) -> Result<(), St
         Err(format!("{stage} failed before signaling readiness"))
     }
 }
+
 #[inline(never)]
 fn run_up(env: &Env, _detach: bool) -> Result<(), String> {
     let flake_dir = resolve_flake_dir(env)?;
     let instance = resolve_instance(env, &flake_dir)?;
-    prepare(&instance)?;
     if let Some(state) = domstate(&instance.id)? {
         return Err(format!("VM is already {state}"));
     }
     let system_profile = run_build(env, false)?;
-    let capture_map = |label: &str, path: &str| -> Result<String, String> {
-        eprintln!("up: capturing {label} map via unshare");
-        let output = process::Command::new("unshare")
-            .args(["--user", "--map-root-user", "--map-auto", "cat", path])
-            .output()
-            .map_err(|err| err.to_string())?;
-        if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-        } else {
-            Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
-        }
-    };
     let machine_id = &instance.id[instance.id.len() - 32..];
     let domain_uuid = format!(
         "{}-{}-{}-{}-{}",
@@ -609,14 +587,13 @@ fn run_up(env: &Env, _detach: bool) -> Result<(), String> {
     );
     let xml_path = instance.runtime_dir.join("domain.xml");
     let output = process::Command::new(system_profile.join("domain.xml.sh"))
-        .env("DOMAIN_UUID", &domain_uuid)
-        .env("GID_MAP", capture_map("gid", "/proc/self/gid_map")?)
-        .env("INSTANCE_ID", &instance.id)
-        .env("MACHINE_ID", machine_id)
         .env("NIX_DIR", instance.sysroot.join("nix"))
+        .env("UID_MAP", capture_host_idmap("/proc/self/uid_map")?)
+        .env("GID_MAP", capture_host_idmap("/proc/self/gid_map")?)
+        .env("INSTANCE_ID", &instance.id)
+        .env("DOMAIN_UUID", &domain_uuid)
+        .env("MACHINE_ID", machine_id)
         .env("PERSISTENT_DIR", &instance.persistent)
-        .env("RUNTIME_DIR", &instance.runtime_dir)
-        .env("UID_MAP", capture_map("uid", "/proc/self/uid_map")?)
         .output()
         .map_err(|err| err.to_string())?;
     if !output.status.success() {
@@ -636,6 +613,19 @@ fn run_up(env: &Env, _detach: bool) -> Result<(), String> {
             status.code().map_or("signal".to_owned(), |code| code.to_string())
         )
     })
+}
+
+/// Get compatible uid/gid maps from host.
+fn capture_host_idmap(path: &str) -> Result<String, String> {
+    let output = process::Command::new("unshare")
+        .args(["--map-auto", "--map-root-user", "cat", path])
+        .output()
+        .map_err(|err| err.to_string())?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+    }
 }
 
 #[inline(never)]
@@ -677,41 +667,6 @@ fn run_destroy(env: &Env, system: bool, data: bool, logs: bool, conf: bool) -> R
 }
 
 #[inline(never)]
-fn domstate(instance_id: &str) -> Result<Option<String>, String> {
-    let output = process::Command::new("virsh")
-        .arg("domstate")
-        .arg(instance_id)
-        .output()
-        .map_err(|err| err.to_string())?;
-    if output.status.success() {
-        return Ok(Some(String::from_utf8_lossy(&output.stdout).trim().to_owned()));
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains("failed to get domain") {
-        Ok(None)
-    } else {
-        Err(stderr.trim().to_owned())
-    }
-}
-
-fn remove_dir_all_if_exists(path: &Path) -> Result<(), String> {
-    if path.exists() {
-        eprintln!("remove: removing {}", path.display());
-        fs::remove_dir_all(path).map_err(|err| err.to_string())?;
-    }
-    Ok(())
-}
-
-#[inline(never)]
-fn virsh(args: &[&str]) {
-    let _ = process::Command::new("virsh")
-        .args(args)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status();
-}
-
-#[inline(never)]
 fn run_ssh(env: &Env, args: &[String]) -> Result<(), String> {
     let flake_dir = resolve_flake_dir(env)?;
     let instance = resolve_instance(env, &flake_dir)?;
@@ -722,7 +677,7 @@ fn run_ssh(env: &Env, args: &[String]) -> Result<(), String> {
         .arg("eval")
         .arg("--json")
         .arg(format!(
-            "{}#nixosConfigurations.{hostname}.config.agentsandbox.portForwards",
+            "path:{}#nixosConfigurations.{hostname}.config.agentsandbox.portForwards",
             flake_dir.display(),
             hostname = env.hostname
         ))
@@ -763,6 +718,41 @@ fn run_ssh(env: &Env, args: &[String]) -> Result<(), String> {
         .stderr(Stdio::inherit())
         .exec()
         .to_string())
+}
+
+#[inline(never)]
+fn domstate(instance_id: &str) -> Result<Option<String>, String> {
+    let output = process::Command::new("virsh")
+        .arg("domstate")
+        .arg(instance_id)
+        .output()
+        .map_err(|err| err.to_string())?;
+    if output.status.success() {
+        return Ok(Some(String::from_utf8_lossy(&output.stdout).trim().to_owned()));
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("failed to get domain") {
+        Ok(None)
+    } else {
+        Err(stderr.trim().to_owned())
+    }
+}
+
+fn remove_dir_all_if_exists(path: &Path) -> Result<(), String> {
+    if path.exists() {
+        eprintln!("remove: removing {}", path.display());
+        fs::remove_dir_all(path).map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+#[inline(never)]
+fn virsh(args: &[&str]) {
+    let _ = process::Command::new("virsh")
+        .args(args)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status();
 }
 
 #[cfg(test)]

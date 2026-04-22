@@ -429,11 +429,15 @@
               )
               machine.succeed("agentsandbox destroy")
               machine.succeed(
+                  f"[[ -d '{data_dir}/sysroot' && -f '{data_dir}/persistent/canary' ]]"
+              )
+              machine.succeed("agentsandbox destroy -s")
+              machine.succeed(
                   f"[[ ! -d '{data_dir}/sysroot' && -f '{data_dir}/persistent/canary' ]]"
               )
               machine.succeed("agentsandbox up")
               machine.succeed("agentsandbox exec test -f /persistent/canary")
-              machine.succeed("agentsandbox destroy")
+              machine.succeed("agentsandbox destroy -sd")
               machine.succeed("[[ -z \"$(agentsandbox port 50052 tcp)\" ]]")
             '';
           };

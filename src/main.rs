@@ -542,8 +542,6 @@ fn install_initial_nixos_profile(workspace: &Path, sysroot: &Path, hostname: &st
                     })
                 };
                 set_idmap("uid", &uid_map)?;
-                eprintln!("install: writing setgroups deny for child {child_pid}");
-                fs::write(format!("/proc/{}/setgroups", child_pid.as_raw_pid()), "deny\n").map_err(|err| err.to_string())?;
                 set_idmap("gid", &gid_map)?;
                 write_fd(&parent_done_write)
             })();

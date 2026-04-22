@@ -36,8 +36,8 @@ struct Cli {
     #[arg(short = 'n', long, global = true, default_value = "default")]
     hostname: String,
     /// Resolve the active workspace and config as if running from this directory.
-    #[arg(short = 'w', global = true, env = "PWD")]
-    workspace: Option<PathBuf>,
+    #[arg(short = 'w', long, global = true, hide_default_value = true, default_value_os_t = env::current_dir().expect("invalid cwd") )]
+    workspace: PathBuf,
 
     #[arg(long, hide = true, env = "HOME")]
     home: Option<PathBuf>,
@@ -174,7 +174,7 @@ fn main() {
         }
         Some(Command::Init { force }) => run_init(&env, force),
         Some(Command::Build { bootstrap }) => run_build(&env, bootstrap).map(|_| ()),
-        Some(Command::Up { .. }) => run_build(&env, false).map(|_| ()),
+        Some(Command::Up { detach }) => run_up(&env, detach),
         Some(Command::Down) => run_virsh_action(&env, "shutdown"),
         Some(Command::Kill) => run_virsh_action(&env, "destroy"),
         Some(Command::Pause) => run_virsh_action(&env, "suspend"),
@@ -192,17 +192,11 @@ fn main() {
 #[inline(never)]
 fn resolve_env(cli: &Cli) -> Result<Env, String> {
     let uid = getuid().as_raw();
-    let workspace = cli
-        .workspace
-        .clone()
-        .ok_or("PWD is not set; pass --target".to_owned())?
-        .canonicalize()
-        .map_err(|err| err.to_string())?;
-    let home = cli.home.clone().unwrap_or_else(|| workspace.clone());
+    let home = cli.home.clone().expect("please set HOME");
     Ok(Env {
         is_global: cli.global,
         hostname: cli.hostname.clone(),
-        workspace,
+        workspace: cli.workspace.clone(),
         config_root: cli.xdg_config_home.clone().unwrap_or_else(|| home.join(".config")).join(APP_NAME),
         data_root: cli.xdg_data_home.clone().unwrap_or_else(|| home.join(".local/share")).join(APP_NAME),
         state_root: cli.xdg_state_home.clone().unwrap_or_else(|| home.join(".local/state")).join(APP_NAME),
@@ -262,10 +256,43 @@ fn run_build(env: &Env, bootstrap: bool) -> Result<PathBuf, String> {
     if bootstrap || !instance.sysroot.join("nix/var/nix/profiles/system").is_symlink() {
         install_initial_nixos_profile(&env.workspace, &instance.sysroot, &env.hostname)?;
     }
-    //  readlink -f "$SYSROOT/nix/var/nix/profiles/system"
-    let system_profile = fs::read_link(instance.sysroot.join("nix/var/nix/profiles/system")).map_err(|err| err.to_string())?;
+    // TODO: launch VM with special target (build-system-only.target), force re-build in guest.
+    //start_vm(&env, &instance);
+    // loop { wait for ssh to be ready }
+    //run_ssh(&instance, build /etc/nixos config and finally poweroff);
+    // TODO: Wait for guest to finish build, down the VM, and read the system profile path.
+    //virsh(&instance.id, "destroy");
+    //match run_wait(&instance, &["crashed", "shut off"]) {
+    //    Ok("shut off") => { ... system profile path ... },
+    //    Ok(other) => Err(format!("VM is not shut off: {other}")),
+    //    Err(err) => err,
+    //}
+    let profile = fs::read_link(instance.sysroot.join("nix/var/nix/profiles/system")).map_err(|err| err.to_string())?;
+    let system_profile = instance.sysroot.join(profile);
     eprintln!("{}", system_profile.display());
     Ok(system_profile)
+
+    // if "build" and not running,
+    // *start_vm to build-system-only.target*.
+    // wait ssh ready, run ssh to build config *then shutdown*.
+    // *destroy vm*.
+    // print profile path.
+
+    // if "build" and running,
+    // wait ssh ready. run ssh to build config *then report if xml hash changed (you need to shutdown and restart to fully take effect)*.
+    // print profile path.
+
+    // if "up" and not running,
+    // *start_vm to build-system-only.target*.
+    // wait ssh ready, run ssh to build config *then report and shutdown if xml hash changed (restarting because of VM config change), or start multi-user.target if hash not changed*.
+    // *destroy vm if hash changed, start_vm to multi-user.target*.
+
+    // if "up" and running,
+    // wait ssh ready. run ssh to build config *then report if xml hash changed (you need to shutdown and restart to fully take effect)*.
+    // apply switch to new profile if user flagged --switch to do so.
+
+    // if "up" and --no-build,
+    // start_vm to multi-user.target.
 }
 
 #[inline(never)]
@@ -293,7 +320,7 @@ fn resolve_instance(env: &Env, flake_dir: &Path) -> Result<Instance, String> {
     let prefix_file = flake_dir.join("machine-prefix");
     let mut prefix = fs::read_to_string(&prefix_file).unwrap_or_default();
     if prefix.is_empty() {
-        prefix = Sha256::digest(flake_dir.canonicalize().map_err(|err| err.to_string())?.display().to_string().as_bytes())
+        prefix = Sha256::digest(fs::canonicalize(flake_dir).map_err(|err| err.to_string())?.display().to_string().as_bytes())
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>()[..24]
@@ -341,7 +368,7 @@ fn resolve_instance(env: &Env, flake_dir: &Path) -> Result<Instance, String> {
 
 // Prepare the minimal instance directories before sysroot build, virtiofsd, or log writers touch them.
 fn prepare(instance: &Instance) -> Result<(), String> {
-    for dir in [&instance.sysroot, &instance.persistent, &instance.logs_dir] {
+    for dir in [&instance.sysroot, &instance.persistent, &instance.logs_dir, &instance.runtime_dir] {
         fs::create_dir_all(dir).map_err(|err| err.to_string())?;
     }
     Ok(())
@@ -391,6 +418,7 @@ fn fetch_nix_dockerhub(sysroot: &Path) -> Result<(), String> {
     Ok(())
 }
 
+// The initial profile is assumed safe, so building it in a simple container is acceptable.
 #[inline(never)]
 fn install_initial_nixos_profile(workspace: &Path, sysroot: &Path, hostname: &str) -> Result<(), String> {
     let config_target = sysroot.join("etc/nixos");
@@ -445,7 +473,8 @@ fn install_initial_nixos_profile(workspace: &Path, sysroot: &Path, hostname: &st
                 eprintln!("install: mounting tmpfs to sysroot/dev/shm");
                 mount("tmpfs", sysroot.join("dev/shm"), "tmpfs", MountFlags::NODEV | MountFlags::NOSUID, c"mode=01777").map_err(|err| err.to_string())?;
                 eprintln!("install: mounting devpts to sysroot/dev/pts");
-                mount("devpts", sysroot.join("dev/pts"), "devpts", MountFlags::NOSUID | MountFlags::NOEXEC, c"newinstance,ptmxmode=0666,mode=620").map_err(|err| err.to_string())?;
+                let opts = c"newinstance,ptmxmode=0666,mode=620";
+                mount("devpts", sysroot.join("dev/pts"), "devpts", MountFlags::NOSUID | MountFlags::NOEXEC, opts).map_err(|err| err.to_string())?;
                 eprintln!("install: binding host /proc to sysroot/proc");
                 mount_bind_recursive(oldroot.join("proc"), sysroot.join("proc")).map_err(|err| err.to_string())?;
                 // Bind host devices etc to new root's /dev.
@@ -502,7 +531,7 @@ fn install_initial_nixos_profile(workspace: &Path, sysroot: &Path, hostname: &st
             let parent_error = (|| {
                 wait_for_pipe_signal(&child_ready_read, "child namespace setup")?;
                 let set_idmap = |kind: &str, id_map: &str| -> Result<(), String> {
-                    eprintln!( "install: assigning /etc/sub{kind} ranges to child {child_pid} via new{kind}map" );
+                    eprintln!("install: assigning /etc/sub{kind} ranges to child {child_pid} via new{kind}map");
                     let status = process::Command::new(format!("new{kind}map"))
                         .arg(child_pid.as_raw_pid().to_string())
                         .args(id_map.split_whitespace().map(str::to_owned))
@@ -510,8 +539,12 @@ fn install_initial_nixos_profile(workspace: &Path, sysroot: &Path, hostname: &st
                         .stderr(Stdio::inherit())
                         .status()
                         .map_err(|err| err.to_string())?;
-                    (status.success().then_some(()))
-                        .ok_or_else(|| format!("new{kind}map failed with status {}", status.code().map_or("signal".to_owned(), |c| c.to_string())))
+                    (status.success().then_some(())).ok_or_else(|| {
+                        format!(
+                            "new{kind}map failed with status {}",
+                            status.code().map_or("signal".to_owned(), |c| c.to_string())
+                        )
+                    })
                 };
                 set_idmap("uid", &uid_map)?;
                 eprintln!("install: writing setgroups deny for child {child_pid}");
@@ -522,7 +555,8 @@ fn install_initial_nixos_profile(workspace: &Path, sysroot: &Path, hostname: &st
             drop(parent_done_write); // Child will see EOF.
             let status = waitpid(Some(child_pid), WaitOptions::empty()) // Reap zombie process.
                 .map_err(|err| err.to_string())?
-                .ok_or("install: child disappeared before waitpid reported status".to_owned())?.1;
+                .ok_or("install: child disappeared before waitpid reported status".to_owned())?
+                .1;
             match (parent_error, status.exit_status(), status.terminating_signal()) {
                 (Err(err), _, _) => Err(err),
                 (_, Some(0), _) => Ok(()),
@@ -550,6 +584,67 @@ fn wait_for_pipe_signal(fd: &std::os::fd::OwnedFd, stage: &str) -> Result<(), St
         Err(format!("{stage} failed before signaling readiness"))
     }
 }
+#[inline(never)]
+fn run_up(env: &Env, _detach: bool) -> Result<(), String> {
+    let flake_dir = resolve_flake_dir(env)?;
+    let instance = resolve_instance(env, &flake_dir)?;
+    prepare(&instance)?;
+    if let Some(state) = domstate(&instance.id)? {
+        return Err(format!("VM is already {state}"));
+    }
+    let system_profile = run_build(env, false)?;
+    let capture_map = |label: &str, path: &str| -> Result<String, String> {
+        eprintln!("up: capturing {label} map via unshare");
+        let output = process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--map-auto", "cat", path])
+            .output()
+            .map_err(|err| err.to_string())?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+        }
+    };
+    let machine_id = &instance.id[instance.id.len() - 32..];
+    let domain_uuid = format!(
+        "{}-{}-{}-{}-{}",
+        &machine_id[..8],
+        &machine_id[8..12],
+        &machine_id[12..16],
+        &machine_id[16..20],
+        &machine_id[20..32]
+    );
+    let xml_path = instance.runtime_dir.join("domain.xml");
+    let output = process::Command::new(system_profile.join("domain.xml.sh"))
+        .env("DOMAIN_UUID", &domain_uuid)
+        .env("GID_MAP", capture_map("gid", "/proc/self/gid_map")?)
+        .env("INSTANCE_ID", &instance.id)
+        .env("MACHINE_ID", machine_id)
+        .env("NIX_DIR", instance.sysroot.join("nix"))
+        .env("PERSISTENT_DIR", &instance.persistent)
+        .env("RUNTIME_DIR", &instance.runtime_dir)
+        .env("UID_MAP", capture_map("uid", "/proc/self/uid_map")?)
+        .output()
+        .map_err(|err| err.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    fs::write(&xml_path, output.stdout).map_err(|err| err.to_string())?;
+    let status = process::Command::new("virsh")
+        .arg("create")
+        .arg(&xml_path)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|err| err.to_string())?;
+    status.success().then_some(()).ok_or_else(|| {
+        format!(
+            "virsh create failed with status {}",
+            status.code().map_or("signal".to_owned(), |code| code.to_string())
+        )
+    })
+}
+
 #[inline(never)]
 fn run_virsh_action(env: &Env, action: &str) -> Result<(), String> {
     let instance = resolve_instance(env, &resolve_flake_dir(env)?)?;
@@ -686,7 +781,7 @@ mod tests {
     use std::{
         env, fs,
         os::unix::fs::PermissionsExt,
-        path::{Path, PathBuf},
+        path::PathBuf,
         sync::{Mutex, OnceLock},
     };
 
@@ -703,7 +798,7 @@ mod tests {
         resolve_env(&Cli {
             global,
             hostname: "default".into(),
-            workspace: Some(workspace),
+            workspace,
             home: Some(home),
             xdg_config_home,
             xdg_data_home,
@@ -742,7 +837,10 @@ mod tests {
         let (root, home, global) = test_root("init");
         let workspace = root.join("workspace");
         assert_dirs(&[&workspace, &home]);
-        let mounts = format!("# <host-path><TAB><guest-name>\n{}\tworkspace\n", workspace.canonicalize().unwrap().display());
+        let mounts = format!(
+            "# <host-path><TAB><guest-name>\n{}\tworkspace\n",
+            fs::canonicalize(&workspace).unwrap().display()
+        );
         let (local_env, global_env) = (
             env_from_input(workspace.clone(), home.clone(), false, None),
             env_from_input(workspace.clone(), home.clone(), true, None),

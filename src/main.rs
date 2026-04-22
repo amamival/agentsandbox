@@ -2,21 +2,25 @@ use clap::{Parser, Subcommand};
 use flate2::read::GzDecoder;
 use reqwest::{blocking::Client, header};
 use rustix::{
-    io::{read, write},
-    mount::{MountFlags, UnmountFlags},
-    mount::{mount, mount_bind_recursive, mount_remount, unmount},
+    io::{Errno, read, write},
+    mount::{MountFlags, MountPropagationFlags, UnmountFlags},
+    mount::{mount, mount_bind_recursive, mount_change, mount_remount, unmount},
     pipe::{PipeFlags, pipe_with},
-    process::{WaitOptions, chdir, getuid, pivot_root, waitpid},
-    runtime::{Fork, exit_group, kernel_fork},
-    thread::{UnshareFlags, unshare_unsafe},
+    process::{Pid, Signal, WaitOptions, chdir, getgid, getuid, kill_process, pivot_root, waitpid},
+    runtime::{Fork, How, KernelSigSet, Timespec, exit_group, kernel_fork, kernel_sigprocmask, kernel_sigtimedwait},
+    thread::{UnshareFlags, set_thread_res_gid, set_thread_res_uid, unshare_unsafe},
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     env, fs,
+    io::{Read as _, Write as _},
+    os::unix::net::UnixStream,
     os::unix::{fs::symlink, process::CommandExt},
     path::{Path, PathBuf},
     process::{self, Stdio},
+    thread,
+    time::Duration,
 };
 
 const APP_NAME: &str = "agentsandbox";
@@ -177,8 +181,11 @@ fn main() {
         Some(Command::Pause) => run_virsh_action(&env, "suspend"),
         Some(Command::Unpause) => run_virsh_action(&env, "resume"),
         Some(Command::Ps) => run_ps(&env),
+        Some(Command::Mount { path, name }) => run_mount(&env, path, name, true),
+        Some(Command::Unmount { path }) => run_mount(&env, Some(path), None, false),
         Some(Command::Destroy { system, data, logs, conf }) => run_destroy(&env, system, data, logs, conf),
         Some(Command::Ssh { args }) => run_ssh(&env, &args),
+        Some(Command::Verify) => run_verify(&env),
         None | Some(_) => Ok(println!("Comming soon(tm)...")),
     } {
         eprintln!("{err}");
@@ -575,7 +582,114 @@ fn run_up(env: &Env, _detach: bool) -> Result<(), String> {
     if let Some(state) = domstate(&instance.id)? {
         return Err(format!("VM is already {state}"));
     }
+    let pv_socket = instance.runtime_dir.join("pv.sock");
+    let pid_path = instance.runtime_dir.join("agentsandbox.pid");
+    let _ = fs::remove_file(&pv_socket);
+    let _ = fs::remove_file(&pid_path);
     let system_profile = run_build(env, false)?;
+    let (mut parent_sock, mut child_sock) = UnixStream::pair().map_err(|err| err.to_string())?;
+    let current_uid = getuid().as_raw();
+    let current_gid = getgid().as_raw();
+    let supervisor_pid = match unsafe { kernel_fork() }.map_err(|err| err.to_string())? {
+        Fork::Child(_) => {
+            drop(parent_sock);
+            let status = match (|| -> Result<(), String> {
+                unsafe { unshare_unsafe(UnshareFlags::NEWUSER | UnshareFlags::NEWNS) }.map_err(|err| err.to_string())?;
+                child_sock.write_all(&[1]).map_err(|err| err.to_string())?;
+                let mut ready = [0_u8; 1];
+                child_sock.read_exact(&mut ready).map_err(|err| err.to_string())?;
+                set_thread_res_uid(
+                    Some(rustix::process::Uid::ROOT),
+                    Some(rustix::process::Uid::ROOT),
+                    Some(rustix::process::Uid::ROOT),
+                )
+                .map_err(|err| err.to_string())?;
+                set_thread_res_gid(
+                    Some(rustix::process::Gid::ROOT),
+                    Some(rustix::process::Gid::ROOT),
+                    Some(rustix::process::Gid::ROOT),
+                )
+                .map_err(|err| err.to_string())?;
+                mount_change("/", MountPropagationFlags::DOWNSTREAM | MountPropagationFlags::REC).map_err(|err| err.to_string())?;
+                mount_bind_recursive(&instance.persistent, &instance.persistent).map_err(|err| err.to_string())?;
+                mount_change(&instance.persistent, MountPropagationFlags::SHARED | MountPropagationFlags::REC).map_err(|err| err.to_string())?;
+                apply_mounts(&flake_dir, &instance)?;
+                fs::write(&pid_path, format!("{}\n", process::id())).map_err(|err| err.to_string())?;
+
+                let mut mask = KernelSigSet::empty();
+                mask.insert(Signal::HUP);
+                unsafe { kernel_sigprocmask(How::BLOCK, Some(&mask)) }.map_err(|err| err.to_string())?;
+
+                let mut daemon = process::Command::new("virtiofsd")
+                    .args(["--shared-dir", &instance.persistent.display().to_string()])
+                    .args(["--socket-path", &pv_socket.display().to_string()])
+                    .args(["--sandbox", "namespace", "--cache", "auto", "--xattr"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::inherit())
+                    .spawn()
+                    .map_err(|err| err.to_string())?;
+
+                for _ in 0..50 {
+                    if pv_socket.exists() {
+                        child_sock.write_all(&[1]).map_err(|err| err.to_string())?;
+                        break;
+                    }
+                    if let Some(status) = daemon.try_wait().map_err(|err| err.to_string())? {
+                        return Err(format!("virtiofsd exited before socket became ready: {status}"));
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+                if !pv_socket.exists() {
+                    return Err("virtiofsd socket did not appear in time".to_owned());
+                }
+
+                loop {
+                    if let Some(status) = daemon.try_wait().map_err(|err| err.to_string())? {
+                        if status.success() {
+                            break;
+                        }
+                        return Err(format!("virtiofsd exited unexpectedly: {status}"));
+                    }
+                    let timeout = Timespec {
+                        tv_sec: 0,
+                        tv_nsec: 200_000_000,
+                    };
+                    match unsafe { kernel_sigtimedwait(&mask, Some(&timeout)) } {
+                        Ok(_info) => {
+                            if let Err(err) = apply_mounts(&flake_dir, &instance) {
+                                eprintln!("mount reload: {err}");
+                            }
+                            continue;
+                        }
+                        Err(Errno::AGAIN) | Err(Errno::INTR) => continue,
+                        Err(err) => return Err(err.to_string()),
+                    }
+                }
+
+                Ok(())
+            })() {
+                Ok(()) => 0,
+                Err(err) => {
+                    eprintln!("up(supervisor): {err}");
+                    1
+                }
+            };
+            let _ = fs::remove_file(&pid_path);
+            let _ = fs::remove_file(&pv_socket);
+            exit_group(status)
+        }
+        Fork::ParentOf(child_pid) => {
+            drop(child_sock);
+            let mut ready = [0_u8; 1];
+            parent_sock.read_exact(&mut ready).map_err(|err| err.to_string())?;
+            fs::write(format!("/proc/{child_pid}/uid_map"), format!("0 {current_uid} 1")).map_err(|err| err.to_string())?;
+            fs::write(format!("/proc/{child_pid}/setgroups"), b"deny").map_err(|err| err.to_string())?;
+            fs::write(format!("/proc/{child_pid}/gid_map"), format!("0 {current_gid} 1")).map_err(|err| err.to_string())?;
+            parent_sock.write_all(&[1]).map_err(|err| err.to_string())?;
+            parent_sock.read_exact(&mut ready).map_err(|err| err.to_string())?;
+            child_pid
+        }
+    };
     let machine_id = &instance.id[instance.id.len() - 32..];
     let domain_uuid = format!(
         "{}-{}-{}-{}-{}",
@@ -599,7 +713,29 @@ fn run_up(env: &Env, _detach: bool) -> Result<(), String> {
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
     }
-    fs::write(&xml_path, output.stdout).map_err(|err| err.to_string())?;
+    let socket_xml = pv_socket
+        .display()
+        .to_string()
+        .replace('&', "&amp;")
+        .replace('\'', "&apos;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    let mut xml = String::from_utf8(output.stdout).map_err(|err| err.to_string())?;
+    let target = "<target dir='persistent'/>";
+    let target_idx = xml.find(target).ok_or("persistent filesystem target missing from domain XML".to_owned())?;
+    let start_idx = xml[..target_idx]
+        .rfind("<filesystem type='mount'>")
+        .ok_or("persistent filesystem block start missing from domain XML".to_owned())?;
+    let end_idx = target_idx
+        + xml[target_idx..]
+            .find("</filesystem>")
+            .ok_or("persistent filesystem block end missing from domain XML".to_owned())?
+        + "</filesystem>".len();
+    let replacement = format!(
+        "<filesystem type='mount'>\n                  <driver type='virtiofs' queue='1024'/>\n                  <source socket='{socket_xml}'/>\n                  <target dir='persistent'/>\n                </filesystem>"
+    );
+    xml.replace_range(start_idx..end_idx, &replacement);
+    fs::write(&xml_path, xml).map_err(|err| err.to_string())?;
     let status = process::Command::new("virsh")
         .arg("create")
         .arg(&xml_path)
@@ -608,6 +744,8 @@ fn run_up(env: &Env, _detach: bool) -> Result<(), String> {
         .status()
         .map_err(|err| err.to_string())?;
     status.success().then_some(()).ok_or_else(|| {
+        let _ = kill_process(supervisor_pid, Signal::TERM);
+        let _ = waitpid(Some(supervisor_pid), WaitOptions::empty());
         format!(
             "virsh create failed with status {}",
             status.code().map_or("signal".to_owned(), |code| code.to_string())
@@ -627,6 +765,142 @@ fn capture_host_idmap(path: &str) -> Result<String, String> {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
     }
 }
+// TODO: rmdir on empty dirs.
+fn apply_mounts(flake_dir: &Path, instance: &Instance) -> Result<(), String> {
+    let mounts_path = flake_dir.join("mounts");
+    let workspace_dir = instance.persistent.join("workspace");
+    fs::create_dir_all(&workspace_dir).map_err(|err| err.to_string())?;
+
+    let mut dirs = Vec::new();
+    let mut stack = vec![workspace_dir.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).map_err(|err| err.to_string())? {
+            let entry = entry.map_err(|err| err.to_string())?;
+            let path = entry.path();
+            if entry.file_type().map_err(|err| err.to_string())?.is_dir() {
+                stack.push(path.clone());
+                dirs.push(path);
+            }
+        }
+    }
+    dirs.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for dir in &dirs {
+        let _ = unmount(dir, UnmountFlags::DETACH);
+    }
+    for entry in fs::read_dir(&workspace_dir).map_err(|err| err.to_string())? {
+        let entry = entry.map_err(|err| err.to_string())?;
+        let path = entry.path();
+        if entry.file_type().map_err(|err| err.to_string())?.is_dir() {
+            fs::remove_dir_all(path).map_err(|err| err.to_string())?;
+        } else {
+            fs::remove_file(path).map_err(|err| err.to_string())?;
+        }
+    }
+
+    for line in fs::read_to_string(&mounts_path).map_err(|err| err.to_string())?.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (source, guest_name) = line.split_once('\t').ok_or_else(|| format!("invalid mounts entry: {line}"))?;
+        if guest_name.is_empty() || guest_name.contains('/') {
+            return Err(format!("invalid guest name: {guest_name}"));
+        }
+        let source = PathBuf::from(source);
+        if !source.is_dir() {
+            return Err(format!("mount source is not a directory: {}", source.display()));
+        }
+        let target = workspace_dir.join(guest_name);
+        fs::create_dir_all(&target).map_err(|err| err.to_string())?;
+        mount_bind_recursive(&source, &target).map_err(|err| err.to_string())?;
+    }
+
+    Ok(())
+}
+
+fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_add: bool) -> Result<(), String> {
+    let flake_dir = resolve_flake_dir(env)?;
+    let instance = resolve_instance(env, &flake_dir)?;
+    let mounts_path = flake_dir.join("mounts");
+    let mut mounts = Vec::new();
+    for line in fs::read_to_string(&mounts_path).map_err(|err| err.to_string())?.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (source, guest_name) = line.split_once('\t').ok_or_else(|| format!("invalid mounts entry: {line}"))?;
+        mounts.push((source.to_owned(), guest_name.to_owned()));
+    }
+
+    if is_add && path.is_none() {
+        for (source, guest_name) in mounts {
+            println!("{source}\t{guest_name}");
+        }
+        return Ok(());
+    }
+
+    if is_add {
+        let source = fs::canonicalize(PathBuf::from(path.ok_or("mount path is required".to_owned())?)).map_err(|err| err.to_string())?;
+        if !source.is_dir() {
+            return Err(format!("mount source is not a directory: {}", source.display()));
+        }
+        let guest_name = name.ok_or("mount name is required".to_owned())?;
+        if guest_name.is_empty() || guest_name.contains('/') {
+            return Err(format!("invalid guest name: {guest_name}"));
+        }
+        let source = source.display().to_string();
+        if let Some((_, existing_name)) = mounts.iter_mut().find(|(existing_source, _)| *existing_source == source) {
+            *existing_name = guest_name;
+        } else {
+            mounts.push((source, guest_name));
+        }
+    } else {
+        let path = path.ok_or("unmount path is required".to_owned())?;
+        let canonical = fs::canonicalize(&path).ok().map(|path| path.display().to_string());
+        let before = mounts.len();
+        mounts.retain(|(source, _)| *source != path && canonical.as_ref().is_none_or(|canonical| source != canonical));
+        if mounts.len() == before {
+            return Err(format!("mount not found: {path}"));
+        }
+    }
+
+    let mut contents = String::from("# <host-path><TAB><guest-name>\n");
+    for (source, guest_name) in &mounts {
+        contents.push_str(source);
+        contents.push('\t');
+        contents.push_str(guest_name);
+        contents.push('\n');
+    }
+    fs::write(&mounts_path, contents).map_err(|err| err.to_string())?;
+
+    let pid_path = instance.runtime_dir.join("agentsandbox.pid");
+    if let Ok(pid) = fs::read_to_string(&pid_path) {
+        if let Ok(pid) = pid.trim().parse::<i32>() {
+            match Pid::from_raw(pid) {
+                Some(pid) => {
+                    if let Err(err) = kill_process(pid, Signal::HUP) {
+                        if err == Errno::SRCH {
+                            eprintln!("mount reload: pid file not found");
+                            let _ = fs::remove_file(&pid_path);
+                            let _ = fs::remove_file(instance.runtime_dir.join("pv.sock"));
+                        } else {
+                            eprintln!("mount reload: {err}");
+                            return Err(err.to_string());
+                        }
+                    }
+                    eprintln!("mount reload: sent HUP to {pid}");
+                }
+                None => {
+                    eprintln!("mount reload: pid file not found");
+                    let _ = fs::remove_file(&pid_path);
+                    let _ = fs::remove_file(instance.runtime_dir.join("pv.sock"));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
 
 #[inline(never)]
 fn run_virsh_action(env: &Env, action: &str) -> Result<(), String> {
@@ -640,6 +914,242 @@ fn run_ps(env: &Env) -> Result<(), String> {
     let instance = resolve_instance(env, &resolve_flake_dir(env)?)?;
     println!("{}\t{}", instance.id, domstate(&instance.id)?.unwrap_or_else(|| "down".to_owned()));
     Ok(())
+}
+
+#[inline(never)]
+fn run_verify(env: &Env) -> Result<(), String> {
+    let instance = resolve_instance(env, &resolve_flake_dir(env)?)?;
+    prepare(&instance)?;
+    let verify_dir = env::temp_dir().join(format!("asv-{}", process::id()));
+    remove_dir_all_if_exists(&verify_dir)?;
+    fs::create_dir_all(&verify_dir).map_err(|err| err.to_string())?;
+
+    let export_dir = verify_dir.join("export");
+    let source_dir = verify_dir.join("source");
+    let mount_target = export_dir.join("workspace");
+    let socket_path = verify_dir.join("virtiofsd.sock");
+    let source_file = source_dir.join("mounted.txt");
+    let nested_source_dir = source_dir.join("nested");
+    let nested_source_file = nested_source_dir.join("child.txt");
+    let export_marker = export_dir.join("export-root.txt");
+
+    fs::create_dir_all(&nested_source_dir).map_err(|err| err.to_string())?;
+    fs::create_dir_all(&mount_target).map_err(|err| err.to_string())?;
+    fs::write(&source_file, "dynamic mount ok\n").map_err(|err| err.to_string())?;
+    fs::write(&nested_source_file, "nested file ok\n").map_err(|err| err.to_string())?;
+    fs::write(&export_marker, "export root ok\n").map_err(|err| err.to_string())?;
+
+    let current_uid = getuid().as_raw();
+    let current_gid = getgid().as_raw();
+    let (child_ready_read, child_ready_write) = pipe_with(PipeFlags::CLOEXEC).map_err(|err| err.to_string())?;
+    let (parent_done_read, parent_done_write) = pipe_with(PipeFlags::CLOEXEC).map_err(|err| err.to_string())?;
+    let (daemon_ready_read, daemon_ready_write) = pipe_with(PipeFlags::CLOEXEC).map_err(|err| err.to_string())?;
+    let (mount_done_read, mount_done_write) = pipe_with(PipeFlags::CLOEXEC).map_err(|err| err.to_string())?;
+    let (cleanup_read, cleanup_write) = pipe_with(PipeFlags::CLOEXEC).map_err(|err| err.to_string())?;
+
+    match unsafe { kernel_fork() }.map_err(|err| err.to_string())? {
+        Fork::Child(_) => {
+            drop(child_ready_read);
+            drop(parent_done_write);
+            drop(daemon_ready_read);
+            drop(mount_done_read);
+            drop(cleanup_write);
+            let mut mounted = false;
+            let mut daemon = None;
+            let status = match (|| -> Result<(), String> {
+                unsafe { unshare_unsafe(UnshareFlags::NEWUSER | UnshareFlags::NEWNS) }.map_err(|err| err.to_string())?;
+                write_fd(&child_ready_write)?;
+                wait_for_pipe_signal(&parent_done_read, "parent uid/gid map install")?;
+                set_thread_res_uid(
+                    Some(rustix::process::Uid::ROOT),
+                    Some(rustix::process::Uid::ROOT),
+                    Some(rustix::process::Uid::ROOT),
+                )
+                .map_err(|err| err.to_string())?;
+                set_thread_res_gid(
+                    Some(rustix::process::Gid::ROOT),
+                    Some(rustix::process::Gid::ROOT),
+                    Some(rustix::process::Gid::ROOT),
+                )
+                .map_err(|err| err.to_string())?;
+                mount_change("/", MountPropagationFlags::DOWNSTREAM | MountPropagationFlags::REC).map_err(|err| err.to_string())?;
+
+                mount_bind_recursive(&export_dir, &export_dir).map_err(|err| err.to_string())?;
+                mount_change(&export_dir, MountPropagationFlags::SHARED | MountPropagationFlags::REC)
+                    .map_err(|err| format!("verify: make-shared {}: {}", export_dir.display(), err))?;
+
+                let daemon_child = process::Command::new("virtiofsd")
+                    .args(["--shared-dir", &export_dir.display().to_string()])
+                    .args(["--socket-path", &socket_path.display().to_string()])
+                    .args(["--sandbox", "namespace", "--seccomp", "none", "--cache", "always"])
+                    .args(["--thread-pool-size", "0", "--log-level", "debug"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::inherit())
+                    .spawn()
+                    .map_err(|err| err.to_string())?;
+                daemon = Some(daemon_child);
+
+                for _ in 0..50 {
+                    if socket_path.exists() {
+                        write_fd(&daemon_ready_write)?;
+                        mount_bind_recursive(&source_dir, &mount_target).map_err(|err| err.to_string())?;
+                        mounted = true;
+                        write_fd(&mount_done_write)?;
+                        wait_for_pipe_signal(&cleanup_read, "parent cleanup")?;
+                        break;
+                    }
+                    if daemon.as_mut().unwrap().try_wait().map_err(|err| err.to_string())?.is_some() {
+                        return Err("virtiofsd exited before socket became ready".to_owned());
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+                if !socket_path.exists() {
+                    return Err("virtiofsd socket did not appear in time".to_owned());
+                }
+
+                Ok(())
+            })() {
+                Ok(()) => 0,
+                Err(err) => {
+                    eprintln!("verify: {err}");
+                    1
+                }
+            };
+            if mounted {
+                let _ = unmount(&mount_target, UnmountFlags::DETACH);
+            }
+            if let Some(mut daemon) = daemon {
+                let _ = daemon.kill();
+                let _ = daemon.wait();
+            }
+            let _ = fs::remove_file(&socket_path);
+            exit_group(status)
+        }
+        Fork::ParentOf(child_pid) => {
+            drop(child_ready_write);
+            drop(parent_done_read);
+            drop(daemon_ready_write);
+            drop(mount_done_write);
+            drop(cleanup_read);
+
+            let parent_result = (|| -> Result<(), String> {
+                wait_for_pipe_signal(&child_ready_read, "child namespace setup")?;
+                fs::write(format!("/proc/{child_pid}/uid_map"), format!("0 {current_uid} 1")).map_err(|err| err.to_string())?;
+                fs::write(format!("/proc/{child_pid}/setgroups"), b"deny").map_err(|err| err.to_string())?;
+                fs::write(format!("/proc/{child_pid}/gid_map"), format!("0 {current_gid} 1")).map_err(|err| err.to_string())?;
+                write_fd(&parent_done_write)?;
+                wait_for_pipe_signal(&daemon_ready_read, "virtiofsd socket ready")?;
+                wait_for_pipe_signal(&mount_done_read, "dynamic mount apply")?;
+
+                let export_dir_text = export_dir.display().to_string();
+                let socket_path_text = socket_path.display().to_string();
+                let output = process::Command::new("ps")
+                    .args(["-eo", "pid=,ppid=,args="])
+                    .output()
+                    .map_err(|err| err.to_string())?;
+                if !output.status.success() {
+                    return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+                }
+                let mut matches = Vec::new();
+                for line in String::from_utf8_lossy(&output.stdout).lines() {
+                    let mut fields = line.split_whitespace();
+                    let Some(pid) = fields.next().and_then(|field| field.parse::<i32>().ok()) else {
+                        continue;
+                    };
+                    let Some(ppid) = fields.next().and_then(|field| field.parse::<i32>().ok()) else {
+                        continue;
+                    };
+                    if !line.contains("virtiofsd") || !line.contains(&export_dir_text) || !line.contains(&socket_path_text) {
+                        continue;
+                    }
+                    matches.push((pid, ppid));
+                }
+                if matches.is_empty() {
+                    return Err("verify: standalone virtiofsd matches not found".to_owned());
+                }
+                println!("verify: standalone virtiofsd matches");
+                for (match_pid, match_ppid) in &matches {
+                    println!("pid={match_pid} ppid={match_ppid}");
+                    println!(
+                        "verify: /proc/{match_pid}/ns/user = {}",
+                        fs::read_link(format!("/proc/{match_pid}/ns/user")).map_err(|err| err.to_string())?.display()
+                    );
+                    println!(
+                        "verify: /proc/{match_pid}/ns/mnt = {}",
+                        fs::read_link(format!("/proc/{match_pid}/ns/mnt")).map_err(|err| err.to_string())?.display()
+                    );
+                }
+
+                let mut observed = None;
+                for _ in 0..50 {
+                    for (match_pid, _) in &matches {
+                        let root_path = format!("/proc/{match_pid}/root");
+                        let mounted_path = format!("{root_path}/workspace/mounted.txt");
+                        let nested_path = format!("{root_path}/workspace/nested/child.txt");
+                        if let (Ok(mounted_contents), Ok(nested_contents)) = (fs::read_to_string(&mounted_path), fs::read_to_string(&nested_path)) {
+                            observed = Some((*match_pid, mounted_contents, nested_contents));
+                            break;
+                        }
+                    }
+                    if observed.is_some() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+                let (daemon_pid, mounted_contents, nested_contents) =
+                    observed.ok_or("verify: propagated bind mount not visible from any virtiofsd pid".to_owned())?;
+                println!("verify: observed propagated mount through pid {daemon_pid}");
+
+                let mut root_entries = fs::read_dir(format!("/proc/{daemon_pid}/root"))
+                    .map_err(|err| err.to_string())?
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                root_entries.sort();
+                println!("verify: /proc/{daemon_pid}/root entries");
+                for entry in root_entries {
+                    println!("{entry}");
+                }
+
+                let mut workspace_entries = fs::read_dir(format!("/proc/{daemon_pid}/root/workspace"))
+                    .map_err(|err| err.to_string())?
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                workspace_entries.sort();
+                println!("verify: /proc/{daemon_pid}/root/workspace entries");
+                for entry in workspace_entries {
+                    println!("{entry}");
+                }
+
+                println!(
+                    "verify: /proc/{daemon_pid}/root/export-root.txt = {}",
+                    fs::read_to_string(format!("/proc/{daemon_pid}/root/export-root.txt"))
+                        .map_err(|err| err.to_string())?
+                        .trim_end()
+                );
+                println!("verify: /proc/{daemon_pid}/root/workspace/mounted.txt = {}", mounted_contents.trim_end());
+                println!("verify: /proc/{daemon_pid}/root/workspace/nested/child.txt = {}", nested_contents.trim_end());
+
+                write_fd(&cleanup_write)
+            })();
+
+            drop(parent_done_write);
+            drop(cleanup_write);
+            let status = waitpid(Some(child_pid), WaitOptions::empty())
+                .map_err(|err| err.to_string())?
+                .ok_or("verify: child disappeared before waitpid reported status".to_owned())?
+                .1;
+            remove_dir_all_if_exists(&verify_dir)?;
+            match (parent_result, status.exit_status(), status.terminating_signal()) {
+                (Err(err), _, _) => Err(err),
+                (_, Some(0), _) => Ok(()),
+                (_, Some(code), _) => Err(format!("verify: child exited with status {code}")),
+                (_, None, Some(signal)) => Err(format!("verify: child terminated by signal {signal}")),
+                (_, None, None) => Err(format!("verify: child ended unexpectedly: {status:?}")),
+            }
+        }
+    }
 }
 
 #[inline(never)]

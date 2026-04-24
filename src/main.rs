@@ -185,7 +185,8 @@ fn main() {
         Some(Command::Mount { path, name }) => run_mount(&env, path, name, true),
         Some(Command::Unmount { path }) => run_mount(&env, Some(path), None, false),
         Some(Command::Destroy { system, data, logs, conf }) => run_destroy(&env, system, data, logs, conf),
-        Some(Command::Ssh { args }) => run_ssh(&env, &args),
+        Some(Command::Ssh { args }) => run_ssh(&env, &args, false),
+        Some(Command::Exec { args }) => run_ssh(&env, &args, true),
         Some(Command::Verify) => run_verify(&env),
         None | Some(_) => Ok(println!("Comming soon(tm)...")),
     } {
@@ -240,7 +241,7 @@ fn write_template_config(target: &Path, workspace: &Path, force: bool) -> Result
         ("flake.nix", include_str!("../share/agentsandbox/template/flake.nix").to_owned()),
         ("configuration.nix", include_str!("../share/agentsandbox/template/configuration.nix").to_owned()),
         ("allowed_hosts", String::new()),
-        ("mounts", format!("# <host-path><TAB><guest-name>\n{}\t{workspace_name}\n", workspace.display())),
+        ("mounts", format!("# <rel-host-path><TAB><guest-name>\n.\t{workspace_name}\n")),
         (
             "agentsandbox/flake.nix",
             include_str!("../share/agentsandbox/template/agentsandbox/flake.nix").to_owned(),
@@ -588,38 +589,49 @@ fn run_up(env: &Env, _detach: bool) -> Result<(), String> {
     let _ = fs::remove_file(&pv_socket);
     let _ = fs::remove_file(&pid_path);
     let system_profile = run_build(env, false)?;
-    let (mut parent_sock, mut child_sock) = UnixStream::pair().map_err(|err| err.to_string())?;
+let (mut parent_sock, mut child_sock) =
+    UnixStream::pair().map_err(|err| format!("up: create supervisor socket pair: {err}"))?;
     let current_uid = getuid().as_raw();
     let current_gid = getgid().as_raw();
-    let supervisor_pid = match unsafe { kernel_fork() }.map_err(|err| err.to_string())? {
+    let supervisor_pid = match unsafe { kernel_fork() }.map_err(|err| format!("up: fork supervisor: {err}"))? {
         Fork::Child(_) => {
             drop(parent_sock);
             let status = match (|| -> Result<(), String> {
-                unsafe { unshare_unsafe(UnshareFlags::NEWUSER | UnshareFlags::NEWNS) }.map_err(|err| err.to_string())?;
-                child_sock.write_all(&[1]).map_err(|err| err.to_string())?;
+                unsafe { unshare_unsafe(UnshareFlags::NEWUSER | UnshareFlags::NEWNS) }
+                    .map_err(|err| format!("unshare user+mount namespaces: {err}"))?;
+                child_sock
+                    .write_all(&[1])
+                    .map_err(|err| format!("notify parent for uid/gid map setup: {err}"))?;
                 let mut ready = [0_u8; 1];
-                child_sock.read_exact(&mut ready).map_err(|err| err.to_string())?;
+                child_sock
+                    .read_exact(&mut ready)
+                    .map_err(|err| format!("wait parent uid/gid map setup: {err}"))?;
                 set_thread_res_uid(
                     Some(rustix::process::Uid::ROOT),
                     Some(rustix::process::Uid::ROOT),
                     Some(rustix::process::Uid::ROOT),
                 )
-                .map_err(|err| err.to_string())?;
+                .map_err(|err| format!("set uid to root in userns: {err}"))?;
                 set_thread_res_gid(
                     Some(rustix::process::Gid::ROOT),
                     Some(rustix::process::Gid::ROOT),
                     Some(rustix::process::Gid::ROOT),
                 )
-                .map_err(|err| err.to_string())?;
-                mount_change("/", MountPropagationFlags::DOWNSTREAM | MountPropagationFlags::REC).map_err(|err| err.to_string())?;
-                mount_bind_recursive(&instance.persistent, &instance.persistent).map_err(|err| err.to_string())?;
-                mount_change(&instance.persistent, MountPropagationFlags::SHARED | MountPropagationFlags::REC).map_err(|err| err.to_string())?;
-                apply_mounts(&flake_dir, &instance)?;
-                fs::write(&pid_path, format!("{}\n", process::id())).map_err(|err| err.to_string())?;
+                .map_err(|err| format!("set gid to root in userns: {err}"))?;
+                mount_change("/", MountPropagationFlags::DOWNSTREAM | MountPropagationFlags::REC)
+                    .map_err(|err| format!("set / mount propagation downstream+rec: {err}"))?;
+                mount_bind_recursive(&instance.persistent, &instance.persistent)
+                    .map_err(|err| format!("self bind persistent dir: {err}"))?;
+                mount_change(&instance.persistent, MountPropagationFlags::SHARED | MountPropagationFlags::REC)
+                    .map_err(|err| format!("set persistent mount shared+rec: {err}"))?;
+                apply_mounts(&env, &flake_dir, &instance).map_err(|err| format!("apply_mounts: {err}"))?;
+                fs::write(&pid_path, format!("{}\n", process::id()))
+                    .map_err(|err| format!("write pid file {}: {err}", pid_path.display()))?;
 
                 let mut mask = KernelSigSet::empty();
                 mask.insert(Signal::HUP);
-                unsafe { kernel_sigprocmask(How::BLOCK, Some(&mask)) }.map_err(|err| err.to_string())?;
+                unsafe { kernel_sigprocmask(How::BLOCK, Some(&mask)) }
+                    .map_err(|err| format!("block HUP signal: {err}"))?;
 
                 let mut daemon = process::Command::new("virtiofsd")
                     .args(["--shared-dir", &instance.persistent.display().to_string()])
@@ -628,14 +640,19 @@ fn run_up(env: &Env, _detach: bool) -> Result<(), String> {
                     .stdout(Stdio::null())
                     .stderr(Stdio::inherit())
                     .spawn()
-                    .map_err(|err| err.to_string())?;
+                    .map_err(|err| format!("spawn virtiofsd: {err}"))?;
 
                 for _ in 0..50 {
                     if pv_socket.exists() {
-                        child_sock.write_all(&[1]).map_err(|err| err.to_string())?;
+                        child_sock
+                            .write_all(&[1])
+                            .map_err(|err| format!("notify parent virtiofs socket ready: {err}"))?;
                         break;
                     }
-                    if let Some(status) = daemon.try_wait().map_err(|err| err.to_string())? {
+                    if let Some(status) = daemon
+                        .try_wait()
+                        .map_err(|err| format!("poll virtiofsd process: {err}"))?
+                    {
                         return Err(format!("virtiofsd exited before socket became ready: {status}"));
                     }
                     thread::sleep(Duration::from_millis(100));
@@ -645,7 +662,10 @@ fn run_up(env: &Env, _detach: bool) -> Result<(), String> {
                 }
 
                 loop {
-                    if let Some(status) = daemon.try_wait().map_err(|err| err.to_string())? {
+                    if let Some(status) = daemon
+                        .try_wait()
+                        .map_err(|err| format!("poll virtiofsd process: {err}"))?
+                    {
                         if status.success() {
                             break;
                         }
@@ -657,13 +677,13 @@ fn run_up(env: &Env, _detach: bool) -> Result<(), String> {
                     };
                     match unsafe { kernel_sigtimedwait(&mask, Some(&timeout)) } {
                         Ok(_info) => {
-                            if let Err(err) = apply_mounts(&flake_dir, &instance) {
-                                eprintln!("mount reload: {err}");
+                            if let Err(err) = apply_mounts(&env, &flake_dir, &instance).map_err(|err| format!("apply_mounts: {err}")) {
+                                eprintln!("apply_mounts: {err}");
                             }
                             continue;
                         }
                         Err(Errno::AGAIN) | Err(Errno::INTR) => continue,
-                        Err(err) => return Err(err.to_string()),
+                        Err(err) => return Err(format!("wait HUP signal: {err}")),
                     }
                 }
 
@@ -679,17 +699,27 @@ fn run_up(env: &Env, _detach: bool) -> Result<(), String> {
             let _ = fs::remove_file(&pv_socket);
             exit_group(status)
         }
-        Fork::ParentOf(child_pid) => {
+        Fork::ParentOf(child_pid) => (|| -> Result<Pid, String> {
             drop(child_sock);
             let mut ready = [0_u8; 1];
-            parent_sock.read_exact(&mut ready).map_err(|err| err.to_string())?;
-            fs::write(format!("/proc/{child_pid}/uid_map"), format!("0 {current_uid} 1")).map_err(|err| err.to_string())?;
-            fs::write(format!("/proc/{child_pid}/setgroups"), b"deny").map_err(|err| err.to_string())?;
-            fs::write(format!("/proc/{child_pid}/gid_map"), format!("0 {current_gid} 1")).map_err(|err| err.to_string())?;
-            parent_sock.write_all(&[1]).map_err(|err| err.to_string())?;
-            parent_sock.read_exact(&mut ready).map_err(|err| err.to_string())?;
-            child_pid
-        }
+            parent_sock
+                .read_exact(&mut ready)
+                .map_err(|err| format!("wait child unshare ready: {err}"))?;
+            fs::write(format!("/proc/{child_pid}/uid_map"), format!("0 {current_uid} 1"))
+                .map_err(|err| format!("write /proc/{child_pid}/uid_map: {err}"))?;
+            fs::write(format!("/proc/{child_pid}/setgroups"), b"deny")
+                .map_err(|err| format!("write /proc/{child_pid}/setgroups: {err}"))?;
+            fs::write(format!("/proc/{child_pid}/gid_map"), format!("0 {current_gid} 1"))
+                .map_err(|err| format!("write /proc/{child_pid}/gid_map: {err}"))?;
+            parent_sock
+                .write_all(&[1])
+                .map_err(|err| format!("notify child uid/gid maps ready: {err}"))?;
+            parent_sock
+                .read_exact(&mut ready)
+                .map_err(|err| format!("wait child virtiofs socket ready: {err}"))?;
+            Ok(child_pid)
+        })()
+        .map_err(|err| format!("up(parent): {err}"))?,
     };
     let machine_id = &instance.id[instance.id.len() - 32..];
     let domain_uuid = format!(
@@ -768,15 +798,16 @@ fn capture_host_idmap(path: &str) -> Result<String, String> {
 }
 
 /// Apply mounts from mounts file to the guest system.
-fn apply_mounts(flake_dir: &Path, instance: &Instance) -> Result<(), String> {
+fn apply_mounts(env: &Env, flake_dir: &Path, instance: &Instance) -> Result<(), String> {
     let mounts_path = flake_dir.join("mounts");
     let workspace_dir = instance.persistent.join("workspace");
     let mut mounted = Vec::new();
 
     // Collect all mounted directories under /persistent/workspace.
-    let output = (process::Command::new("findmnt").args(["-Rlno", "target"]).output()).map_err(|err| err.to_string())?;
+    let output =
+        (process::Command::new("findmnt").args(["-Rlno", "target"]).output()).map_err(|err| format!("run findmnt -Rlno target: {err}"))?;
     if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+        return Err(format!("findmnt: {}", String::from_utf8_lossy(&output.stderr)));
     }
     for target in String::from_utf8_lossy(&output.stdout).lines() {
         let target = Path::new(target);
@@ -787,47 +818,46 @@ fn apply_mounts(flake_dir: &Path, instance: &Instance) -> Result<(), String> {
     mounted.sort();
 
     // Collect and validate all mounts from mounts file.
-    let parsed_mounts = (fs::read_to_string(&mounts_path).map_err(|err| err.to_string())?)
+    let mut parsed_mounts = Vec::new();
+    for line in fs::read_to_string(&mounts_path)
+        .map_err(|err| format!("read mounts file {}: {err}", mounts_path.display()))?
         .lines()
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(|line| {
-            let mut parts = line.split('\t');
-            let (source, name) = match (parts.next(), parts.next(), parts.next()) {
-                (Some(source), Some(name), None) => (source, name),
-                _ => return Err(format!("invalid mounts entry: {line}")),
-            };
-            validate_mount_source_field(source)?;
-            let source_abs = if Path::new(source).is_absolute() {
-                PathBuf::from(source)
-            } else {
-                workspace_dir.join(source)
-            };
-            if !source_abs.exists() {
-                return Err(format!("mount source does not exist: {}", source_abs.display()));
-            }
-            if !source_abs.is_dir() && !source_abs.is_file() {
-                return Err(format!("mount source is neither file nor directory: {}", source_abs.display()));
-            }
-            validate_mount_name_field(name)?;
-            let target = workspace_dir.join(name);
-            let is_dir = source_abs.is_dir();
-            Ok((source_abs, target, is_dir))
-        })
-        .collect::<Vec<Result<(PathBuf, PathBuf, bool), String>>>();
-    let mut new_mounts = Vec::new();
-    for parsed in parsed_mounts {
-        match parsed {
-            Ok(mount) => new_mounts.push(mount),
-            Err(err) => eprintln!("{err}"),
+    {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
         }
+        let mut parts = line.split('\t');
+        let (source, name) = match (parts.next(), parts.next(), parts.next()) {
+            (Some(source), Some(name), None) => (source, name),
+            _ => return Err(format!("invalid mounts entry: {line}")),
+        };
+        validate_mount_source_field(source)?;
+        let source_abs = if Path::new(source).is_absolute() {
+            PathBuf::from(source)
+        } else {
+            env.workspace.join(source)
+        };
+        let source_abs = source_abs
+            .canonicalize()
+            .map_err(|err| format!("canonicalize mount source {}: {err}", source_abs.display()))?;
+        if !source_abs.exists() {
+            return Err(format!("mount source does not exist: {}", source_abs.display()));
+        }
+        if !source_abs.is_dir() && !source_abs.is_file() {
+            return Err(format!("mount source is neither file nor directory: {}", source_abs.display()));
+        }
+        validate_mount_name_field(name)?;
+        let target = workspace_dir.join(name);
+        let is_dir = source_abs.is_dir();
+        parsed_mounts.push((source_abs, target, is_dir));
     }
-
+    parsed_mounts.sort_by(|a, b| a.1.cmp(&b.1));
     // Unmount all mounted directories in order of depth.
     for target in mounted.iter().rev() {
         let metadata = match fs::symlink_metadata(target) {
             Ok(metadata) => metadata,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(err.to_string()),
+            Err(err) => return Err(format!("stat mounted target {}: {err}", target.display())),
         };
         if unmount(target, UnmountFlags::DETACH).is_err() {
             continue;
@@ -837,27 +867,39 @@ fn apply_mounts(flake_dir: &Path, instance: &Instance) -> Result<(), String> {
                 Ok(()) => {}
                 // Underlaying mount is still visible.
                 Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
-                Err(err) => return Err(err.to_string()),
+                Err(err) => return Err(format!("remove mounted dir {}: {err}", target.display())),
             }
         } else if metadata.is_file() && metadata.len() == 0 {
             // Only remove empty files.
-            fs::remove_file(target).map_err(|err| err.to_string())?;
+            fs::remove_file(target).map_err(|err| format!("remove mounted file {}: {err}", target.display()))?;
         }
     }
 
     // Mount all mounts from mounts file.
-    for (source_abs, target, is_dir) in new_mounts {
+    for (source_abs, target, is_dir) in parsed_mounts {
         if is_dir {
-            fs::create_dir_all(&target).map_err(|err| err.to_string())?;
-            mount_bind_recursive(&source_abs, &target).map_err(|err| err.to_string())?;
+            fs::create_dir_all(&target).map_err(|err| format!("create target dir {}: {err}", target.display()))?;
+            mount_bind_recursive(&source_abs, &target).map_err(|err| {
+                format!(
+                    "bind-mount dir {} -> {}: {err}",
+                    source_abs.display(),
+                    target.display()
+                )
+            })?;
         } else {
             if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+                fs::create_dir_all(parent).map_err(|err| format!("create target parent dir {}: {err}", parent.display()))?;
             }
             if !target.exists() {
-                fs::write(&target, "").map_err(|err| err.to_string())?;
+                fs::write(&target, "").map_err(|err| format!("create target file {}: {err}", target.display()))?;
             }
-            mount_bind(&source_abs, &target).map_err(|err| err.to_string())?;
+            mount_bind(&source_abs, &target).map_err(|err| {
+                format!(
+                    "bind-mount file {} -> {}: {err}",
+                    source_abs.display(),
+                    target.display()
+                )
+            })?;
         }
     }
     Ok(())
@@ -998,7 +1040,7 @@ fn run_destroy(env: &Env, system: bool, data: bool, logs: bool, conf: bool) -> R
 }
 
 #[inline(never)]
-fn run_ssh(env: &Env, args: &[String]) -> Result<(), String> {
+fn run_ssh(env: &Env, args: &[String], is_root: bool) -> Result<(), String> {
     let flake_dir = resolve_flake_dir(env)?;
     let instance = resolve_instance(env, &flake_dir)?;
     if domstate(&instance.id)?.as_deref() != Some("running") {
@@ -1041,7 +1083,8 @@ fn run_ssh(env: &Env, args: &[String]) -> Result<(), String> {
         })
         .ok_or("ssh port forward for guest tcp/22 is not configured".to_owned())?;
     Err(process::Command::new("ssh")
-        .args(["vscode@127.0.0.1", "-p"])
+        .arg(if is_root { "root@127.0.0.1" } else { "vscode@127.0.0.1" })
+        .arg("-p")
         .arg(ssh_port.to_string())
         .args(["-o", "LogLevel=ERROR", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"])
         .args(args)

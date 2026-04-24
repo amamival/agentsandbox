@@ -90,6 +90,7 @@ In our experiments, *gVisor* could not run *SystemD* as PID 1 because it lacks t
 ## Similar project
 
 [devsandbox](https://github.com/zekker6/devsandbox) - a `bwrap`-based container runtime with request logs, domain filtering, egress secret reduction, `GH_TOKEN` injection, desktop notification, and automatic sharing of tool configuration.
+[cube sandbox](https://github.com/TencentCloud/CubeSandbox) - a KVM-based lightweight E2B-compatible sandbox. Quick iteration for parallel RL sessions and production services.
 
 # Design detail
 

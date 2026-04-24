@@ -103,10 +103,17 @@ This file defines a single end-to-end scenario sequence that exercises every `ag
    - Verify that helper sockets and PID files are cleaned up.
 
 15. Validate destroy semantics.
-   - Run `agentsandbox destroy`.
-   - Verify that the sysroot is removed.
-   - Verify that the `persistent/` tree remains.
-   - Verify that a later `agentsandbox up` reuses the persistent state.
+    - Run `agentsandbox destroy`.
+    - Verify that the sysroot remains.
+    - Verify that the `persistent/` tree remains.
+    - Run `agentsandbox destroy -s`.
+    - Verify that the sysroot is removed.
+    - Verify that the `persistent/` tree remains.
+    - Run `agentsandbox destroy -d`.
+    - Verify that `persistent/` is removed and `sysroot/` remains.
+    - Run `agentsandbox destroy -sd`.
+    - Verify that the whole data dir is removed.
+    - Verify that a later `agentsandbox up` reuses the persistent state.
 
 16. Validate the remaining utility commands in the same session.
    - Run `agentsandbox port`.

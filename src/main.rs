@@ -614,7 +614,7 @@ fn run_up(env: &Env, _detach: bool) -> Result<(), String> {
                 mount_change("/", MountPropagationFlags::DOWNSTREAM | MountPropagationFlags::REC).map_err(|err| err.to_string())?;
                 mount_bind_recursive(&instance.persistent, &instance.persistent).map_err(|err| err.to_string())?;
                 mount_change(&instance.persistent, MountPropagationFlags::SHARED | MountPropagationFlags::REC).map_err(|err| err.to_string())?;
-                apply_mounts(env, &flake_dir, &instance)?;
+                apply_mounts(&flake_dir, &instance)?;
                 fs::write(&pid_path, format!("{}\n", process::id())).map_err(|err| err.to_string())?;
 
                 let mut mask = KernelSigSet::empty();
@@ -657,7 +657,7 @@ fn run_up(env: &Env, _detach: bool) -> Result<(), String> {
                     };
                     match unsafe { kernel_sigtimedwait(&mask, Some(&timeout)) } {
                         Ok(_info) => {
-                            if let Err(err) = apply_mounts(env, &flake_dir, &instance) {
+                            if let Err(err) = apply_mounts(&flake_dir, &instance) {
                                 eprintln!("mount reload: {err}");
                             }
                             continue;
@@ -766,70 +766,114 @@ fn capture_host_idmap(path: &str) -> Result<String, String> {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
     }
 }
-// TODO: rmdir on empty dirs.
-fn apply_mounts(env: &Env, flake_dir: &Path, instance: &Instance) -> Result<(), String> {
+
+/// Apply mounts from mounts file to the guest system.
+fn apply_mounts(flake_dir: &Path, instance: &Instance) -> Result<(), String> {
     let mounts_path = flake_dir.join("mounts");
     let workspace_dir = instance.persistent.join("workspace");
-    fs::create_dir_all(&workspace_dir).map_err(|err| err.to_string())?;
+    let mut mounted = Vec::new();
 
-    let mut dirs = Vec::new();
-    let mut stack = vec![workspace_dir.clone()];
-    while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(&dir).map_err(|err| err.to_string())? {
-            let entry = entry.map_err(|err| err.to_string())?;
-            let path = entry.path();
-            if entry.file_type().map_err(|err| err.to_string())?.is_dir() {
-                stack.push(path.clone());
-                dirs.push(path);
+    // Collect all mounted directories under /persistent/workspace.
+    let output = (process::Command::new("findmnt").args(["-Rlno", "target"]).output()).map_err(|err| err.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    for target in String::from_utf8_lossy(&output.stdout).lines() {
+        let target = Path::new(target);
+        if target == workspace_dir || target.strip_prefix(&workspace_dir).is_ok_and(|suffix| !suffix.as_os_str().is_empty()) {
+            mounted.push(target.to_path_buf());
+        }
+    }
+    mounted.sort();
+
+    // Collect and validate all mounts from mounts file.
+    let parsed_mounts = (fs::read_to_string(&mounts_path).map_err(|err| err.to_string())?)
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| {
+            let mut parts = line.split('\t');
+            let (source, name) = match (parts.next(), parts.next(), parts.next()) {
+                (Some(source), Some(name), None) => (source, name),
+                _ => return Err(format!("invalid mounts entry: {line}")),
+            };
+            validate_mount_source_field(source)?;
+            let source_abs = if Path::new(source).is_absolute() {
+                PathBuf::from(source)
+            } else {
+                workspace_dir.join(source)
+            };
+            if !source_abs.exists() {
+                return Err(format!("mount source does not exist: {}", source_abs.display()));
             }
-        }
-    }
-    dirs.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
-    for dir in &dirs {
-        let _ = unmount(dir, UnmountFlags::DETACH);
-    }
-    for entry in fs::read_dir(&workspace_dir).map_err(|err| err.to_string())? {
-        let entry = entry.map_err(|err| err.to_string())?;
-        let path = entry.path();
-        if entry.file_type().map_err(|err| err.to_string())?.is_dir() {
-            fs::remove_dir_all(path).map_err(|err| err.to_string())?;
-        } else {
-            fs::remove_file(path).map_err(|err| err.to_string())?;
+            if !source_abs.is_dir() && !source_abs.is_file() {
+                return Err(format!("mount source is neither file nor directory: {}", source_abs.display()));
+            }
+            validate_mount_name_field(name)?;
+            let target = workspace_dir.join(name);
+            let is_dir = source_abs.is_dir();
+            Ok((source_abs, target, is_dir))
+        })
+        .collect::<Vec<Result<(PathBuf, PathBuf, bool), String>>>();
+    let mut new_mounts = Vec::new();
+    for parsed in parsed_mounts {
+        match parsed {
+            Ok(mount) => new_mounts.push(mount),
+            Err(err) => eprintln!("{err}"),
         }
     }
 
-    for line in fs::read_to_string(&mounts_path).map_err(|err| err.to_string())?.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+    // Unmount all mounted directories in order of depth.
+    for target in mounted.iter().rev() {
+        let metadata = match fs::symlink_metadata(target) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.to_string()),
+        };
+        if unmount(target, UnmountFlags::DETACH).is_err() {
             continue;
         }
-        let (source, guest_name) = line.split_once('\t').ok_or_else(|| format!("invalid mounts entry: {line}"))?;
-        if guest_name.is_empty() || guest_name == "." || guest_name == ".." || guest_name.contains('/') {
-            return Err(format!("invalid guest name: {guest_name}"));
+        if metadata.is_dir() {
+            match fs::remove_dir(target) {
+                Ok(()) => {}
+                // Underlaying mount is still visible.
+                Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+                Err(err) => return Err(err.to_string()),
+            }
+        } else if metadata.is_file() && metadata.len() == 0 {
+            // Only remove empty files.
+            fs::remove_file(target).map_err(|err| err.to_string())?;
         }
-        let source = if Path::new(source).is_absolute() {
-            PathBuf::from(source)
-        } else {
-            env.workspace.join(source)
-        };
-        if !source.exists() {
-            return Err(format!("mount source does not exist: {}", source.display()));
-        }
-        let target = workspace_dir.join(guest_name);
-        if source.is_dir() {
+    }
+
+    // Mount all mounts from mounts file.
+    for (source_abs, target, is_dir) in new_mounts {
+        if is_dir {
             fs::create_dir_all(&target).map_err(|err| err.to_string())?;
-            mount_bind_recursive(&source, &target).map_err(|err| err.to_string())?;
-        } else if source.is_file() {
+            mount_bind_recursive(&source_abs, &target).map_err(|err| err.to_string())?;
+        } else {
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent).map_err(|err| err.to_string())?;
             }
-            fs::write(&target, "").map_err(|err| err.to_string())?;
-            mount_bind(&source, &target).map_err(|err| err.to_string())?;
-        } else {
-            return Err(format!("mount source is neither file nor directory: {}", source.display()));
+            if !target.exists() {
+                fs::write(&target, "").map_err(|err| err.to_string())?;
+            }
+            mount_bind(&source_abs, &target).map_err(|err| err.to_string())?;
         }
     }
+    Ok(())
+}
 
+fn validate_mount_source_field(value: &str) -> Result<(), String> {
+    if value.is_empty() || value.contains('\t') || value.contains('\n') {
+        return Err(format!("invalid mount source: contains control separator characters or empty"));
+    }
+    Ok(())
+}
+
+fn validate_mount_name_field(value: &str) -> Result<(), String> {
+    if value.is_empty() || value == "." || value == ".." || value.contains('\t') || value.contains('\n') {
+        return Err(format!("invalid mount name: contains control separator characters or empty"));
+    }
     Ok(())
 }
 
@@ -838,12 +882,6 @@ fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bo
     let instance = resolve_instance(env, &flake_dir)?;
     let mounts_path = flake_dir.join("mounts");
 
-    let validate_mount_field = |field: &str, value: &str| -> Result<(), String> {
-        if value.is_empty() || value.contains('\t') || value.contains('\n') {
-            return Err(format!("invalid {field}: contains control separator characters or empty"));
-        }
-        Ok(())
-    };
     let to_base_rel = |path: &Path| -> Result<(PathBuf, PathBuf), String> {
         let base_abs = env.workspace.canonicalize().map_err(|err| err.to_string())?;
         let path_abs = if path.is_absolute() { path.to_path_buf() } else { base_abs.join(path) };
@@ -856,17 +894,17 @@ fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bo
         // mount.
         (true, Some(path)) => {
             let (source_rel, source_abs) = to_base_rel(Path::new(&path))?;
-            validate_mount_field("mount path", &source_rel.display().to_string())?;
+            validate_mount_source_field(&source_rel.display().to_string())?;
             if !source_abs.is_dir() && !source_abs.is_file() {
                 return Err(format!("mount source is neither file nor directory: {}", source_abs.display()));
             }
             let name = name.unwrap_or((source_abs.file_name().expect("failed to infer mount name from path").to_string_lossy()).to_string());
-            validate_mount_field("mount destination directory name", &name)?;
+            validate_mount_name_field(&name)?;
             (Some((source_rel, name)), None)
         }
         // unmount.
         (false, Some(source)) => {
-            validate_mount_field("mount path", &source)?;
+            validate_mount_source_field(&source)?;
             let (source_rel, _) = to_base_rel(Path::new(&source))?;
             (None, Some(source_rel.display().to_string()))
         }

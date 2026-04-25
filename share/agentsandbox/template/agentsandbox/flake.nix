@@ -54,101 +54,108 @@
         virtualisation.useDefaultFilesystems = false;
         virtualisation.useNixStoreImage = false;
         virtualisation.useBootLoader = false;
-        system.systemBuilderCommands = let
-          kernelParams = lib.escapeXML (lib.concatStringsSep " " config.boot.kernelParams);
-          portForwardsXml = lib.concatMapStrings (forward: let
-            h = forward.host;
-            g = forward.guest;
-          in ''
-                      <portForward proto='${lib.escapeXML forward.proto}'>
-                        ${
-                          if h.start == h.end then
-                            "<range start='${toString h.start}' to='${toString g}'/>"
-                          else
-                            "<range start='${toString h.start}' end='${toString h.end}' to='${toString g}'/>"
-                        }
-                      </portForward>
-          '') (lib.attrValues config.agentsandbox.portForwards);
-          libvirtDomainXmlGen = pkgs.writeShellScript "domain.xml.sh" ''
-            TOPLEVEL="$(cd -- "$(dirname -- "$0")" && pwd -P)"
-            SYSROOT="''${NIX_DIR%/nix}"
-            KERNEL="$(readlink "$TOPLEVEL/kernel")"
-            INITRD="$(readlink "$TOPLEVEL/initrd")"
-            UID_IDMAP_XML="$(
-              while read -r START TARGET COUNT; do
-                echo "                    <uid start='$START' target='$TARGET' count='$COUNT'/>"
-              done <<<"$UID_MAP"
-            )"
-            GID_IDMAP_XML="$(
-              while read -r START TARGET COUNT; do
-                echo "                    <gid start='$START' target='$TARGET' count='$COUNT'/>"
-              done <<<"$GID_MAP"
-            )"
-            [[ "$KERNEL" == /* ]] && KERNEL="$SYSROOT$KERNEL" || KERNEL="$TOPLEVEL/$KERNEL"
-            [[ "$INITRD" == /* ]] && INITRD="$SYSROOT$INITRD" || INITRD="$TOPLEVEL/$INITRD"
-            cat <<EOF
-            <domain type='kvm'>
-              <name>$INSTANCE_ID</name>
-              <uuid>$DOMAIN_UUID</uuid>
-              <memory unit='MiB'>${toString config.virtualisation.memorySize}</memory>
-              <currentMemory unit='MiB'>${toString config.virtualisation.memorySize}</currentMemory>
-              <vcpu placement='static'>${toString config.virtualisation.cores}</vcpu>
-              <os>
-                <type arch='x86_64' machine='q35'>hvm</type>
-                <kernel>$KERNEL</kernel>
-                <initrd>$INITRD</initrd>
-                <cmdline>${kernelParams} init=/nix/var/nix/profiles/system/init systemd.machine_id=$MACHINE_ID</cmdline>
-              </os>
-              <cpu mode='host-passthrough' migratable='off'/>
-              <memoryBacking>
-                <source type='memfd'/>
-                <access mode='shared'/>
-              </memoryBacking>
-              <features>
-                <acpi/>
-                <apic/>
-              </features>
-              <devices>
-                <filesystem type='mount'>
-                  <driver type='virtiofs' queue='1024'/>
-                  <binary path='${pkgs.virtiofsd}/bin/virtiofsd' xattr='on'>
-                    <cache mode='always'/>
-                    <sandbox mode='namespace'/>
-                    <!-- Rust virtiofsd 1.13.x does not advertise lock support to libvirt:
-                         https://virtio-fs.gitlab.io/virtiofsd/doc/virtiofsd/fuse/struct.FsOptions.html -->
-                    <thread_pool size='0'/>
-                  </binary>
-                  <source dir='$NIX_DIR'/>
-                  <target dir='nix'/>
-                  <idmap>
-            $UID_IDMAP_XML
-            $GID_IDMAP_XML
-                  </idmap>
-                </filesystem>
-                <filesystem type='mount'>
-                  <driver type='virtiofs' queue='1024'/>
-                  <source socket='$PERSISTENT_SOCKET_XML'/>
-                  <target dir='persistent'/>
-                </filesystem>
-                <serial type='pty'>
-                  <target port='0'/>
-                </serial>
-                <console type='pty'>
-                  <target type='serial' port='0'/>
-                </console>
-                <rng model='virtio'>
-                  <backend model='random'>/dev/urandom</backend>
-                </rng>
-                <interface type='user'>
-                  <backend type='passt'/>
-                  <model type='virtio'/>
-            ${portForwardsXml}
-                </interface>
-              </devices>
-            </domain>
-            EOF
+        system.systemBuilderCommands =
+          let
+            kernelParams = lib.escapeXML (lib.concatStringsSep " " config.boot.kernelParams);
+            portForwards = lib.mapAttrsToList (name: forward: "${name}\t${forward.proto}\t${toString forward.host.start}\t${toString forward.host.end}\t${toString forward.guest}") config.agentsandbox.portForwards;
+            portForwardsFile = pkgs.writeText "port-forwards" (lib.concatStringsSep "\n" portForwards + "\n");
+            portForwardsXml = lib.concatMapStrings
+              (f: ''
+                <portForward proto='${lib.escapeXML forward.proto}'>${
+                if f.host.start == f.host.end then
+                  "<range start='${toString f.host.start}' to='${toString g}'/>"
+                else
+                  "<range start='${toString f.host.start}' end='${toString f.host.end}' to='${toString f.guest}'/>"
+                }</portForward>
+              '')
+              (lib.attrValues config.agentsandbox.portForwards);
+            libvirtDomainXmlGen = pkgs.writeShellScript "domain.xml.sh" ''
+              TOPLEVEL="$(cd -- "$(dirname -- "$0")" && pwd -P)"
+              SYSROOT="''${NIX_DIR%/nix}"
+              KERNEL="$(readlink "$TOPLEVEL/kernel")"
+              INITRD="$(readlink "$TOPLEVEL/initrd")"
+              UID_IDMAP_XML="$(
+                  while read -r START TARGET COUNT; do
+                    echo "                    <uid start='$START' target='$TARGET' count='$COUNT'/>"
+                  done <<<"$UID_MAP"
+                )"
+              GID_IDMAP_XML="$(
+                  while read -r START TARGET COUNT; do
+                    echo "                    <gid start='$START' target='$TARGET' count='$COUNT'/>"
+                  done <<<"$GID_MAP"
+                )"
+              [[ "$KERNEL" == /* ]] && KERNEL="$SYSROOT$KERNEL" || KERNEL="$TOPLEVEL/$KERNEL"
+              [[ "$INITRD" == /* ]] && INITRD="$SYSROOT$INITRD" || INITRD="$TOPLEVEL/$INITRD"
+              cat <<EOF
+              <domain type='kvm'>
+                <name>$INSTANCE_ID</name>
+                <uuid>$DOMAIN_UUID</uuid>
+                <memory unit='MiB'>${toString config.virtualisation.memorySize}</memory>
+                <currentMemory unit='MiB'>${toString config.virtualisation.memorySize}</currentMemory>
+                <vcpu placement='static'>${toString config.virtualisation.cores}</vcpu>
+                <os>
+                  <type arch='x86_64' machine='q35'>hvm</type>
+                  <kernel>$KERNEL</kernel>
+                  <initrd>$INITRD</initrd>
+                  <cmdline>${kernelParams} init=/nix/var/nix/profiles/system/init systemd.machine_id=$MACHINE_ID</cmdline>
+                </os>
+                <cpu mode='host-passthrough' migratable='off'/>
+                <memoryBacking>
+                  <source type='memfd'/>
+                  <access mode='shared'/>
+                </memoryBacking>
+                <features>
+                  <acpi/>
+                  <apic/>
+                </features>
+                <devices>
+                  <filesystem type='mount'>
+                    <driver type='virtiofs' queue='1024'/>
+                    <binary path='${pkgs.virtiofsd}/bin/virtiofsd' xattr='on'>
+                      <cache mode='always'/>
+                      <sandbox mode='namespace'/>
+                      <!-- Rust virtiofsd 1.13.x does not advertise lock support to libvirt:
+                            https://virtio-fs.gitlab.io/virtiofsd/doc/virtiofsd/fuse/struct.FsOptions.html -->
+                      <thread_pool size='0'/>
+                    </binary>
+                    <source dir='$NIX_DIR'/>
+                    <target dir='nix'/>
+                    <idmap>
+              $UID_IDMAP_XML
+              $GID_IDMAP_XML
+                    </idmap>
+                  </filesystem>
+                  <filesystem type='mount'>
+                    <driver type='virtiofs' queue='1024'/>
+                    <source socket='$PERSISTENT_SOCKET_XML'/>
+                    <target dir='persistent'/>
+                  </filesystem>
+                  <serial type='pty'>
+                    <target port='0'/>
+                  </serial>
+                  <console type='pty'>
+                    <target type='serial' port='0'/>
+                  </console>
+                  <rng model='virtio'>
+                    <backend model='random'>/dev/urandom</backend>
+                  </rng>
+                  <interface type='user'>
+                    <backend type='passt'/>
+                    <model type='virtio'/>
+              ${portForwardsXml}
+                  </interface>
+                </devices>
+              </domain>
+              EOF
+            '';
+          in
+          lib.mkAfter ''
+            cp ${libvirtDomainXmlGen} "$out/domain.xml.sh"
+            cp ${portForwardsFile} "$out/port-forwards"
+            ${lib.optionalString config.agentsandbox.mutableSandboxConfig ''
+              touch "$out/mutable-sandbox-config"
+            ''}
           '';
-        in lib.mkAfter "cp ${libvirtDomainXmlGen} $out/domain.xml.sh";
         # Keep initrd module set minimal; root and early mounts only need virtiofs here.
         boot.initrd.kernelModules = [ "virtiofs" ];
         #boot.loader.external = { enable = true; installHook = "${pkgs.coreutils}/bin/true"; };
@@ -233,3 +240,4 @@
     };
   };
 }
+

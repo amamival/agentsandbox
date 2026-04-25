@@ -57,13 +57,15 @@
         system.systemBuilderCommands =
           let
             kernelParams = lib.escapeXML (lib.concatStringsSep " " config.boot.kernelParams);
-            portForwards = lib.mapAttrsToList (name: forward: "${name}\t${forward.proto}\t${toString forward.host.start}\t${toString forward.host.end}\t${toString forward.guest}") config.agentsandbox.portForwards;
+            portForwards = lib.mapAttrsToList
+              (name: f: "${name}\t${f.proto}\t${toString f.host.start}\t${toString f.host.end}\t${toString f.guest}")
+              config.agentsandbox.portForwards;
             portForwardsFile = pkgs.writeText "port-forwards" (lib.concatStringsSep "\n" portForwards + "\n");
             portForwardsXml = lib.concatMapStrings
               (f: ''
-                <portForward proto='${lib.escapeXML forward.proto}'>${
+                <portForward proto='${lib.escapeXML f.proto}'>${
                 if f.host.start == f.host.end then
-                  "<range start='${toString f.host.start}' to='${toString g}'/>"
+                  "<range start='${toString f.host.start}' to='${toString f.guest}'/>"
                 else
                   "<range start='${toString f.host.start}' end='${toString f.host.end}' to='${toString f.guest}'/>"
                 }</portForward>
@@ -240,4 +242,3 @@
     };
   };
 }
-

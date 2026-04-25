@@ -947,42 +947,36 @@ fn run_ssh(env: &Env, args: &[String], is_root: bool) -> anyhow::Result<()> {
     if domstate(&instance.id)? != "running" {
         bail!("VM is not running");
     }
-    // FIXME: Avoid nixos tree eval.
-    let output = process::Command::new("nix")
-        .arg("eval")
-        .arg("--json")
-        .arg(format!(
-            "path:{}#nixosConfigurations.{hostname}.config.agentsandbox.portForwards",
-            flake_dir.display(),
-            hostname = env.hostname
-        ))
-        .output()
-        .context("load VM port forward settings")?;
-    if !output.status.success() {
-        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    let system_profile = fs::read_link(instance.sysroot.join("nix/var/nix/profiles/system")).context("read system profile symlink")?;
+    let rel_system_profile_path = system_profile.strip_prefix("/").context("require absolute system profile symlink")?;
+    let mut ssh_port = None;
+    for line in fs::read_to_string(instance.sysroot.join(rel_system_profile_path).join("port-forwards"))
+        .context("read system profile port-forwards")?
+        .lines()
+    {
+        let mut parts = line.split('\t');
+        let (_name, proto, start, end, guest) = match (parts.next(), parts.next(), parts.next(), parts.next(), parts.next(), parts.next()) {
+            (Some(name), Some(proto), Some(start), Some(end), Some(guest), None) => (name, proto, start, end, guest),
+            _ => bail!("invalid port-forwards entry: {line}"),
+        };
+        if proto != "tcp" {
+            continue;
+        }
+        let start = start.parse::<u64>().context("parse port-forwards host start")?;
+        let end = end.parse::<u64>().context("parse port-forwards host end")?;
+        let guest = guest.parse::<u64>().context("parse port-forwards guest port")?;
+        if end < start {
+            bail!("invalid port-forwards range: {line}");
+        }
+        if (22_u64 >= guest) && (22_u64 <= guest + (end - start)) {
+            ssh_port = Some(u16::try_from(start + 22_u64 - guest).context("ssh host port exceeds u16")?);
+            break;
+        }
     }
-    let port_forwards: Value = serde_json::from_slice(&output.stdout).context("parse VM port forward settings")?;
-    let ssh_port = port_forwards
-        .as_object()
-        .and_then(|forwards| {
-            for forward in forwards.values() {
-                if forward.get("proto")?.as_str()? != "tcp" {
-                    continue;
-                }
-                let host = forward.get("host")?;
-                let (start, end) = if let Some(host_port) = host.as_u64() {
-                    (host_port, host_port)
-                } else {
-                    (host.get("start")?.as_u64()?, host.get("end")?.as_u64()?)
-                };
-                let guest = forward.get("guest")?.as_u64()?;
-                if (22_u64 >= guest) && (22_u64 <= guest + (end - start)) {
-                    return u16::try_from(start + 22_u64 - guest).ok();
-                }
-            }
-            None
-        })
-        .context("ssh port forward for guest tcp/22 is not configured")?;
+    let ssh_port = match ssh_port {
+        Some(port) => port,
+        None => bail!("ssh port forward for guest tcp/22 is not configured"),
+    };
     bail!(
         process::Command::new("ssh")
             .arg(if is_root { "root@127.0.0.1" } else { "vscode@127.0.0.1" })

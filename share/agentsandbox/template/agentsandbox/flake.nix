@@ -127,19 +127,8 @@
                 </filesystem>
                 <filesystem type='mount'>
                   <driver type='virtiofs' queue='1024'/>
-                  <binary path='${pkgs.virtiofsd}/bin/virtiofsd' xattr='on'>
-                    <cache mode='always'/>
-                    <sandbox mode='namespace'/>
-                    <!-- Rust virtiofsd 1.13.x does not advertise lock support to libvirt:
-                         https://virtio-fs.gitlab.io/virtiofsd/doc/virtiofsd/fuse/struct.FsOptions.html -->
-                    <thread_pool size='0'/>
-                  </binary>
-                  <source dir='$PERSISTENT_DIR'/>
+                  <source socket='$PERSISTENT_SOCKET_XML'/>
                   <target dir='persistent'/>
-                  <idmap>
-            $UID_IDMAP_XML
-            $GID_IDMAP_XML
-                  </idmap>
                 </filesystem>
                 <serial type='pty'>
                   <target port='0'/>

@@ -87,6 +87,7 @@ let
 
   Users = {
     users.mutableUsers = false;
+    users.users.root.initialPassword = "";
     users.users.${HostConf.wheelUser} = {
       isNormalUser = true;
       uid = 1000;

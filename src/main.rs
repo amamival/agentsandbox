@@ -1,3 +1,4 @@
+use anyhow::{Context as _, bail};
 use clap::{Parser, Subcommand};
 use flate2::read::GzDecoder;
 use pathdiff::diff_paths;
@@ -166,36 +167,35 @@ struct Instance {
 }
 
 fn main() {
-    let cli = Cli::parse();
-    let env = resolve_env(&cli).unwrap_or_else(|err| {
-        eprintln!("{err}");
-        process::exit(1);
-    });
-    if let Err(err) = match cli.command {
-        Some(Command::Version) => Ok(println!("{}", env!("CARGO_PKG_VERSION"))),
-        Some(Command::Init { force }) => run_init(&env, force),
-        Some(Command::Build { bootstrap }) => run_build(&env, bootstrap).map(|p| println!("{}", p.display())),
-        Some(Command::Up { detach }) => run_up(&env, detach),
-        Some(Command::Down) => run_virsh_action(&env, "shutdown"),
-        Some(Command::Kill) => run_virsh_action(&env, "destroy"),
-        Some(Command::Pause) => run_virsh_action(&env, "suspend"),
-        Some(Command::Unpause) => run_virsh_action(&env, "resume"),
-        Some(Command::Ps) => run_ps(&env),
-        Some(Command::Mount { path, name }) => run_mount(&env, path, name, true),
-        Some(Command::Unmount { path }) => run_mount(&env, Some(path), None, false),
-        Some(Command::Destroy { system, data, logs, conf }) => run_destroy(&env, system, data, logs, conf),
-        Some(Command::Ssh { args }) => run_ssh(&env, &args, false),
-        Some(Command::Exec { args }) => run_ssh(&env, &args, true),
-        Some(Command::Verify) => run_verify(&env),
-        None | Some(_) => Ok(println!("Comming soon(tm)...")),
-    } {
-        eprintln!("{err}");
+    if let Err(err) = (|| -> anyhow::Result<()> {
+        let cli = Cli::parse();
+        let env = resolve_env(&cli).context("resolve environment")?;
+        match cli.command {
+            Some(Command::Version) => Ok(println!("{}", env!("CARGO_PKG_VERSION"))),
+            Some(Command::Init { force }) => run_init(&env, force).context("init"),
+            Some(Command::Build { bootstrap }) => run_build(&env, bootstrap).map(|p| println!("{}", p.display())).context("build"),
+            Some(Command::Up { detach }) => run_up(&env, detach).context("up"),
+            Some(Command::Down) => run_virsh_action(&env, "shutdown").context("down"),
+            Some(Command::Kill) => run_virsh_action(&env, "destroy").context("kill"),
+            Some(Command::Pause) => run_virsh_action(&env, "suspend").context("pause"),
+            Some(Command::Unpause) => run_virsh_action(&env, "resume").context("unpause"),
+            Some(Command::Ps) => run_ps(&env).context("ps"),
+            Some(Command::Mount { path, name }) => run_mount(&env, path, name, true).context("mount"),
+            Some(Command::Unmount { path }) => run_mount(&env, Some(path), None, false).context("unmount"),
+            Some(Command::Destroy { system, data, logs, conf }) => run_destroy(&env, system, data, logs, conf).context("destroy"),
+            Some(Command::Ssh { args }) => run_ssh(&env, &args, false).context("ssh"),
+            Some(Command::Exec { args }) => run_ssh(&env, &args, true).context("exec"),
+            Some(Command::Verify) => run_verify(&env).context("verify"),
+            None | Some(_) => Ok(println!("Comming soon(tm)...")),
+        }
+    })() {
+        eprintln!("{err:#}");
         process::exit(1);
     }
 }
 
 #[inline(never)]
-fn resolve_env(cli: &Cli) -> Result<Env, String> {
+fn resolve_env(cli: &Cli) -> anyhow::Result<Env> {
     let uid = getuid().as_raw();
     let home = cli.home.clone().expect("please set HOME");
     Ok(Env {
@@ -215,7 +215,7 @@ fn resolve_env(cli: &Cli) -> Result<Env, String> {
 
 // Create the config dir and initial files for local/global init, or return a displayable error.
 #[inline(never)]
-fn run_init(env: &Env, force: bool) -> Result<(), String> {
+fn run_init(env: &Env, force: bool) -> anyhow::Result<()> {
     let target = if env.is_global {
         env.config_root.clone()
     } else {
@@ -226,16 +226,12 @@ fn run_init(env: &Env, force: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn write_template_config(target: &Path, workspace: &Path, force: bool) -> Result<(), String> {
+fn write_template_config(target: &Path, workspace: &Path, force: bool) -> anyhow::Result<()> {
     if target.exists() && !force {
-        return Err(format!("{} already exists", target.display()));
+        bail!("{} already exists", target.display());
     }
-    fs::create_dir_all(target).map_err(|err| err.to_string())?;
-    let workspace_name = workspace
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or("failed to derive workspace name".to_owned())?;
-    fs::create_dir_all(target.join("agentsandbox")).map_err(|err| err.to_string())?;
+    let workspace_name = workspace.file_name().and_then(|name| name.to_str()).context("derive workspace name")?;
+    fs::create_dir_all(target.join("agentsandbox")).context("create agentsandbox dir")?;
     for (name, contents) in [
         ("flake.nix", include_str!("../share/agentsandbox/template/flake.nix").to_owned()),
         ("configuration.nix", include_str!("../share/agentsandbox/template/configuration.nix").to_owned()),
@@ -246,13 +242,13 @@ fn write_template_config(target: &Path, workspace: &Path, force: bool) -> Result
             include_str!("../share/agentsandbox/template/agentsandbox/flake.nix").to_owned(),
         ),
     ] {
-        fs::write(target.join(name), contents).map_err(|err| err.to_string())?;
+        fs::write(target.join(name), contents).context("write template file")?;
     }
     Ok(())
 }
 
 #[inline(never)]
-fn run_build(env: &Env, bootstrap: bool) -> Result<PathBuf, String> {
+fn run_build(env: &Env, bootstrap: bool) -> anyhow::Result<PathBuf> {
     let instance = resolve_instance(env, &resolve_flake_dir(env)?)?;
     prepare(&instance)?;
     if !instance.sysroot.join("nix/var/nix/profiles/default").is_symlink() {
@@ -272,8 +268,8 @@ fn run_build(env: &Env, bootstrap: bool) -> Result<PathBuf, String> {
     //    Ok(other) => Err(format!("VM is not shut off: {other}")),
     //    Err(err) => err,
     //}
-    let system_profile = fs::read_link(instance.sysroot.join("nix/var/nix/profiles/system")).map_err(|err| err.to_string())?;
-    let rel_system_profile_path = system_profile.strip_prefix("/").expect("system profile symlink is not absolute path");
+    let system_profile = fs::read_link(instance.sysroot.join("nix/var/nix/profiles/system")).context("read system profile symlink")?;
+    let rel_system_profile_path = system_profile.strip_prefix("/").context("require absolute system profile symlink")?;
     Ok(instance.sysroot.join(rel_system_profile_path))
 
     // if "build" and not running,
@@ -300,7 +296,7 @@ fn run_build(env: &Env, bootstrap: bool) -> Result<PathBuf, String> {
 }
 
 #[inline(never)]
-fn resolve_flake_dir(env: &Env) -> Result<PathBuf, String> {
+fn resolve_flake_dir(env: &Env) -> anyhow::Result<PathBuf> {
     if !env.is_global {
         let mut dir = env.workspace.clone();
         loop {
@@ -315,21 +311,21 @@ fn resolve_flake_dir(env: &Env) -> Result<PathBuf, String> {
     if env.config_root.join("flake.nix").is_file() {
         Ok(env.config_root.clone())
     } else {
-        Err(format!("{} not found", env.config_root.display()))
+        bail!("{} not found", env.config_root.display())
     }
 }
 
 #[inline(never)]
-fn resolve_instance(env: &Env, flake_dir: &Path) -> Result<Instance, String> {
+fn resolve_instance(env: &Env, flake_dir: &Path) -> anyhow::Result<Instance> {
     let prefix_file = flake_dir.join("machine-prefix");
     let mut prefix = fs::read_to_string(&prefix_file).unwrap_or_default();
     if prefix.is_empty() {
-        prefix = Sha256::digest(fs::canonicalize(flake_dir).map_err(|err| err.to_string())?.display().to_string().as_bytes())
+        prefix = Sha256::digest(fs::canonicalize(flake_dir).context("canonicalize flake dir")?.as_os_str().as_encoded_bytes())
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>()[..24]
             .into();
-        fs::write(&prefix_file, &prefix).map_err(|err| err.to_string())?;
+        fs::write(&prefix_file, &prefix).context("write machine-prefix")?;
     }
     let machine_id = format!(
         "{prefix}{}",
@@ -344,7 +340,7 @@ fn resolve_instance(env: &Env, flake_dir: &Path) -> Result<Instance, String> {
             .parent()
             .and_then(Path::file_name)
             .and_then(|name| name.to_str())
-            .ok_or("failed to derive workspace name".to_owned())?
+            .context("derive workspace name")?
     } else {
         APP_NAME
     };
@@ -371,52 +367,45 @@ fn resolve_instance(env: &Env, flake_dir: &Path) -> Result<Instance, String> {
 }
 
 // Prepare the minimal instance directories before sysroot build, virtiofsd, or log writers touch them.
-fn prepare(instance: &Instance) -> Result<(), String> {
+fn prepare(instance: &Instance) -> anyhow::Result<()> {
     for dir in [&instance.sysroot, &instance.persistent, &instance.logs_dir, &instance.runtime_dir] {
-        fs::create_dir_all(dir).map_err(|err| err.to_string())?;
+        fs::create_dir_all(dir)?;
     }
     Ok(())
 }
 
 #[inline(never)]
-fn fetch_nix_dockerhub(sysroot: &Path) -> Result<(), String> {
+fn fetch_nix_dockerhub(sysroot: &Path) -> anyhow::Result<()> {
     let repo = "nixos/nix";
     let registry = "https://registry-1.docker.io/v2";
     eprintln!("fetch: requesting docker auth token for {repo}");
-    let client = Client::builder().build().map_err(|err| err.to_string())?;
+    let client = Client::builder().build()?;
     let token = client
         .get(format!("https://auth.docker.io/token?service=registry.docker.io&scope=repository:{repo}:pull"))
-        .send()
-        .map_err(|err| err.to_string())?;
-    let token = token.error_for_status().map_err(|err| err.to_string())?;
-    let token = token.json::<Value>().map_err(|err| err.to_string())?;
-    let token = token["token"].as_str().ok_or("docker token missing".to_owned())?;
+        .send()?;
+    let token = token.error_for_status()?.json::<Value>()?;
+    let token = token["token"].as_str().context("docker token missing")?;
     let auth = format!("Bearer {token}");
     eprintln!("fetch: resolving image manifest list (latest)");
     let manifests = client.get(format!("{registry}/{repo}/manifests/latest")).header(header::AUTHORIZATION, &auth);
-    let manifests = manifests.send().map_err(|err| err.to_string())?;
-    let manifests = manifests.error_for_status().map_err(|err| err.to_string())?;
-    let manifests = manifests.json::<Value>().map_err(|err| err.to_string())?;
+    let manifests = manifests.send()?.error_for_status()?.json::<Value>()?;
     let digest = manifests["manifests"]
         .as_array()
-        .ok_or("docker manifest list missing".to_owned())?
+        .context("docker manifest list missing")?
         .iter()
         .find(|manifest| manifest["platform"]["architecture"] == "amd64" && manifest["platform"]["os"] == "linux")
-        .ok_or("linux/amd64 docker manifest missing".to_owned())?;
-    let digest = digest["digest"].as_str().ok_or("linux/amd64 docker manifest missing".to_owned())?;
+        .context("linux/amd64 docker manifest missing")?;
+    let digest = digest["digest"].as_str().context("linux/amd64 docker manifest missing")?;
     eprintln!("fetch: selected linux/amd64 image digest {digest}");
     let manifest = client.get(format!("{registry}/{repo}/manifests/{digest}")).header(header::AUTHORIZATION, &auth);
-    let manifest = manifest.send().map_err(|err| err.to_string())?;
-    let manifest = manifest.error_for_status().map_err(|err| err.to_string())?;
-    let manifest = manifest.json::<Value>().map_err(|err| err.to_string())?;
-    let layers = manifest["layers"].as_array().ok_or("docker layers missing".to_owned())?;
+    let manifest = manifest.send()?.error_for_status()?.json::<Value>()?;
+    let layers = manifest["layers"].as_array().context("docker layers missing")?;
     eprintln!("fetch: extracting {} layers into {}", layers.len(), sysroot.display());
     for (index, blob) in layers.iter().filter_map(|layer| layer["digest"].as_str()).enumerate() {
         eprintln!("fetch: layer {}/{} {}", index + 1, layers.len(), blob);
         let response = client.get(format!("{registry}/{repo}/blobs/{blob}")).header(header::AUTHORIZATION, &auth);
-        let response = response.send().map_err(|err| err.to_string())?;
-        let response = response.error_for_status().map_err(|err| err.to_string())?;
-        tar::Archive::new(GzDecoder::new(response)).unpack(sysroot).map_err(|err| err.to_string())?;
+        let response = response.send()?.error_for_status()?;
+        tar::Archive::new(GzDecoder::new(response)).unpack(sysroot)?;
     }
     eprintln!("fetch: completed docker image extraction");
     Ok(())
@@ -424,7 +413,7 @@ fn fetch_nix_dockerhub(sysroot: &Path) -> Result<(), String> {
 
 // The initial profile is assumed safe, so building it in a simple container is acceptable.
 #[inline(never)]
-fn install_initial_nixos_profile(workspace: &Path, sysroot: &Path, hostname: &str) -> Result<(), String> {
+fn install_initial_nixos_profile(workspace: &Path, sysroot: &Path, hostname: &str) -> anyhow::Result<()> {
     let config_target = sysroot.join("etc/nixos");
     eprintln!("install: writing template config into {}", config_target.display());
     write_template_config(&config_target, workspace, true)?;
@@ -432,89 +421,93 @@ fn install_initial_nixos_profile(workspace: &Path, sysroot: &Path, hostname: &st
     // Remove previous out-link so `nix build --out-link /nix/var/nix/profiles/system` can overwrite it.
     let _ = fs::remove_file(sysroot.join("nix/var/nix/profiles/system"));
     spawn_mapped_namespace(true, true, || {
-        // Prepare new file system hierarchy.
-        let oldroot = Path::new("/");
-        eprintln!("install: creating mountpoint dir sysroot/dev");
-        fs::create_dir_all(sysroot.join("dev")).map_err(|err| err.to_string())?;
-        eprintln!("install: mounting tmpfs to sysroot/dev");
-        mount("tmpfs", sysroot.join("dev"), "tmpfs", MountFlags::NODEV | MountFlags::NOSUID, c"mode=0755").map_err(|err| err.to_string())?;
-        for dir in ["dev/shm", "dev/pts", "proc", "tmp"] {
-            eprintln!("install: creating mountpoint dir sysroot/{dir}");
-            fs::create_dir_all(sysroot.join(dir)).map_err(|err| err.to_string())?;
-        }
-        // Python's _multiprocessing.SemLock expects a writable 1777 /dev/shm.
-        eprintln!("install: mounting tmpfs to sysroot/dev/shm");
-        let shm_opts = c"mode=01777";
-        mount("tmpfs", sysroot.join("dev/shm"), "tmpfs", MountFlags::NODEV | MountFlags::NOSUID, shm_opts).map_err(|err| err.to_string())?;
-        eprintln!("install: mounting devpts to sysroot/dev/pts");
-        let opts = c"newinstance,ptmxmode=0666,mode=620";
-        mount("devpts", sysroot.join("dev/pts"), "devpts", MountFlags::NOSUID | MountFlags::NOEXEC, opts).map_err(|err| err.to_string())?;
-        eprintln!("install: binding host /proc to sysroot/proc");
-        mount_bind_recursive(oldroot.join("proc"), sysroot.join("proc")).map_err(|err| err.to_string())?;
-        // Bind host devices etc to new root's /dev.
-        for file in ["dev/null", "dev/zero", "dev/full", "dev/random", "dev/urandom", "dev/tty", "etc/resolv.conf"] {
-            eprintln!("install: touching sysroot/{file} and binding host /{file}");
-            fs::write(sysroot.join(file), "").map_err(|err| err.to_string())?;
-            mount_bind_recursive(oldroot.join(file), sysroot.join(file)).map_err(|err| err.to_string())?;
-        }
-        eprintln!("install: remounting sysroot/etc/resolv.conf read-only");
-        mount_remount(sysroot.join("etc/resolv.conf"), MountFlags::BIND | MountFlags::RDONLY, c"").map_err(|err| err.to_string())?;
-        eprintln!("install: creating symlinks for /dev/{{stdin,stdout,stderr,fd,core,ptmx}}");
-        for (fd, file) in [(0, "dev/stdin"), (1, "dev/stdout"), (2, "dev/stderr")] {
-            symlink(format!("/proc/self/fd/{fd}"), sysroot.join(file)).map_err(|err| err.to_string())?;
-        }
-        symlink("/proc/self/fd", sysroot.join("dev/fd")).map_err(|err| err.to_string())?;
-        symlink("/proc/kcore", sysroot.join("dev/core")).map_err(|err| err.to_string())?;
-        symlink("pts/ptmx", sysroot.join("dev/ptmx")).map_err(|err| err.to_string())?;
+        (|| -> anyhow::Result<()> {
+            // Prepare new file system hierarchy.
+            let oldroot = Path::new("/");
+            eprintln!("install: creating mountpoint dir sysroot/dev");
+            fs::create_dir_all(sysroot.join("dev"))?;
+            eprintln!("install: mounting tmpfs to sysroot/dev");
+            mount("tmpfs", sysroot.join("dev"), "tmpfs", MountFlags::NODEV | MountFlags::NOSUID, c"mode=0755")?;
+            for dir in ["dev/shm", "dev/pts", "proc", "tmp"] {
+                eprintln!("install: creating mountpoint dir sysroot/{dir}");
+                fs::create_dir_all(sysroot.join(dir))?;
+            }
+            // Python's _multiprocessing.SemLock expects a writable 1777 /dev/shm.
+            eprintln!("install: mounting tmpfs to sysroot/dev/shm");
+            let shm_opts = c"mode=01777";
+            mount("tmpfs", sysroot.join("dev/shm"), "tmpfs", MountFlags::NODEV | MountFlags::NOSUID, shm_opts)?;
+            eprintln!("install: mounting devpts to sysroot/dev/pts");
+            let opts = c"newinstance,ptmxmode=0666,mode=620";
+            mount("devpts", sysroot.join("dev/pts"), "devpts", MountFlags::NOSUID | MountFlags::NOEXEC, opts)?;
+            eprintln!("install: binding host /proc to sysroot/proc");
+            mount_bind_recursive(oldroot.join("proc"), sysroot.join("proc"))?;
+            // Bind host devices etc to new root's /dev.
+            for file in ["dev/null", "dev/zero", "dev/full", "dev/random", "dev/urandom", "dev/tty", "etc/resolv.conf"] {
+                eprintln!("install: touching sysroot/{file} and binding host /{file}");
+                fs::write(sysroot.join(file), "")?;
+                mount_bind_recursive(oldroot.join(file), sysroot.join(file))?;
+            }
+            eprintln!("install: remounting sysroot/etc/resolv.conf read-only");
+            mount_remount(sysroot.join("etc/resolv.conf"), MountFlags::BIND | MountFlags::RDONLY, c"")?;
+            eprintln!("install: creating symlinks for /dev/{{stdin,stdout,stderr,fd,core,ptmx}}");
+            for (fd, file) in [(0, "dev/stdin"), (1, "dev/stdout"), (2, "dev/stderr")] {
+                symlink(format!("/proc/self/fd/{fd}"), sysroot.join(file))?;
+            }
+            symlink("/proc/self/fd", sysroot.join("dev/fd"))?;
+            symlink("/proc/kcore", sysroot.join("dev/core"))?;
+            symlink("pts/ptmx", sysroot.join("dev/ptmx"))?;
 
-        eprintln!("install: pivoting root: / => (sysroot)/tmp, sysroot => /");
-        // pivot_root() new_root must be a mountpoint. Bind sysroot to itself.
-        mount_bind_recursive(sysroot, sysroot).map_err(|err| err.to_string())?;
-        // Pivot root: / => (sysroot)/tmp, sysroot => /.
-        pivot_root(sysroot, sysroot.join("tmp")).map_err(|err| err.to_string())?;
-        eprintln!("install: detaching host / (currently pivoted to /tmp)");
-        unmount("/tmp", UnmountFlags::DETACH).map_err(|err| err.to_string())?; // Unmount old root.
-        eprintln!("install: cd to the brand new root / (sysroot)");
-        chdir("/").map_err(|err| err.to_string())?;
-        // Err(process::Command::new("cat").args(["/proc/self/mountinfo"]).exec().to_string())
+            eprintln!("install: pivoting root: / => (sysroot)/tmp, sysroot => /");
+            // pivot_root() new_root must be a mountpoint. Bind sysroot to itself.
+            mount_bind_recursive(sysroot, sysroot)?;
+            // Pivot root: / => (sysroot)/tmp, sysroot => /.
+            pivot_root(sysroot, sysroot.join("tmp"))?;
+            eprintln!("install: detaching host / (currently pivoted to /tmp)");
+            unmount("/tmp", UnmountFlags::DETACH)?; // Unmount old root.
+            eprintln!("install: cd to the brand new root / (sysroot)");
+            chdir("/")?;
+            // Err(process::Command::new("cat").args(["/proc/self/mountinfo"]).exec().to_string())
 
-        eprintln!("install: execing nix build for hostname={hostname}");
-        Err(process::Command::new("/nix/var/nix/profiles/default/bin/nix")
-            .args([
-                "--extra-experimental-features",
-                "nix-command flakes",
-                "build",
-                &format!("/etc/nixos#nixosConfigurations.{hostname}.config.system.build.toplevel"),
-                "--out-link",
-                "/nix/var/nix/profiles/system",
-            ])
-            .exec()
-            .to_string())
+            eprintln!("install: execing nix build for hostname={hostname}");
+            bail!(
+                process::Command::new("/nix/var/nix/profiles/default/bin/nix")
+                    .args([
+                        "--extra-experimental-features",
+                        "nix-command flakes",
+                        "build",
+                        &format!("/etc/nixos#nixosConfigurations.{hostname}.config.system.build.toplevel"),
+                        "--out-link",
+                        "/nix/var/nix/profiles/system",
+                    ])
+                    .exec()
+                    .to_string()
+            )
+        })()
     })
-    .map_err(|err| format!("install: {err}"))?;
+    .context("install")?;
     Ok(())
 }
 
-fn spawn_mapped_namespace<F>(map_root: bool, wait_child: bool, child: F) -> Result<Pid, String>
+fn spawn_mapped_namespace<F>(map_root: bool, wait_child: bool, child: F) -> anyhow::Result<Pid>
 where
-    F: FnOnce() -> Result<(), String>,
+    F: FnOnce() -> anyhow::Result<()>,
 {
     let uid_map = capture_host_idmap("/proc/self/uid_map", map_root)?;
     let gid_map = capture_host_idmap("/proc/self/gid_map", map_root)?;
-    let (child_ready_read, child_ready_write) = pipe_with(PipeFlags::CLOEXEC).map_err(|err| err.to_string())?;
-    let (parent_done_read, parent_done_write) = pipe_with(PipeFlags::CLOEXEC).map_err(|err| err.to_string())?;
-    match unsafe { kernel_fork() }.map_err(|err| err.to_string())? {
+    let (child_ready_read, child_ready_write) = pipe_with(PipeFlags::CLOEXEC).context("create child-to-parent setup pipe")?;
+    let (parent_done_read, parent_done_write) = pipe_with(PipeFlags::CLOEXEC).context("create parent-to-child setup pipe")?;
+    match unsafe { kernel_fork() }.context("fork namespace setup process")? {
         Fork::Child(_) => {
             drop(child_ready_read);
             drop(parent_done_write);
             let status = match (|| {
-                unsafe { unshare_unsafe(UnshareFlags::NEWUSER | UnshareFlags::NEWNS) }.map_err(|err| err.to_string())?;
-                if write(&child_ready_write, &[1]).map_err(|err| err.to_string())? != 1 {
-                    return Err("short write to pipe".to_owned());
+                unsafe { unshare_unsafe(UnshareFlags::NEWUSER | UnshareFlags::NEWNS) }.context("enter user+mount namespaces")?;
+                if write(&child_ready_write, &[1]).context("send child namespace-ready notification")? != 1 {
+                    bail!("failed to notify parent that child namespace is ready");
                 }
                 let mut byte = [0_u8; 1];
-                if read(&parent_done_read, &mut byte).map_err(|err| err.to_string())? != 1 {
-                    return Err("parent uid/gid map setup failed before signaling readiness".to_owned());
+                if read(&parent_done_read, &mut byte).context("wait for parent idmap-written notification")? != 1 {
+                    bail!("parent closed setup pipe before uid/gid maps were written");
                 }
                 child()
             })() {
@@ -531,8 +524,8 @@ where
             drop(parent_done_read);
             let parent_error = (|| {
                 let mut byte = [0_u8; 1];
-                if read(&child_ready_read, &mut byte).map_err(|err| err.to_string())? != 1 {
-                    return Err("child namespace setup failed before signaling readiness".to_owned());
+                if read(&child_ready_read, &mut byte).context("wait for child namespace-ready notification")? != 1 {
+                    bail!("child closed setup pipe before entering namespace setup");
                 }
                 for (kind, id_map) in [("uid", &uid_map), ("gid", &gid_map)] {
                     let status = process::Command::new(format!("new{kind}map"))
@@ -541,18 +534,18 @@ where
                         .stdout(Stdio::inherit())
                         .stderr(Stdio::inherit())
                         .status()
-                        .map_err(|err| err.to_string())?;
+                        .context(format!("run new{kind}map"))?;
                     if !status.success() {
-                        return Err(format!(
+                        bail!(
                             "new{kind}map failed with status {}",
                             status.code().map_or("signal".to_owned(), |code| code.to_string())
-                        ));
+                        );
                     }
                 }
-                if write(&parent_done_write, &[1]).map_err(|err| err.to_string())? == 1 {
+                if write(&parent_done_write, &[1]).context("send parent idmap-written notification")? == 1 {
                     Ok(())
                 } else {
-                    Err("short write to pipe".to_owned())
+                    bail!("failed to notify child that uid/gid maps are written")
                 }
             })();
             drop(parent_done_write);
@@ -561,14 +554,14 @@ where
                 Err(err)
             } else if wait_child {
                 let status = waitpid(Some(child_pid), WaitOptions::empty())
-                    .map_err(|err| err.to_string())?
-                    .ok_or_else(|| "child disappeared before waitpid reported status".to_owned())?
+                    .context("wait namespace setup child process")?
+                    .ok_or_else(|| anyhow::anyhow!("child disappeared before waitpid reported status"))?
                     .1;
                 match (status.exit_status(), status.terminating_signal()) {
                     (Some(0), _) => Ok(child_pid),
-                    (Some(code), _) => Err(format!("child exited with status {code}")),
-                    (None, Some(signal)) => Err(format!("child terminated by signal {signal}")),
-                    (None, None) => Err(format!("child ended unexpectedly: {status:?}")),
+                    (Some(code), _) => bail!("child exited with status {code}"),
+                    (None, Some(signal)) => bail!("child terminated by signal {signal}"),
+                    (None, None) => bail!("child ended unexpectedly: {status:?}"),
                 }
             } else {
                 Ok(child_pid)
@@ -578,34 +571,33 @@ where
 }
 
 #[inline(never)]
-fn run_up(env: &Env, _detach: bool) -> Result<(), String> {
+fn run_up(env: &Env, _detach: bool) -> anyhow::Result<()> {
     let flake_dir = resolve_flake_dir(env)?;
     let instance = resolve_instance(env, &flake_dir)?;
-    if let Some(state) = domstate(&instance.id)? {
-        return Err(format!("VM is already {state}"));
+    let state = domstate(&instance.id)?;
+    if state != "down" {
+        bail!("VM is already {state}");
     }
     let pv_socket = instance.runtime_dir.join("pv.sock");
     let pid_path = instance.runtime_dir.join("agentsandbox.pid");
     let _ = fs::remove_file(&pv_socket);
     let _ = fs::remove_file(&pid_path);
     let system_profile = run_build(env, false)?;
-    let (mut parent_sock, mut child_sock) = UnixStream::pair().map_err(|err| format!("up: create supervisor socket pair: {err}"))?;
-    let supervisor_pid = spawn_mapped_namespace(false, false, || -> Result<(), String> {
-        let result = (|| {
-            mount_change("/", MountPropagationFlags::DOWNSTREAM | MountPropagationFlags::REC)
-                .map_err(|err| format!("set / mount propagation downstream+rec: {err}"))?;
-            mount_bind_recursive(&instance.persistent, &instance.persistent).map_err(|err| format!("self bind persistent dir: {err}"))?;
-            mount_change(&instance.persistent, MountPropagationFlags::SHARED | MountPropagationFlags::REC)
-                .map_err(|err| format!("set persistent mount shared+rec: {err}"))?;
-            apply_mounts(&env, &flake_dir, &instance).map_err(|err| format!("apply_mounts: {err}"))?;
-            fs::write(&pid_path, format!("{}\n", process::id())).map_err(|err| format!("write pid file {}: {err}", pid_path.display()))?;
+    let (mut parent_sock, mut child_sock) = UnixStream::pair().context("create supervisor socket pair")?;
+    let supervisor_pid = spawn_mapped_namespace(false, false, || -> anyhow::Result<()> {
+        let result = (|| -> anyhow::Result<()> {
+            mount_change("/", MountPropagationFlags::DOWNSTREAM | MountPropagationFlags::REC).context("set / mount propagation downstream+rec")?;
+            mount_bind_recursive(&instance.persistent, &instance.persistent).context("self bind persistent dir")?;
+            mount_change(&instance.persistent, MountPropagationFlags::SHARED | MountPropagationFlags::REC).context("set persistent mount shared+rec")?;
+            apply_mounts(&env, &flake_dir, &instance).context("apply configured mounts")?;
+            fs::write(&pid_path, format!("{}\n", process::id())).context("write pid file")?;
 
             let mut mask = KernelSigSet::empty();
             mask.insert(Signal::HUP);
-            unsafe { kernel_sigprocmask(How::BLOCK, Some(&mask)) }.map_err(|err| format!("block HUP signal: {err}"))?;
+            unsafe { kernel_sigprocmask(How::BLOCK, Some(&mask)) }.context("block HUP signal")?;
 
-            let listener = UnixListener::bind(&pv_socket).map_err(|err| format!("bind virtiofs socket {}: {err}", pv_socket.display()))?;
-            fcntl_setfd(&listener, FdFlags::empty()).map_err(|err| format!("keep virtiofs socket fd across exec: {err}"))?;
+            let listener = UnixListener::bind(&pv_socket).context("bind virtiofs socket")?;
+            fcntl_setfd(&listener, FdFlags::empty()).context("keep virtiofs socket fd across exec")?;
             let mut daemon = process::Command::new("virtiofsd")
                 .args(["--shared-dir", &instance.persistent.display().to_string()])
                 .args(["--fd", &listener.as_raw_fd().to_string()])
@@ -616,22 +608,20 @@ fn run_up(env: &Env, _detach: bool) -> Result<(), String> {
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())
                 .spawn()
-                .map_err(|err| format!("spawn virtiofsd: {err}"))?;
+                .context("spawn virtiofsd")?;
             drop(listener);
 
-            if let Some(status) = daemon.try_wait().map_err(|err| format!("poll virtiofsd process: {err}"))? {
-                return Err(format!("virtiofsd exited before socket became ready: {status}"));
+            if let Some(status) = daemon.try_wait().context("poll virtiofsd process")? {
+                bail!("virtiofsd exited before socket became ready: {status}");
             }
-            child_sock
-                .write_all(&[1])
-                .map_err(|err| format!("notify parent virtiofs socket ready: {err}"))?;
+            child_sock.write_all(&[1]).context("notify launcher that virtiofs socket is ready")?;
 
             loop {
-                if let Some(status) = daemon.try_wait().map_err(|err| format!("poll virtiofsd process: {err}"))? {
+                if let Some(status) = daemon.try_wait().context("poll virtiofsd process")? {
                     if status.success() {
                         break;
                     }
-                    return Err(format!("virtiofsd exited unexpectedly: {status}"));
+                    bail!("virtiofsd exited unexpectedly: {status}");
                 }
                 let timeout = Timespec {
                     tv_sec: 0,
@@ -639,13 +629,13 @@ fn run_up(env: &Env, _detach: bool) -> Result<(), String> {
                 };
                 match unsafe { kernel_sigtimedwait(&mask, Some(&timeout)) } {
                     Ok(_info) => {
-                        if let Err(err) = apply_mounts(&env, &flake_dir, &instance).map_err(|err| format!("apply_mounts: {err}")) {
+                        if let Err(err) = apply_mounts(&env, &flake_dir, &instance).context("reload configured mounts on HUP") {
                             eprintln!("apply_mounts: {err}");
                         }
                         continue;
                     }
                     Err(Errno::AGAIN) | Err(Errno::INTR) => continue,
-                    Err(err) => return Err(format!("wait HUP signal: {err}")),
+                    Err(err) => bail!("wait HUP signal: {err}"),
                 }
             }
 
@@ -655,12 +645,10 @@ fn run_up(env: &Env, _detach: bool) -> Result<(), String> {
         let _ = fs::remove_file(&pv_socket);
         result
     })
-    .map_err(|err| format!("up: {err}"))?;
+    .context("up")?;
     drop(child_sock);
     let mut ready = [0_u8; 1];
-    parent_sock
-        .read_exact(&mut ready)
-        .map_err(|err| format!("wait child virtiofs socket ready: {err}"))?;
+    parent_sock.read_exact(&mut ready).context("wait for virtiofs socket readiness notification")?;
     let machine_id = &instance.id[instance.id.len() - 32..];
     let domain_uuid = format!(
         "{}-{}-{}-{}-{}",
@@ -673,8 +661,8 @@ fn run_up(env: &Env, _detach: bool) -> Result<(), String> {
     let xml_path = instance.runtime_dir.join("domain.xml");
     let output = process::Command::new(system_profile.join("domain.xml.sh"))
         .env("NIX_DIR", instance.sysroot.join("nix"))
-        .env("UID_MAP", capture_host_idmap("/proc/self/uid_map", true)?)
-        .env("GID_MAP", capture_host_idmap("/proc/self/gid_map", true)?)
+        .env("UID_MAP", capture_host_idmap("/proc/self/uid_map", true).context("resolve UID_MAP")?)
+        .env("GID_MAP", capture_host_idmap("/proc/self/gid_map", true).context("resolve GID_MAP")?)
         .env("INSTANCE_ID", &instance.id)
         .env("DOMAIN_UUID", &domain_uuid)
         .env("MACHINE_ID", machine_id)
@@ -689,52 +677,53 @@ fn run_up(env: &Env, _detach: bool) -> Result<(), String> {
                 .replace('>', "&gt;"),
         )
         .output()
-        .map_err(|err| err.to_string())?;
+        .context("run domain.xml.sh")?;
     if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+        bail!("domain.xml.sh failed: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
-    fs::write(&xml_path, output.stdout).map_err(|err| err.to_string())?;
+    fs::write(&xml_path, output.stdout).context("write generated domain xml")?;
     let status = process::Command::new("virsh")
         .arg("create")
         .arg(&xml_path)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
-        .map_err(|err| err.to_string())?;
-    status.success().then_some(()).ok_or_else(|| {
+        .context("run virsh create")?;
+    if !status.success() {
         let _ = kill_process(supervisor_pid, Signal::TERM);
         let _ = waitpid(Some(supervisor_pid), WaitOptions::empty());
-        format!(
+        bail!(
             "virsh create failed with status {}",
             status.code().map_or("signal".to_owned(), |code| code.to_string())
-        )
-    })
+        );
+    }
+    Ok(())
     // TODO: wait for domain to be ready.
 }
 
 /// Get compatible uid/gid maps from host.
-fn capture_host_idmap(path: &str, map_root: bool) -> Result<String, String> {
+fn capture_host_idmap(path: &str, map_root: bool) -> anyhow::Result<String> {
     let output = process::Command::new("unshare")
         .args(["--map-auto", if map_root { "--map-root-user" } else { "--map-current-user" }, "cat", path])
         .output()
-        .map_err(|err| err.to_string())?;
+        .context(format!("resolve host idmap from {path}"))?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
     } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+        bail!("unshare cat {path} failed: {}", String::from_utf8_lossy(&output.stderr).trim())
     }
 }
 
 /// Apply mounts from mounts file to the guest system.
-fn apply_mounts(env: &Env, flake_dir: &Path, instance: &Instance) -> Result<(), String> {
+fn apply_mounts(env: &Env, flake_dir: &Path, instance: &Instance) -> anyhow::Result<()> {
     let mounts_path = flake_dir.join("mounts");
     let workspace_dir = instance.persistent.join("workspace");
     let mut mounted = Vec::new();
 
     // Collect all mounted directories under /persistent/workspace.
-    let output = (process::Command::new("findmnt").args(["-Rlno", "target"]).output()).map_err(|err| format!("run findmnt -Rlno target: {err}"))?;
+    let output = (process::Command::new("findmnt").args(["-Rlno", "target"]).output()).context("run findmnt -Rlno target")?;
     if !output.status.success() {
-        return Err(format!("findmnt: {}", String::from_utf8_lossy(&output.stderr)));
+        bail!("findmnt: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
     for target in String::from_utf8_lossy(&output.stdout).lines() {
         let target = Path::new(target);
@@ -746,17 +735,14 @@ fn apply_mounts(env: &Env, flake_dir: &Path, instance: &Instance) -> Result<(), 
 
     // Collect and validate all mounts from mounts file.
     let mut parsed_mounts = Vec::new();
-    for line in fs::read_to_string(&mounts_path)
-        .map_err(|err| format!("read mounts file {}: {err}", mounts_path.display()))?
-        .lines()
-    {
+    for line in fs::read_to_string(&mounts_path).context("read mounts file")?.lines() {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         let mut parts = line.split('\t');
         let (source, name) = match (parts.next(), parts.next(), parts.next()) {
             (Some(source), Some(name), None) => (source, name),
-            _ => return Err(format!("invalid mounts entry: {line}")),
+            _ => bail!("invalid mounts entry: {line}"),
         };
         validate_mount_source_field(source)?;
         let source_abs = if Path::new(source).is_absolute() {
@@ -764,14 +750,12 @@ fn apply_mounts(env: &Env, flake_dir: &Path, instance: &Instance) -> Result<(), 
         } else {
             env.workspace.join(source)
         };
-        let source_abs = source_abs
-            .canonicalize()
-            .map_err(|err| format!("canonicalize mount source {}: {err}", source_abs.display()))?;
+        let source_abs = source_abs.canonicalize().context("canonicalize mount source")?;
         if !source_abs.exists() {
-            return Err(format!("mount source does not exist: {}", source_abs.display()));
+            bail!("mount source does not exist: {}", source_abs.display());
         }
         if !source_abs.is_dir() && !source_abs.is_file() {
-            return Err(format!("mount source is neither file nor directory: {}", source_abs.display()));
+            bail!("mount source is neither file nor directory: {}", source_abs.display());
         }
         validate_mount_name_field(name)?;
         let target = workspace_dir.join(name);
@@ -785,7 +769,7 @@ fn apply_mounts(env: &Env, flake_dir: &Path, instance: &Instance) -> Result<(), 
         let metadata = match fs::symlink_metadata(target) {
             Ok(metadata) => metadata,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(format!("stat mounted target {}: {err}", target.display())),
+            Err(err) => bail!("stat mounted target {}: {err}", target.display()),
         };
         if unmount(target, UnmountFlags::DETACH).is_err() {
             continue;
@@ -795,55 +779,55 @@ fn apply_mounts(env: &Env, flake_dir: &Path, instance: &Instance) -> Result<(), 
                 Ok(()) => {}
                 // Underlaying mount is still visible.
                 Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
-                Err(err) => return Err(format!("remove mounted dir {}: {err}", target.display())),
+                Err(err) => bail!("remove mounted dir {}: {err}", target.display()),
             }
         } else if metadata.is_file() && metadata.len() == 0 {
             // Only remove empty files.
-            fs::remove_file(target).map_err(|err| format!("remove mounted file {}: {err}", target.display()))?;
+            fs::remove_file(target).context("remove mounted file")?;
         }
     }
 
     // Mount all mounts from mounts file.
     for (source_abs, target, is_dir) in parsed_mounts {
         if is_dir {
-            fs::create_dir_all(&target).map_err(|err| format!("create target dir {}: {err}", target.display()))?;
-            mount_bind_recursive(&source_abs, &target).map_err(|err| format!("bind-mount dir {} -> {}: {err}", source_abs.display(), target.display()))?;
+            fs::create_dir_all(&target).context("create target dir")?;
+            mount_bind_recursive(&source_abs, &target).context("bind-mount dir")?;
         } else {
             if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent).map_err(|err| format!("create target parent dir {}: {err}", parent.display()))?;
+                fs::create_dir_all(parent).context("create target parent dir")?;
             }
             if !target.exists() {
-                fs::write(&target, "").map_err(|err| format!("create target file {}: {err}", target.display()))?;
+                fs::write(&target, "").context("create target file")?;
             }
-            mount_bind(&source_abs, &target).map_err(|err| format!("bind-mount file {} -> {}: {err}", source_abs.display(), target.display()))?;
+            mount_bind(&source_abs, &target).context("bind-mount file")?;
         }
     }
     Ok(())
 }
 
-fn validate_mount_source_field(value: &str) -> Result<(), String> {
+fn validate_mount_source_field(value: &str) -> anyhow::Result<()> {
     if value.is_empty() || value.contains('\t') || value.contains('\n') {
-        return Err(format!("invalid mount source: contains control separator characters or empty"));
+        bail!("invalid mount source: contains control separator characters or empty");
     }
     Ok(())
 }
 
-fn validate_mount_name_field(value: &str) -> Result<(), String> {
+fn validate_mount_name_field(value: &str) -> anyhow::Result<()> {
     if value.is_empty() || value == "." || value == ".." || value.contains('\t') || value.contains('\n') {
-        return Err(format!("invalid mount name: contains control separator characters or empty"));
+        bail!("invalid mount name: contains control separator characters or empty");
     }
     Ok(())
 }
 
-fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bool) -> Result<(), String> {
+fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bool) -> anyhow::Result<()> {
     let flake_dir = resolve_flake_dir(env)?;
     let instance = resolve_instance(env, &flake_dir)?;
     let mounts_path = flake_dir.join("mounts");
 
-    let to_base_rel = |path: &Path| -> Result<(PathBuf, PathBuf), String> {
-        let base_abs = env.workspace.canonicalize().map_err(|err| err.to_string())?;
+    let to_base_rel = |path: &Path| -> anyhow::Result<(PathBuf, PathBuf)> {
+        let base_abs = env.workspace.canonicalize()?;
         let path_abs = if path.is_absolute() { path.to_path_buf() } else { base_abs.join(path) };
-        let path_rel = diff_paths(&path_abs, &base_abs).ok_or("failed to resolve relative path")?;
+        let path_rel = diff_paths(&path_abs, &base_abs).context("resolve relative path")?;
         let path_rel = if path_rel.as_os_str().is_empty() { PathBuf::from(".") } else { path_rel };
         Ok((path_rel, path_abs))
     };
@@ -854,7 +838,7 @@ fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bo
             let (source_rel, source_abs) = to_base_rel(Path::new(&path))?;
             validate_mount_source_field(&source_rel.display().to_string())?;
             if !source_abs.is_dir() && !source_abs.is_file() {
-                return Err(format!("mount source is neither file nor directory: {}", source_abs.display()));
+                bail!("mount source is neither file nor directory: {}", source_abs.display());
             }
             let name = name.unwrap_or((source_abs.file_name().expect("failed to infer mount name from path").to_string_lossy()).to_string());
             validate_mount_name_field(&name)?;
@@ -867,13 +851,13 @@ fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bo
             (None, Some(source_rel.display().to_string()))
         }
         // list mounts.
-        (_, _) => return Ok(println!("{}", fs::read_to_string(&mounts_path).map_err(|err| err.to_string())?)),
+        (_, _) => return Ok(println!("{}", fs::read_to_string(&mounts_path)?)),
     };
 
     let kill_matcher = format!("{}\t", kill_entry.as_deref().unwrap_or(""));
     let mut contents = String::new();
     let mut updated = false;
-    for line in fs::read_to_string(&mounts_path).map_err(|err| err.to_string())?.lines() {
+    for line in fs::read_to_string(&mounts_path)?.lines() {
         if line.starts_with(&kill_matcher) {
             updated = true;
         } else {
@@ -881,10 +865,10 @@ fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bo
             contents.push('\n');
             if let (Some((new_source, new_name)), Some((source, name))) = (new_entry.as_ref(), line.split_once('\t')) {
                 if new_source.as_os_str() == source {
-                    return Err(format!("mount path already exists: {source}"));
+                    bail!("mount path already exists: {source}");
                 }
                 if new_name == name {
-                    return Err(format!("mount name already exists: {name}"));
+                    bail!("mount name already exists: {name}");
                 }
             }
         }
@@ -897,15 +881,15 @@ fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bo
         eprintln!("unmount: no changes to apply");
         return Ok(());
     }
-    fs::write(&mounts_path, contents).map_err(|err| err.to_string())?;
+    fs::write(&mounts_path, contents)?;
 
     let pid_path = instance.runtime_dir.join("agentsandbox.pid");
     if let Ok(pid) = fs::read_to_string(&pid_path) {
-        let pid = pid.trim().parse::<i32>().map_err(|err| err.to_string())?;
-        let pid = Pid::from_raw(pid).ok_or("invalid agentsandbox.pid".to_owned())?;
+        let pid = pid.trim().parse::<i32>()?;
+        let pid = Pid::from_raw(pid).context("invalid agentsandbox.pid")?;
         if let Err(err) = kill_process(pid, Signal::HUP) {
             eprintln!("mounts: failed to reload: {err}");
-            return Err(err.to_string());
+            bail!("{err}");
         }
         eprintln!("mounts: reloading");
     }
@@ -913,40 +897,37 @@ fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bo
 }
 
 #[inline(never)]
-fn run_virsh_action(env: &Env, action: &str) -> Result<(), String> {
+fn run_virsh_action(env: &Env, action: &str) -> anyhow::Result<()> {
     let instance = resolve_instance(env, &resolve_flake_dir(env)?)?;
-    virsh(&[action, &instance.id]);
+    virsh(&[action, &instance.id])
     // TODO: wait for domain to be the desired state.
-    Ok(())
 }
 
 #[inline(never)]
-fn run_ps(env: &Env) -> Result<(), String> {
+fn run_ps(env: &Env) -> anyhow::Result<()> {
     let instance = resolve_instance(env, &resolve_flake_dir(env)?)?;
-    println!("{}\t{}", instance.id, domstate(&instance.id)?.unwrap_or_else(|| "down".to_owned()));
+    println!("{}\t{}", instance.id, domstate(&instance.id)?);
     Ok(())
 }
 
 #[inline(never)]
-fn run_verify(_env: &Env) -> Result<(), String> {
+fn run_verify(_env: &Env) -> anyhow::Result<()> {
     Ok(())
 }
 
 #[inline(never)]
-fn run_destroy(env: &Env, system: bool, data: bool, logs: bool, conf: bool) -> Result<(), String> {
+fn run_destroy(env: &Env, system: bool, data: bool, logs: bool, conf: bool) -> anyhow::Result<()> {
     let flake_dir = resolve_flake_dir(env)?;
     let instance = resolve_instance(env, &flake_dir)?;
-    virsh(&["destroy", &instance.id]);
+    let _ = virsh(&["destroy", &instance.id]);
     if instance.is_global && !env.is_global {
-        return Err("destroy files for the non-project instance requires --global".to_owned());
+        bail!("destroy files for the non-project instance requires --global");
     }
     if system {
-        spawn_mapped_namespace(false, true, || remove_dir_all_if_exists(&instance.sysroot))
-            .map_err(|err| format!("destroy sysroot: {err}"))?;
+        spawn_mapped_namespace(false, true, || remove_dir_all_if_exists(&instance.sysroot)).context("destroy sysroot")?;
     }
     if data {
-        spawn_mapped_namespace(true, true, || remove_dir_all_if_exists(&instance.persistent))
-            .map_err(|err| format!("destroy persistent: {err}"))?;
+        spawn_mapped_namespace(true, true, || remove_dir_all_if_exists(&instance.persistent)).context("destroy persistent")?;
     }
     if system && data {
         remove_dir_all_if_exists(&instance.data_dir)?;
@@ -960,11 +941,11 @@ fn run_destroy(env: &Env, system: bool, data: bool, logs: bool, conf: bool) -> R
     Ok(())
 }
 #[inline(never)]
-fn run_ssh(env: &Env, args: &[String], is_root: bool) -> Result<(), String> {
+fn run_ssh(env: &Env, args: &[String], is_root: bool) -> anyhow::Result<()> {
     let flake_dir = resolve_flake_dir(env)?;
     let instance = resolve_instance(env, &flake_dir)?;
-    if domstate(&instance.id)?.as_deref() != Some("running") {
-        return Err("VM is not running".to_owned());
+    if domstate(&instance.id)? != "running" {
+        bail!("VM is not running");
     }
     // FIXME: Avoid nixos tree eval.
     let output = process::Command::new("nix")
@@ -976,11 +957,11 @@ fn run_ssh(env: &Env, args: &[String], is_root: bool) -> Result<(), String> {
             hostname = env.hostname
         ))
         .output()
-        .map_err(|err| err.to_string())?;
+        .context("load VM port forward settings")?;
     if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
     }
-    let port_forwards: Value = serde_json::from_slice(&output.stdout).map_err(|err| err.to_string())?;
+    let port_forwards: Value = serde_json::from_slice(&output.stdout).context("parse VM port forward settings")?;
     let ssh_port = port_forwards
         .as_object()
         .and_then(|forwards| {
@@ -1001,53 +982,63 @@ fn run_ssh(env: &Env, args: &[String], is_root: bool) -> Result<(), String> {
             }
             None
         })
-        .ok_or("ssh port forward for guest tcp/22 is not configured".to_owned())?;
-    Err(process::Command::new("ssh")
-        .arg(if is_root { "root@127.0.0.1" } else { "vscode@127.0.0.1" })
-        .arg("-p")
-        .arg(ssh_port.to_string())
-        .args(["-o", "LogLevel=ERROR", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"])
-        .args(args)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .exec()
-        .to_string())
+        .context("ssh port forward for guest tcp/22 is not configured")?;
+    bail!(
+        process::Command::new("ssh")
+            .arg(if is_root { "root@127.0.0.1" } else { "vscode@127.0.0.1" })
+            .arg("-p")
+            .arg(ssh_port.to_string())
+            .args(["-o", "LogLevel=ERROR", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"])
+            .args(args)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .exec()
+            .to_string()
+    )
 }
 
 #[inline(never)]
-fn domstate(instance_id: &str) -> Result<Option<String>, String> {
+fn domstate(instance_id: &str) -> anyhow::Result<String> {
     let output = process::Command::new("virsh")
         .arg("domstate")
         .arg(instance_id)
         .output()
-        .map_err(|err| err.to_string())?;
+        .context("run virsh domstate")?;
     if output.status.success() {
-        return Ok(Some(String::from_utf8_lossy(&output.stdout).trim().to_owned()));
+        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned());
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
     if stderr.contains("failed to get domain") {
-        Ok(None)
+        Ok("down".to_owned())
     } else {
-        Err(stderr.trim().to_owned())
+        bail!("{}", stderr.trim())
     }
 }
 
-fn remove_dir_all_if_exists(path: &Path) -> Result<(), String> {
+fn remove_dir_all_if_exists(path: &Path) -> anyhow::Result<()> {
     if path.exists() {
         eprintln!("remove: removing {}", path.display());
-        fs::remove_dir_all(path).map_err(|err| err.to_string())?;
+        fs::remove_dir_all(path)?;
     }
     Ok(())
 }
 
 #[inline(never)]
-fn virsh(args: &[&str]) {
-    let _ = process::Command::new("virsh")
+fn virsh(args: &[&str]) -> anyhow::Result<()> {
+    let status = process::Command::new("virsh")
         .args(args)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .status();
+        .status()
+        .context("run virsh")?;
+    if !status.success() {
+        bail!(
+            "virsh failed with status {}",
+            status.code().map_or("signal".to_owned(), |code| code.to_string())
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

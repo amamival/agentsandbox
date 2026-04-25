@@ -431,13 +431,76 @@ fn install_initial_nixos_profile(workspace: &Path, sysroot: &Path, hostname: &st
 
     // Remove previous out-link so `nix build --out-link /nix/var/nix/profiles/system` can overwrite it.
     let _ = fs::remove_file(sysroot.join("nix/var/nix/profiles/system"));
+    spawn_mapped_namespace(true, true, || {
+        // Prepare new file system hierarchy.
+        let oldroot = Path::new("/");
+        eprintln!("install: creating mountpoint dir sysroot/dev");
+        fs::create_dir_all(sysroot.join("dev")).map_err(|err| err.to_string())?;
+        eprintln!("install: mounting tmpfs to sysroot/dev");
+        mount("tmpfs", sysroot.join("dev"), "tmpfs", MountFlags::NODEV | MountFlags::NOSUID, c"mode=0755").map_err(|err| err.to_string())?;
+        for dir in ["dev/shm", "dev/pts", "proc", "tmp"] {
+            eprintln!("install: creating mountpoint dir sysroot/{dir}");
+            fs::create_dir_all(sysroot.join(dir)).map_err(|err| err.to_string())?;
+        }
+        // Python's _multiprocessing.SemLock expects a writable 1777 /dev/shm.
+        eprintln!("install: mounting tmpfs to sysroot/dev/shm");
+        let shm_opts = c"mode=01777";
+        mount("tmpfs", sysroot.join("dev/shm"), "tmpfs", MountFlags::NODEV | MountFlags::NOSUID, shm_opts).map_err(|err| err.to_string())?;
+        eprintln!("install: mounting devpts to sysroot/dev/pts");
+        let opts = c"newinstance,ptmxmode=0666,mode=620";
+        mount("devpts", sysroot.join("dev/pts"), "devpts", MountFlags::NOSUID | MountFlags::NOEXEC, opts).map_err(|err| err.to_string())?;
+        eprintln!("install: binding host /proc to sysroot/proc");
+        mount_bind_recursive(oldroot.join("proc"), sysroot.join("proc")).map_err(|err| err.to_string())?;
+        // Bind host devices etc to new root's /dev.
+        for file in ["dev/null", "dev/zero", "dev/full", "dev/random", "dev/urandom", "dev/tty", "etc/resolv.conf"] {
+            eprintln!("install: touching sysroot/{file} and binding host /{file}");
+            fs::write(sysroot.join(file), "").map_err(|err| err.to_string())?;
+            mount_bind_recursive(oldroot.join(file), sysroot.join(file)).map_err(|err| err.to_string())?;
+        }
+        eprintln!("install: remounting sysroot/etc/resolv.conf read-only");
+        mount_remount(sysroot.join("etc/resolv.conf"), MountFlags::BIND | MountFlags::RDONLY, c"").map_err(|err| err.to_string())?;
+        eprintln!("install: creating symlinks for /dev/{{stdin,stdout,stderr,fd,core,ptmx}}");
+        for (fd, file) in [(0, "dev/stdin"), (1, "dev/stdout"), (2, "dev/stderr")] {
+            symlink(format!("/proc/self/fd/{fd}"), sysroot.join(file)).map_err(|err| err.to_string())?;
+        }
+        symlink("/proc/self/fd", sysroot.join("dev/fd")).map_err(|err| err.to_string())?;
+        symlink("/proc/kcore", sysroot.join("dev/core")).map_err(|err| err.to_string())?;
+        symlink("pts/ptmx", sysroot.join("dev/ptmx")).map_err(|err| err.to_string())?;
 
-    eprintln!("install: capturing uid map via unshare");
-    let uid_map = capture_host_idmap("/proc/self/uid_map", true)?;
-    eprintln!("install: capturing gid map via unshare");
-    let gid_map = capture_host_idmap("/proc/self/gid_map", true)?;
+        eprintln!("install: pivoting root: / => (sysroot)/tmp, sysroot => /");
+        // pivot_root() new_root must be a mountpoint. Bind sysroot to itself.
+        mount_bind_recursive(sysroot, sysroot).map_err(|err| err.to_string())?;
+        // Pivot root: / => (sysroot)/tmp, sysroot => /.
+        pivot_root(sysroot, sysroot.join("tmp")).map_err(|err| err.to_string())?;
+        eprintln!("install: detaching host / (currently pivoted to /tmp)");
+        unmount("/tmp", UnmountFlags::DETACH).map_err(|err| err.to_string())?; // Unmount old root.
+        eprintln!("install: cd to the brand new root / (sysroot)");
+        chdir("/").map_err(|err| err.to_string())?;
+        // Err(process::Command::new("cat").args(["/proc/self/mountinfo"]).exec().to_string())
 
-    // Create pipe for child/parent communication.
+        eprintln!("install: execing nix build for hostname={hostname}");
+        Err(process::Command::new("/nix/var/nix/profiles/default/bin/nix")
+            .args([
+                "--extra-experimental-features",
+                "nix-command flakes",
+                "build",
+                &format!("/etc/nixos#nixosConfigurations.{hostname}.config.system.build.toplevel"),
+                "--out-link",
+                "/nix/var/nix/profiles/system",
+            ])
+            .exec()
+            .to_string())
+    })
+    .map_err(|err| format!("install: {err}"))?;
+    Ok(())
+}
+
+fn spawn_mapped_namespace<F>(map_root: bool, wait_child: bool, child: F) -> Result<Pid, String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    let uid_map = capture_host_idmap("/proc/self/uid_map", map_root)?;
+    let gid_map = capture_host_idmap("/proc/self/gid_map", map_root)?;
     let (child_ready_read, child_ready_write) = pipe_with(PipeFlags::CLOEXEC).map_err(|err| err.to_string())?;
     let (parent_done_read, parent_done_write) = pipe_with(PipeFlags::CLOEXEC).map_err(|err| err.to_string())?;
     match unsafe { kernel_fork() }.map_err(|err| err.to_string())? {
@@ -445,70 +508,15 @@ fn install_initial_nixos_profile(workspace: &Path, sysroot: &Path, hostname: &st
             drop(child_ready_read);
             drop(parent_done_write);
             let status = match (|| {
-                eprintln!("install: entering user+mount namespace");
-                // Unshare to new mount+user(less privileged) namespace.
-                // All previous mounts are inherited. All shared mounts are reduced to slave.
                 unsafe { unshare_unsafe(UnshareFlags::NEWUSER | UnshareFlags::NEWNS) }.map_err(|err| err.to_string())?;
-                write_fd(&child_ready_write)?; // I'm ready in new namespace.
-                wait_for_pipe_signal(&parent_done_read, "parent uid/gid map install")?; // Parent wrote uid/gid maps.
-
-                // Prepare new file system hierarchy.
-                let oldroot = Path::new("/");
-                eprintln!("install: creating mountpoint dir sysroot/dev");
-                fs::create_dir_all(sysroot.join("dev")).map_err(|err| err.to_string())?;
-                eprintln!("install: mounting tmpfs to sysroot/dev");
-                mount("tmpfs", sysroot.join("dev"), "tmpfs", MountFlags::NODEV | MountFlags::NOSUID, c"mode=0755").map_err(|err| err.to_string())?;
-                for dir in ["dev/shm", "dev/pts", "proc", "tmp"] {
-                    eprintln!("install: creating mountpoint dir sysroot/{dir}");
-                    fs::create_dir_all(sysroot.join(dir)).map_err(|err| err.to_string())?;
+                if write(&child_ready_write, &[1]).map_err(|err| err.to_string())? != 1 {
+                    return Err("short write to pipe".to_owned());
                 }
-                // Python's _multiprocessing.SemLock expects a writable 1777 /dev/shm.
-                eprintln!("install: mounting tmpfs to sysroot/dev/shm");
-                mount("tmpfs", sysroot.join("dev/shm"), "tmpfs", MountFlags::NODEV | MountFlags::NOSUID, c"mode=01777").map_err(|err| err.to_string())?;
-                eprintln!("install: mounting devpts to sysroot/dev/pts");
-                let opts = c"newinstance,ptmxmode=0666,mode=620";
-                mount("devpts", sysroot.join("dev/pts"), "devpts", MountFlags::NOSUID | MountFlags::NOEXEC, opts).map_err(|err| err.to_string())?;
-                eprintln!("install: binding host /proc to sysroot/proc");
-                mount_bind_recursive(oldroot.join("proc"), sysroot.join("proc")).map_err(|err| err.to_string())?;
-                // Bind host devices etc to new root's /dev.
-                for file in ["dev/null", "dev/zero", "dev/full", "dev/random", "dev/urandom", "dev/tty", "etc/resolv.conf"] {
-                    eprintln!("install: touching sysroot/{file} and binding host /{file}");
-                    fs::write(sysroot.join(file), "").map_err(|err| err.to_string())?;
-                    mount_bind_recursive(oldroot.join(file), sysroot.join(file)).map_err(|err| err.to_string())?;
+                let mut byte = [0_u8; 1];
+                if read(&parent_done_read, &mut byte).map_err(|err| err.to_string())? != 1 {
+                    return Err("parent uid/gid map setup failed before signaling readiness".to_owned());
                 }
-                eprintln!("install: remounting sysroot/etc/resolv.conf read-only");
-                mount_remount(sysroot.join("etc/resolv.conf"), MountFlags::BIND | MountFlags::RDONLY, c"").map_err(|err| err.to_string())?;
-                eprintln!("install: creating symlinks for /dev/{{stdin,stdout,stderr,fd,core,ptmx}}");
-                for (fd, file) in [(0, "dev/stdin"), (1, "dev/stdout"), (2, "dev/stderr")] {
-                    symlink(format!("/proc/self/fd/{fd}"), sysroot.join(file)).map_err(|err| err.to_string())?;
-                }
-                symlink("/proc/self/fd", sysroot.join("dev/fd")).map_err(|err| err.to_string())?;
-                symlink("/proc/kcore", sysroot.join("dev/core")).map_err(|err| err.to_string())?;
-                symlink("pts/ptmx", sysroot.join("dev/ptmx")).map_err(|err| err.to_string())?;
-
-                eprintln!("install: pivoting root: / => (sysroot)/tmp, sysroot => /");
-                // pivot_root() new_root must be a mountpoint. Bind sysroot to itself.
-                mount_bind_recursive(sysroot, sysroot).map_err(|err| err.to_string())?;
-                // Pivot root: / => (sysroot)/tmp, sysroot => /.
-                pivot_root(sysroot, sysroot.join("tmp")).map_err(|err| err.to_string())?;
-                eprintln!("install: detaching host / (currently pivoted to /tmp)");
-                unmount("/tmp", UnmountFlags::DETACH).map_err(|err| err.to_string())?; // Unmount old root.
-                eprintln!("install: cd to the brand new root / (sysroot)");
-                chdir("/").map_err(|err| err.to_string())?;
-                // Err(process::Command::new("cat").args(["/proc/self/mountinfo"]).exec().to_string())
-
-                eprintln!("install: execing nix build for hostname={hostname}");
-                Err(process::Command::new("/nix/var/nix/profiles/default/bin/nix")
-                    .args([
-                        "--extra-experimental-features",
-                        "nix-command flakes",
-                        "build",
-                        &format!("/etc/nixos#nixosConfigurations.{hostname}.config.system.build.toplevel"),
-                        "--out-link",
-                        "/nix/var/nix/profiles/system",
-                    ])
-                    .exec()
-                    .to_string())
+                child()
             })() {
                 Ok(()) => 0,
                 Err(err) => {
@@ -522,9 +530,11 @@ fn install_initial_nixos_profile(workspace: &Path, sysroot: &Path, hostname: &st
             drop(child_ready_write);
             drop(parent_done_read);
             let parent_error = (|| {
-                wait_for_pipe_signal(&child_ready_read, "child namespace setup")?;
-                let set_idmap = |kind: &str, id_map: &str| -> Result<(), String> {
-                    eprintln!("install: assigning /etc/sub{kind} ranges to child {child_pid} via new{kind}map");
+                let mut byte = [0_u8; 1];
+                if read(&child_ready_read, &mut byte).map_err(|err| err.to_string())? != 1 {
+                    return Err("child namespace setup failed before signaling readiness".to_owned());
+                }
+                for (kind, id_map) in [("uid", &uid_map), ("gid", &gid_map)] {
                     let status = process::Command::new(format!("new{kind}map"))
                         .arg(child_pid.as_raw_pid().to_string())
                         .args(id_map.split_whitespace().map(str::to_owned))
@@ -532,47 +542,38 @@ fn install_initial_nixos_profile(workspace: &Path, sysroot: &Path, hostname: &st
                         .stderr(Stdio::inherit())
                         .status()
                         .map_err(|err| err.to_string())?;
-                    (status.success().then_some(())).ok_or_else(|| {
-                        format!(
+                    if !status.success() {
+                        return Err(format!(
                             "new{kind}map failed with status {}",
-                            status.code().map_or("signal".to_owned(), |c| c.to_string())
-                        )
-                    })
-                };
-                set_idmap("uid", &uid_map)?;
-                set_idmap("gid", &gid_map)?;
-                write_fd(&parent_done_write)
+                            status.code().map_or("signal".to_owned(), |code| code.to_string())
+                        ));
+                    }
+                }
+                if write(&parent_done_write, &[1]).map_err(|err| err.to_string())? == 1 {
+                    Ok(())
+                } else {
+                    Err("short write to pipe".to_owned())
+                }
             })();
-            drop(parent_done_write); // Child will see EOF.
-            let status = waitpid(Some(child_pid), WaitOptions::empty()) // Reap zombie process.
-                .map_err(|err| err.to_string())?
-                .ok_or("install: child disappeared before waitpid reported status".to_owned())?
-                .1;
-            match (parent_error, status.exit_status(), status.terminating_signal()) {
-                (Err(err), _, _) => Err(err),
-                (_, Some(0), _) => Ok(()),
-                (_, Some(code), _) => Err(format!("install: child exited with status {code}")),
-                (_, None, Some(signal)) => Err(format!("install: child terminated by signal {signal}")),
-                (_, None, None) => Err(format!("install: child ended unexpectedly: {status:?}")),
+            drop(parent_done_write);
+            if let Err(err) = parent_error {
+                let _ = waitpid(Some(child_pid), WaitOptions::empty());
+                Err(err)
+            } else if wait_child {
+                let status = waitpid(Some(child_pid), WaitOptions::empty())
+                    .map_err(|err| err.to_string())?
+                    .ok_or_else(|| "child disappeared before waitpid reported status".to_owned())?
+                    .1;
+                match (status.exit_status(), status.terminating_signal()) {
+                    (Some(0), _) => Ok(child_pid),
+                    (Some(code), _) => Err(format!("child exited with status {code}")),
+                    (None, Some(signal)) => Err(format!("child terminated by signal {signal}")),
+                    (None, None) => Err(format!("child ended unexpectedly: {status:?}")),
+                }
+            } else {
+                Ok(child_pid)
             }
         }
-    }
-}
-
-fn write_fd(fd: &std::os::fd::OwnedFd) -> Result<(), String> {
-    if write(fd, &[1]).map_err(|err| err.to_string())? == 1 {
-        Ok(())
-    } else {
-        Err("short write to pipe".to_owned())
-    }
-}
-
-fn wait_for_pipe_signal(fd: &std::os::fd::OwnedFd, stage: &str) -> Result<(), String> {
-    let mut byte = [0_u8; 1];
-    if read(fd, &mut byte).map_err(|err| err.to_string())? == 1 {
-        Ok(())
-    } else {
-        Err(format!("{stage} failed before signaling readiness"))
     }
 }
 
@@ -589,114 +590,77 @@ fn run_up(env: &Env, _detach: bool) -> Result<(), String> {
     let _ = fs::remove_file(&pid_path);
     let system_profile = run_build(env, false)?;
     let (mut parent_sock, mut child_sock) = UnixStream::pair().map_err(|err| format!("up: create supervisor socket pair: {err}"))?;
-    let persistent_uid_map = capture_host_idmap("/proc/self/uid_map", false)?;
-    let persistent_gid_map = capture_host_idmap("/proc/self/gid_map", false)?;
-    let supervisor_pid = match unsafe { kernel_fork() }.map_err(|err| format!("up: fork supervisor: {err}"))? {
-        Fork::Child(_) => {
-            drop(parent_sock);
-            let status = match (|| -> Result<(), String> {
-                unsafe { unshare_unsafe(UnshareFlags::NEWUSER | UnshareFlags::NEWNS) }.map_err(|err| format!("unshare user+mount namespaces: {err}"))?;
-                child_sock
-                    .write_all(&[1])
-                    .map_err(|err| format!("notify parent for uid/gid map setup: {err}"))?;
-                let mut ready = [0_u8; 1];
-                child_sock
-                    .read_exact(&mut ready)
-                    .map_err(|err| format!("wait parent uid/gid map setup: {err}"))?;
-                mount_change("/", MountPropagationFlags::DOWNSTREAM | MountPropagationFlags::REC)
-                    .map_err(|err| format!("set / mount propagation downstream+rec: {err}"))?;
-                mount_bind_recursive(&instance.persistent, &instance.persistent).map_err(|err| format!("self bind persistent dir: {err}"))?;
-                mount_change(&instance.persistent, MountPropagationFlags::SHARED | MountPropagationFlags::REC)
-                    .map_err(|err| format!("set persistent mount shared+rec: {err}"))?;
-                apply_mounts(&env, &flake_dir, &instance).map_err(|err| format!("apply_mounts: {err}"))?;
-                fs::write(&pid_path, format!("{}\n", process::id())).map_err(|err| format!("write pid file {}: {err}", pid_path.display()))?;
+    let supervisor_pid = spawn_mapped_namespace(false, false, || -> Result<(), String> {
+        let result = (|| {
+            mount_change("/", MountPropagationFlags::DOWNSTREAM | MountPropagationFlags::REC)
+                .map_err(|err| format!("set / mount propagation downstream+rec: {err}"))?;
+            mount_bind_recursive(&instance.persistent, &instance.persistent).map_err(|err| format!("self bind persistent dir: {err}"))?;
+            mount_change(&instance.persistent, MountPropagationFlags::SHARED | MountPropagationFlags::REC)
+                .map_err(|err| format!("set persistent mount shared+rec: {err}"))?;
+            apply_mounts(&env, &flake_dir, &instance).map_err(|err| format!("apply_mounts: {err}"))?;
+            fs::write(&pid_path, format!("{}\n", process::id())).map_err(|err| format!("write pid file {}: {err}", pid_path.display()))?;
 
-                let mut mask = KernelSigSet::empty();
-                mask.insert(Signal::HUP);
-                unsafe { kernel_sigprocmask(How::BLOCK, Some(&mask)) }.map_err(|err| format!("block HUP signal: {err}"))?;
+            let mut mask = KernelSigSet::empty();
+            mask.insert(Signal::HUP);
+            unsafe { kernel_sigprocmask(How::BLOCK, Some(&mask)) }.map_err(|err| format!("block HUP signal: {err}"))?;
 
-                let listener = UnixListener::bind(&pv_socket).map_err(|err| format!("bind virtiofs socket {}: {err}", pv_socket.display()))?;
-                fcntl_setfd(&listener, FdFlags::empty()).map_err(|err| format!("keep virtiofs socket fd across exec: {err}"))?;
-                let mut daemon = process::Command::new("virtiofsd")
-                    .args(["--shared-dir", &instance.persistent.display().to_string()])
-                    .args(["--fd", &listener.as_raw_fd().to_string()])
-                    .args(["--sandbox", "namespace", "--cache", "auto", "--xattr", "--log-level", "error"])
-                    // Use the supervisor user namespace as the single idmap source.
-                    .uid(0)
-                    .gid(0)
-                    .stdout(Stdio::inherit())
-                    .stderr(Stdio::inherit())
-                    .spawn()
-                    .map_err(|err| format!("spawn virtiofsd: {err}"))?;
-                drop(listener);
+            let listener = UnixListener::bind(&pv_socket).map_err(|err| format!("bind virtiofs socket {}: {err}", pv_socket.display()))?;
+            fcntl_setfd(&listener, FdFlags::empty()).map_err(|err| format!("keep virtiofs socket fd across exec: {err}"))?;
+            let mut daemon = process::Command::new("virtiofsd")
+                .args(["--shared-dir", &instance.persistent.display().to_string()])
+                .args(["--fd", &listener.as_raw_fd().to_string()])
+                .args(["--sandbox", "namespace", "--cache", "auto", "--xattr", "--log-level", "error"])
+                // Use the supervisor user namespace as the single idmap source.
+                .uid(0)
+                .gid(0)
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .map_err(|err| format!("spawn virtiofsd: {err}"))?;
+            drop(listener);
 
+            if let Some(status) = daemon.try_wait().map_err(|err| format!("poll virtiofsd process: {err}"))? {
+                return Err(format!("virtiofsd exited before socket became ready: {status}"));
+            }
+            child_sock
+                .write_all(&[1])
+                .map_err(|err| format!("notify parent virtiofs socket ready: {err}"))?;
+
+            loop {
                 if let Some(status) = daemon.try_wait().map_err(|err| format!("poll virtiofsd process: {err}"))? {
-                    return Err(format!("virtiofsd exited before socket became ready: {status}"));
-                }
-                child_sock
-                    .write_all(&[1])
-                    .map_err(|err| format!("notify parent virtiofs socket ready: {err}"))?;
-
-                loop {
-                    if let Some(status) = daemon.try_wait().map_err(|err| format!("poll virtiofsd process: {err}"))? {
-                        if status.success() {
-                            break;
-                        }
-                        return Err(format!("virtiofsd exited unexpectedly: {status}"));
+                    if status.success() {
+                        break;
                     }
-                    let timeout = Timespec {
-                        tv_sec: 0,
-                        tv_nsec: 200_000_000,
-                    };
-                    match unsafe { kernel_sigtimedwait(&mask, Some(&timeout)) } {
-                        Ok(_info) => {
-                            if let Err(err) = apply_mounts(&env, &flake_dir, &instance).map_err(|err| format!("apply_mounts: {err}")) {
-                                eprintln!("apply_mounts: {err}");
-                            }
-                            continue;
+                    return Err(format!("virtiofsd exited unexpectedly: {status}"));
+                }
+                let timeout = Timespec {
+                    tv_sec: 0,
+                    tv_nsec: 200_000_000,
+                };
+                match unsafe { kernel_sigtimedwait(&mask, Some(&timeout)) } {
+                    Ok(_info) => {
+                        if let Err(err) = apply_mounts(&env, &flake_dir, &instance).map_err(|err| format!("apply_mounts: {err}")) {
+                            eprintln!("apply_mounts: {err}");
                         }
-                        Err(Errno::AGAIN) | Err(Errno::INTR) => continue,
-                        Err(err) => return Err(format!("wait HUP signal: {err}")),
+                        continue;
                     }
-                }
-
-                Ok(())
-            })() {
-                Ok(()) => 0,
-                Err(err) => {
-                    eprintln!("up(supervisor): {err}");
-                    1
-                }
-            };
-            let _ = fs::remove_file(&pid_path);
-            let _ = fs::remove_file(&pv_socket);
-            exit_group(status)
-        }
-        Fork::ParentOf(child_pid) => (|| -> Result<Pid, String> {
-            drop(child_sock);
-            let mut ready = [0_u8; 1];
-            parent_sock.read_exact(&mut ready).map_err(|err| format!("wait child unshare ready: {err}"))?;
-            for (kind, id_map) in [("uid", &persistent_uid_map), ("gid", &persistent_gid_map)] {
-                let status = process::Command::new(format!("new{kind}map"))
-                    .arg(child_pid.as_raw_pid().to_string())
-                    .args(id_map.split_whitespace().map(str::to_owned))
-                    .status()
-                    .map_err(|err| format!("spawn new{kind}map: {err}"))?;
-                if !status.success() {
-                    return Err(format!(
-                        "new{kind}map failed with status {}",
-                        status.code().map_or("signal".to_owned(), |code| code.to_string())
-                    ));
+                    Err(Errno::AGAIN) | Err(Errno::INTR) => continue,
+                    Err(err) => return Err(format!("wait HUP signal: {err}")),
                 }
             }
-            parent_sock.write_all(&[1]).map_err(|err| format!("notify child uid/gid maps ready: {err}"))?;
-            parent_sock
-                .read_exact(&mut ready)
-                .map_err(|err| format!("wait child virtiofs socket ready: {err}"))?;
-            Ok(child_pid)
-        })()
-        .map_err(|err| format!("up(parent): {err}"))?,
-    };
+
+            Ok(())
+        })();
+        let _ = fs::remove_file(&pid_path);
+        let _ = fs::remove_file(&pv_socket);
+        result
+    })
+    .map_err(|err| format!("up: {err}"))?;
+    drop(child_sock);
+    let mut ready = [0_u8; 1];
+    parent_sock
+        .read_exact(&mut ready)
+        .map_err(|err| format!("wait child virtiofs socket ready: {err}"))?;
     let machine_id = &instance.id[instance.id.len() - 32..];
     let domain_uuid = format!(
         "{}-{}-{}-{}-{}",
@@ -976,12 +940,16 @@ fn run_destroy(env: &Env, system: bool, data: bool, logs: bool, conf: bool) -> R
     if instance.is_global && !env.is_global {
         return Err("destroy files for the non-project instance requires --global".to_owned());
     }
+    if system {
+        spawn_mapped_namespace(false, true, || remove_dir_all_if_exists(&instance.sysroot))
+            .map_err(|err| format!("destroy sysroot: {err}"))?;
+    }
+    if data {
+        spawn_mapped_namespace(true, true, || remove_dir_all_if_exists(&instance.persistent))
+            .map_err(|err| format!("destroy persistent: {err}"))?;
+    }
     if system && data {
         remove_dir_all_if_exists(&instance.data_dir)?;
-    } else if system {
-        remove_dir_all_if_exists(&instance.sysroot)?;
-    } else if data {
-        remove_dir_all_if_exists(&instance.persistent)?;
     }
     if logs {
         remove_dir_all_if_exists(&instance.state_dir)?;
@@ -991,7 +959,6 @@ fn run_destroy(env: &Env, system: bool, data: bool, logs: bool, conf: bool) -> R
     }
     Ok(())
 }
-
 #[inline(never)]
 fn run_ssh(env: &Env, args: &[String], is_root: bool) -> Result<(), String> {
     let flake_dir = resolve_flake_dir(env)?;

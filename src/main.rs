@@ -3,25 +3,24 @@ use flate2::read::GzDecoder;
 use pathdiff::diff_paths;
 use reqwest::{blocking::Client, header};
 use rustix::{
-    io::{Errno, read, write},
+    io::{Errno, FdFlags, fcntl_setfd, read, write},
     mount::{MountFlags, MountPropagationFlags, UnmountFlags},
     mount::{mount, mount_bind, mount_bind_recursive, mount_change, mount_remount, unmount},
     pipe::{PipeFlags, pipe_with},
-    process::{Pid, Signal, WaitOptions, chdir, getgid, getuid, kill_process, pivot_root, waitpid},
+    process::{Pid, Signal, WaitOptions, chdir, getuid, kill_process, pivot_root, waitpid},
     runtime::{Fork, How, KernelSigSet, Timespec, exit_group, kernel_fork, kernel_sigprocmask, kernel_sigtimedwait},
-    thread::{UnshareFlags, set_thread_res_gid, set_thread_res_uid, unshare_unsafe},
+    thread::{UnshareFlags, unshare_unsafe},
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     env, fs,
     io::{Read as _, Write as _},
-    os::unix::net::UnixStream,
+    os::fd::AsRawFd,
+    os::unix::net::{UnixListener, UnixStream},
     os::unix::{fs::symlink, process::CommandExt},
     path::{Path, PathBuf},
     process::{self, Stdio},
-    thread,
-    time::Duration,
 };
 
 const APP_NAME: &str = "agentsandbox";
@@ -434,9 +433,9 @@ fn install_initial_nixos_profile(workspace: &Path, sysroot: &Path, hostname: &st
     let _ = fs::remove_file(sysroot.join("nix/var/nix/profiles/system"));
 
     eprintln!("install: capturing uid map via unshare");
-    let uid_map = capture_host_idmap("/proc/self/uid_map")?;
+    let uid_map = capture_host_idmap("/proc/self/uid_map", true)?;
     eprintln!("install: capturing gid map via unshare");
-    let gid_map = capture_host_idmap("/proc/self/gid_map")?;
+    let gid_map = capture_host_idmap("/proc/self/gid_map", true)?;
 
     // Create pipe for child/parent communication.
     let (child_ready_read, child_ready_write) = pipe_with(PipeFlags::CLOEXEC).map_err(|err| err.to_string())?;
@@ -589,16 +588,14 @@ fn run_up(env: &Env, _detach: bool) -> Result<(), String> {
     let _ = fs::remove_file(&pv_socket);
     let _ = fs::remove_file(&pid_path);
     let system_profile = run_build(env, false)?;
-let (mut parent_sock, mut child_sock) =
-    UnixStream::pair().map_err(|err| format!("up: create supervisor socket pair: {err}"))?;
-    let current_uid = getuid().as_raw();
-    let current_gid = getgid().as_raw();
+    let (mut parent_sock, mut child_sock) = UnixStream::pair().map_err(|err| format!("up: create supervisor socket pair: {err}"))?;
+    let persistent_uid_map = capture_host_idmap("/proc/self/uid_map", false)?;
+    let persistent_gid_map = capture_host_idmap("/proc/self/gid_map", false)?;
     let supervisor_pid = match unsafe { kernel_fork() }.map_err(|err| format!("up: fork supervisor: {err}"))? {
         Fork::Child(_) => {
             drop(parent_sock);
             let status = match (|| -> Result<(), String> {
-                unsafe { unshare_unsafe(UnshareFlags::NEWUSER | UnshareFlags::NEWNS) }
-                    .map_err(|err| format!("unshare user+mount namespaces: {err}"))?;
+                unsafe { unshare_unsafe(UnshareFlags::NEWUSER | UnshareFlags::NEWNS) }.map_err(|err| format!("unshare user+mount namespaces: {err}"))?;
                 child_sock
                     .write_all(&[1])
                     .map_err(|err| format!("notify parent for uid/gid map setup: {err}"))?;
@@ -606,66 +603,42 @@ let (mut parent_sock, mut child_sock) =
                 child_sock
                     .read_exact(&mut ready)
                     .map_err(|err| format!("wait parent uid/gid map setup: {err}"))?;
-                set_thread_res_uid(
-                    Some(rustix::process::Uid::ROOT),
-                    Some(rustix::process::Uid::ROOT),
-                    Some(rustix::process::Uid::ROOT),
-                )
-                .map_err(|err| format!("set uid to root in userns: {err}"))?;
-                set_thread_res_gid(
-                    Some(rustix::process::Gid::ROOT),
-                    Some(rustix::process::Gid::ROOT),
-                    Some(rustix::process::Gid::ROOT),
-                )
-                .map_err(|err| format!("set gid to root in userns: {err}"))?;
                 mount_change("/", MountPropagationFlags::DOWNSTREAM | MountPropagationFlags::REC)
                     .map_err(|err| format!("set / mount propagation downstream+rec: {err}"))?;
-                mount_bind_recursive(&instance.persistent, &instance.persistent)
-                    .map_err(|err| format!("self bind persistent dir: {err}"))?;
+                mount_bind_recursive(&instance.persistent, &instance.persistent).map_err(|err| format!("self bind persistent dir: {err}"))?;
                 mount_change(&instance.persistent, MountPropagationFlags::SHARED | MountPropagationFlags::REC)
                     .map_err(|err| format!("set persistent mount shared+rec: {err}"))?;
                 apply_mounts(&env, &flake_dir, &instance).map_err(|err| format!("apply_mounts: {err}"))?;
-                fs::write(&pid_path, format!("{}\n", process::id()))
-                    .map_err(|err| format!("write pid file {}: {err}", pid_path.display()))?;
+                fs::write(&pid_path, format!("{}\n", process::id())).map_err(|err| format!("write pid file {}: {err}", pid_path.display()))?;
 
                 let mut mask = KernelSigSet::empty();
                 mask.insert(Signal::HUP);
-                unsafe { kernel_sigprocmask(How::BLOCK, Some(&mask)) }
-                    .map_err(|err| format!("block HUP signal: {err}"))?;
+                unsafe { kernel_sigprocmask(How::BLOCK, Some(&mask)) }.map_err(|err| format!("block HUP signal: {err}"))?;
 
+                let listener = UnixListener::bind(&pv_socket).map_err(|err| format!("bind virtiofs socket {}: {err}", pv_socket.display()))?;
+                fcntl_setfd(&listener, FdFlags::empty()).map_err(|err| format!("keep virtiofs socket fd across exec: {err}"))?;
                 let mut daemon = process::Command::new("virtiofsd")
                     .args(["--shared-dir", &instance.persistent.display().to_string()])
-                    .args(["--socket-path", &pv_socket.display().to_string()])
-                    .args(["--sandbox", "namespace", "--cache", "auto", "--xattr"])
-                    .stdout(Stdio::null())
+                    .args(["--fd", &listener.as_raw_fd().to_string()])
+                    .args(["--sandbox", "namespace", "--cache", "auto", "--xattr", "--log-level", "error"])
+                    // Use the supervisor user namespace as the single idmap source.
+                    .uid(0)
+                    .gid(0)
+                    .stdout(Stdio::inherit())
                     .stderr(Stdio::inherit())
                     .spawn()
                     .map_err(|err| format!("spawn virtiofsd: {err}"))?;
+                drop(listener);
 
-                for _ in 0..50 {
-                    if pv_socket.exists() {
-                        child_sock
-                            .write_all(&[1])
-                            .map_err(|err| format!("notify parent virtiofs socket ready: {err}"))?;
-                        break;
-                    }
-                    if let Some(status) = daemon
-                        .try_wait()
-                        .map_err(|err| format!("poll virtiofsd process: {err}"))?
-                    {
-                        return Err(format!("virtiofsd exited before socket became ready: {status}"));
-                    }
-                    thread::sleep(Duration::from_millis(100));
+                if let Some(status) = daemon.try_wait().map_err(|err| format!("poll virtiofsd process: {err}"))? {
+                    return Err(format!("virtiofsd exited before socket became ready: {status}"));
                 }
-                if !pv_socket.exists() {
-                    return Err("virtiofsd socket did not appear in time".to_owned());
-                }
+                child_sock
+                    .write_all(&[1])
+                    .map_err(|err| format!("notify parent virtiofs socket ready: {err}"))?;
 
                 loop {
-                    if let Some(status) = daemon
-                        .try_wait()
-                        .map_err(|err| format!("poll virtiofsd process: {err}"))?
-                    {
+                    if let Some(status) = daemon.try_wait().map_err(|err| format!("poll virtiofsd process: {err}"))? {
                         if status.success() {
                             break;
                         }
@@ -702,18 +675,21 @@ let (mut parent_sock, mut child_sock) =
         Fork::ParentOf(child_pid) => (|| -> Result<Pid, String> {
             drop(child_sock);
             let mut ready = [0_u8; 1];
-            parent_sock
-                .read_exact(&mut ready)
-                .map_err(|err| format!("wait child unshare ready: {err}"))?;
-            fs::write(format!("/proc/{child_pid}/uid_map"), format!("0 {current_uid} 1"))
-                .map_err(|err| format!("write /proc/{child_pid}/uid_map: {err}"))?;
-            fs::write(format!("/proc/{child_pid}/setgroups"), b"deny")
-                .map_err(|err| format!("write /proc/{child_pid}/setgroups: {err}"))?;
-            fs::write(format!("/proc/{child_pid}/gid_map"), format!("0 {current_gid} 1"))
-                .map_err(|err| format!("write /proc/{child_pid}/gid_map: {err}"))?;
-            parent_sock
-                .write_all(&[1])
-                .map_err(|err| format!("notify child uid/gid maps ready: {err}"))?;
+            parent_sock.read_exact(&mut ready).map_err(|err| format!("wait child unshare ready: {err}"))?;
+            for (kind, id_map) in [("uid", &persistent_uid_map), ("gid", &persistent_gid_map)] {
+                let status = process::Command::new(format!("new{kind}map"))
+                    .arg(child_pid.as_raw_pid().to_string())
+                    .args(id_map.split_whitespace().map(str::to_owned))
+                    .status()
+                    .map_err(|err| format!("spawn new{kind}map: {err}"))?;
+                if !status.success() {
+                    return Err(format!(
+                        "new{kind}map failed with status {}",
+                        status.code().map_or("signal".to_owned(), |code| code.to_string())
+                    ));
+                }
+            }
+            parent_sock.write_all(&[1]).map_err(|err| format!("notify child uid/gid maps ready: {err}"))?;
             parent_sock
                 .read_exact(&mut ready)
                 .map_err(|err| format!("wait child virtiofs socket ready: {err}"))?;
@@ -733,40 +709,27 @@ let (mut parent_sock, mut child_sock) =
     let xml_path = instance.runtime_dir.join("domain.xml");
     let output = process::Command::new(system_profile.join("domain.xml.sh"))
         .env("NIX_DIR", instance.sysroot.join("nix"))
-        .env("UID_MAP", capture_host_idmap("/proc/self/uid_map")?)
-        .env("GID_MAP", capture_host_idmap("/proc/self/gid_map")?)
+        .env("UID_MAP", capture_host_idmap("/proc/self/uid_map", true)?)
+        .env("GID_MAP", capture_host_idmap("/proc/self/gid_map", true)?)
         .env("INSTANCE_ID", &instance.id)
         .env("DOMAIN_UUID", &domain_uuid)
         .env("MACHINE_ID", machine_id)
-        .env("PERSISTENT_DIR", &instance.persistent)
+        .env(
+            "PERSISTENT_SOCKET_XML",
+            pv_socket
+                .display()
+                .to_string()
+                .replace('&', "&amp;")
+                .replace('\'', "&apos;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;"),
+        )
         .output()
         .map_err(|err| err.to_string())?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
     }
-    let socket_xml = pv_socket
-        .display()
-        .to_string()
-        .replace('&', "&amp;")
-        .replace('\'', "&apos;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;");
-    let mut xml = String::from_utf8(output.stdout).map_err(|err| err.to_string())?;
-    let target = "<target dir='persistent'/>";
-    let target_idx = xml.find(target).ok_or("persistent filesystem target missing from domain XML".to_owned())?;
-    let start_idx = xml[..target_idx]
-        .rfind("<filesystem type='mount'>")
-        .ok_or("persistent filesystem block start missing from domain XML".to_owned())?;
-    let end_idx = target_idx
-        + xml[target_idx..]
-            .find("</filesystem>")
-            .ok_or("persistent filesystem block end missing from domain XML".to_owned())?
-        + "</filesystem>".len();
-    let replacement = format!(
-        "<filesystem type='mount'>\n                  <driver type='virtiofs' queue='1024'/>\n                  <source socket='{socket_xml}'/>\n                  <target dir='persistent'/>\n                </filesystem>"
-    );
-    xml.replace_range(start_idx..end_idx, &replacement);
-    fs::write(&xml_path, xml).map_err(|err| err.to_string())?;
+    fs::write(&xml_path, output.stdout).map_err(|err| err.to_string())?;
     let status = process::Command::new("virsh")
         .arg("create")
         .arg(&xml_path)
@@ -782,12 +745,13 @@ let (mut parent_sock, mut child_sock) =
             status.code().map_or("signal".to_owned(), |code| code.to_string())
         )
     })
+    // TODO: wait for domain to be ready.
 }
 
 /// Get compatible uid/gid maps from host.
-fn capture_host_idmap(path: &str) -> Result<String, String> {
+fn capture_host_idmap(path: &str, map_root: bool) -> Result<String, String> {
     let output = process::Command::new("unshare")
-        .args(["--map-auto", "--map-root-user", "cat", path])
+        .args(["--map-auto", if map_root { "--map-root-user" } else { "--map-current-user" }, "cat", path])
         .output()
         .map_err(|err| err.to_string())?;
     if output.status.success() {
@@ -804,8 +768,7 @@ fn apply_mounts(env: &Env, flake_dir: &Path, instance: &Instance) -> Result<(), 
     let mut mounted = Vec::new();
 
     // Collect all mounted directories under /persistent/workspace.
-    let output =
-        (process::Command::new("findmnt").args(["-Rlno", "target"]).output()).map_err(|err| format!("run findmnt -Rlno target: {err}"))?;
+    let output = (process::Command::new("findmnt").args(["-Rlno", "target"]).output()).map_err(|err| format!("run findmnt -Rlno target: {err}"))?;
     if !output.status.success() {
         return Err(format!("findmnt: {}", String::from_utf8_lossy(&output.stderr)));
     }
@@ -852,6 +815,7 @@ fn apply_mounts(env: &Env, flake_dir: &Path, instance: &Instance) -> Result<(), 
         parsed_mounts.push((source_abs, target, is_dir));
     }
     parsed_mounts.sort_by(|a, b| a.1.cmp(&b.1));
+
     // Unmount all mounted directories in order of depth.
     for target in mounted.iter().rev() {
         let metadata = match fs::symlink_metadata(target) {
@@ -879,13 +843,7 @@ fn apply_mounts(env: &Env, flake_dir: &Path, instance: &Instance) -> Result<(), 
     for (source_abs, target, is_dir) in parsed_mounts {
         if is_dir {
             fs::create_dir_all(&target).map_err(|err| format!("create target dir {}: {err}", target.display()))?;
-            mount_bind_recursive(&source_abs, &target).map_err(|err| {
-                format!(
-                    "bind-mount dir {} -> {}: {err}",
-                    source_abs.display(),
-                    target.display()
-                )
-            })?;
+            mount_bind_recursive(&source_abs, &target).map_err(|err| format!("bind-mount dir {} -> {}: {err}", source_abs.display(), target.display()))?;
         } else {
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent).map_err(|err| format!("create target parent dir {}: {err}", parent.display()))?;
@@ -893,13 +851,7 @@ fn apply_mounts(env: &Env, flake_dir: &Path, instance: &Instance) -> Result<(), 
             if !target.exists() {
                 fs::write(&target, "").map_err(|err| format!("create target file {}: {err}", target.display()))?;
             }
-            mount_bind(&source_abs, &target).map_err(|err| {
-                format!(
-                    "bind-mount file {} -> {}: {err}",
-                    source_abs.display(),
-                    target.display()
-                )
-            })?;
+            mount_bind(&source_abs, &target).map_err(|err| format!("bind-mount file {} -> {}: {err}", source_abs.display(), target.display()))?;
         }
     }
     Ok(())
@@ -1000,6 +952,7 @@ fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bo
 fn run_virsh_action(env: &Env, action: &str) -> Result<(), String> {
     let instance = resolve_instance(env, &resolve_flake_dir(env)?)?;
     virsh(&[action, &instance.id]);
+    // TODO: wait for domain to be the desired state.
     Ok(())
 }
 

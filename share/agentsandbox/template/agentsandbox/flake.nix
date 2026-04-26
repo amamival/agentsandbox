@@ -88,6 +88,7 @@
                 )"
               [[ "$KERNEL" == /* ]] && KERNEL="$SYSROOT$KERNEL" || KERNEL="$TOPLEVEL/$KERNEL"
               [[ "$INITRD" == /* ]] && INITRD="$SYSROOT$INITRD" || INITRD="$TOPLEVEL/$INITRD"
+              BUILD_UNIT=''${AGENTSANDBOX_BUILD:+systemd.unit=agentsandbox-build.target}
               cat <<EOF
               <domain type='kvm'>
                 <name>$INSTANCE_ID</name>
@@ -99,7 +100,7 @@
                   <type arch='x86_64' machine='q35'>hvm</type>
                   <kernel>$KERNEL</kernel>
                   <initrd>$INITRD</initrd>
-                  <cmdline>${kernelParams} init=/nix/var/nix/profiles/system/init systemd.machine_id=$MACHINE_ID</cmdline>
+                  <cmdline>${kernelParams} init=/nix/var/nix/profiles/system/init systemd.machine_id=$MACHINE_ID $BUILD_UNIT</cmdline>
                 </os>
                 <cpu mode='host-passthrough' migratable='off'/>
                 <memoryBacking>
@@ -152,7 +153,7 @@
             '';
           in
           lib.mkAfter ''
-            cp ${libvirtDomainXmlGen} "$out/domain.xml.sh"
+            ln -s ${libvirtDomainXmlGen} "$out/domain.xml.sh"
             cp ${portForwardsFile} "$out/port-forwards"
             ${lib.optionalString config.agentsandbox.mutableSandboxConfig ''
               touch "$out/mutable-sandbox-config"
@@ -173,6 +174,12 @@
           "console=ttyS0,115200n8" # Used by console subcommand.
         ];
         services.getty.autologinUser = "root";
+        systemd.targets.agentsandbox-build = {
+          description = "AgentSandbox build environment";
+          wants = [ "sshd.service" ];
+          after = [ "sshd.service" ];
+          unitConfig.AllowIsolate = true;
+        };
 
         # Service.OpenSSH, used by exec/ssh subcommand.
         security.pam.services.sshd.allowNullPassword = true;
@@ -185,7 +192,12 @@
 
 
         # Impermanence
-        virtualisation.fileSystems."/persistent" = { neededForBoot = true; device = "persistent"; fsType = "virtiofs"; options = [ "nosuid" "nodev" ]; };
+        virtualisation.fileSystems."/persistent" = {
+          neededForBoot = true;
+          device = "persistent";
+          fsType = "virtiofs";
+          options = [ "nosuid" "nodev" ];
+        };
         environment.persistence."/persistent" = {
           directories = [ "/var/lib/nixos" ];
           files = [

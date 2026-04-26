@@ -173,8 +173,8 @@ fn main() {
         match cli.command {
             Some(Command::Version) => Ok(println!("{}", env!("CARGO_PKG_VERSION"))),
             Some(Command::Init { force }) => run_init(&env, force).context("init"),
-            Some(Command::Build { bootstrap }) => run_build(&env, bootstrap).map(|p| println!("{}", p.display())).context("build"),
-            Some(Command::Up { detach }) => run_up(&env, detach).context("up"),
+            Some(Command::Build { bootstrap }) => run_build_or_up(&env, bootstrap, false, false).context("build"),
+            Some(Command::Up { detach }) => run_build_or_up(&env, false, true, detach).context("up"),
             Some(Command::Down) => run_virsh_action(&env, "shutdown").context("down"),
             Some(Command::Kill) => run_virsh_action(&env, "destroy").context("kill"),
             Some(Command::Pause) => run_virsh_action(&env, "suspend").context("pause"),
@@ -185,6 +185,7 @@ fn main() {
             Some(Command::Destroy { system, data, logs, conf }) => run_destroy(&env, system, data, logs, conf).context("destroy"),
             Some(Command::Ssh { args }) => run_ssh(&env, &args, false).context("ssh"),
             Some(Command::Exec { args }) => run_ssh(&env, &args, true).context("exec"),
+            Some(Command::Wait { states }) => run_wait(&resolve_instance(&env, &resolve_flake_dir(&env)?)?, &states).context("wait"),
             Some(Command::Verify) => run_verify(&env).context("verify"),
             None | Some(_) => Ok(println!("Comming soon(tm)...")),
         }
@@ -245,54 +246,6 @@ fn write_template_config(target: &Path, workspace: &Path, force: bool) -> anyhow
         fs::write(target.join(name), contents).context("write template file")?;
     }
     Ok(())
-}
-
-#[inline(never)]
-fn run_build(env: &Env, bootstrap: bool) -> anyhow::Result<PathBuf> {
-    let instance = resolve_instance(env, &resolve_flake_dir(env)?)?;
-    prepare(&instance)?;
-    if !instance.sysroot.join("nix/var/nix/profiles/default").is_symlink() {
-        fetch_nix_dockerhub(&instance.sysroot)?;
-    }
-    if bootstrap || !instance.sysroot.join("nix/var/nix/profiles/system").is_symlink() {
-        install_initial_nixos_profile(&env.workspace, &instance.sysroot, &env.hostname)?;
-    }
-    // TODO: launch VM with special target (build-system-only.target), force re-build in guest.
-    //start_vm(&env, &instance);
-    // loop { wait for ssh to be ready }
-    //run_ssh(&instance, build /etc/nixos config and finally poweroff);
-    // TODO: Wait for guest to finish build, down the VM, and read the system profile path.
-    //virsh(&instance.id, "destroy");
-    //match run_wait(&instance, &["crashed", "shut off"]) {
-    //    Ok("shut off") => { ... system profile path ... },
-    //    Ok(other) => Err(format!("VM is not shut off: {other}")),
-    //    Err(err) => err,
-    //}
-    let system_profile = fs::read_link(instance.sysroot.join("nix/var/nix/profiles/system")).context("read system profile symlink")?;
-    let rel_system_profile_path = system_profile.strip_prefix("/").context("require absolute system profile symlink")?;
-    Ok(instance.sysroot.join(rel_system_profile_path))
-
-    // if "build" and not running,
-    // *start_vm to build-system-only.target*.
-    // wait ssh ready, run ssh to build config *then shutdown*.
-    // *destroy vm*.
-    // print profile path.
-
-    // if "build" and running,
-    // wait ssh ready. run ssh to build config *then report if xml hash changed (you need to shutdown and restart to fully take effect)*.
-    // print profile path.
-
-    // if "up" and not running,
-    // *start_vm to build-system-only.target*.
-    // wait ssh ready, run ssh to build config *then report and shutdown if xml hash changed (restarting because of VM config change), or start multi-user.target if hash not changed*.
-    // *destroy vm if hash changed, start_vm to multi-user.target*.
-
-    // if "up" and running,
-    // wait ssh ready. run ssh to build config *then report if xml hash changed (you need to shutdown and restart to fully take effect)*.
-    // apply switch to new profile if user flagged --switch to do so.
-
-    // if "up" and --no-build,
-    // start_vm to multi-user.target.
 }
 
 #[inline(never)]
@@ -372,6 +325,69 @@ fn prepare(instance: &Instance) -> anyhow::Result<()> {
         fs::create_dir_all(dir)?;
     }
     Ok(())
+}
+
+#[inline(never)]
+fn run_build_or_up(env: &Env, bootstrap: bool, is_up: bool, detach: bool) -> anyhow::Result<()> {
+    let is_switch = is_up;
+    let flake_dir = resolve_flake_dir(env)?;
+    let instance = resolve_instance(env, &flake_dir)?;
+    prepare(&instance).context("prepare instance directories")?;
+    if !instance.sysroot.join("nix/var/nix/profiles/default").is_symlink() {
+        fetch_nix_dockerhub(&instance.sysroot).context("fetch")?;
+    }
+    if bootstrap || !instance.sysroot.join("nix/var/nix/profiles/system").is_symlink() {
+        install_initial_nixos_profile(&env.workspace, &instance.sysroot, &env.hostname)?;
+    }
+    match domstate(&instance.id)?.as_str() {
+        "down" | "shut off" | "crashed" => {
+            let domain_profile = start_vm(env, &flake_dir, &instance, true)?;
+            let flake = format!("/persistent/etc/nixos#{}", env.hostname);
+            run_ssh(env, &["nixos-rebuild", "boot", "--flake", &flake], true)?;
+            let new_profile = read_system_profile(&instance)?;
+            println!("{}", new_profile.display());
+            if !is_up {
+                virsh(&["destroy", &instance.id]).context("return to down")?;
+            } else if fs::canonicalize(domain_profile.join("domain.xml.sh")).context("resolve old domain.xml.sh")?
+                != fs::canonicalize(new_profile.join("domain.xml.sh")).context("resolve new domain.xml.sh")?
+            {
+                virsh(&["destroy", &instance.id]).context("restart")?;
+                start_vm(env, &flake_dir, &instance, false).context("restart")?;
+            } else {
+                run_ssh(env, &["systemctl", "isolate", "multi-user.target"], true).context("starting")?;
+            }
+        }
+        "running" => {
+            let domain_profile = read_domain_profile(&instance)?;
+            let flake = format!("/persistent/etc/nixos#{}", env.hostname);
+            let switch_or_boot = if is_switch { "switch" } else { "boot" };
+            run_ssh(env, &["nixos-rebuild", switch_or_boot, "--flake", &flake], true)?;
+            let new_profile = read_system_profile(&instance)?;
+            if fs::canonicalize(domain_profile.join("domain.xml.sh")).context("resolve old domain.xml.sh")?
+                != fs::canonicalize(new_profile.join("domain.xml.sh")).context("resolve new domain.xml.sh")?
+            {
+                eprintln!("build: domain definition changed; please restart the VM for the changes to take effect");
+            }
+            if !detach {
+                run_ssh::<&str>(env, &[], false).context("detach")?;
+            }
+        }
+        domstate => bail!("VM is {domstate}; expected running, down, shut off, or crashed"),
+    };
+    Ok(())
+}
+
+/// Read the NixOS profile which the domain is created with.
+fn read_domain_profile(instance: &Instance) -> anyhow::Result<PathBuf> {
+    fs::read_link(instance.runtime_dir.join("domain-profile")).context("read domain-profile symlink")
+}
+
+/// Read the NixOS profile to be used to start the VM next time.
+fn read_system_profile(instance: &Instance) -> anyhow::Result<PathBuf> {
+    let profile_link = instance.sysroot.join("nix/var/nix/profiles/system");
+    let system_profile = fs::read_link(profile_link).context("read system profile symlink")?;
+    let rel_system_profile_path = system_profile.strip_prefix("/").context("require absolute system profile symlink")?;
+    Ok(instance.sysroot.join(rel_system_profile_path))
 }
 
 #[inline(never)]
@@ -570,26 +586,23 @@ where
     }
 }
 
-#[inline(never)]
-fn run_up(env: &Env, _detach: bool) -> anyhow::Result<()> {
-    let flake_dir = resolve_flake_dir(env)?;
-    let instance = resolve_instance(env, &flake_dir)?;
-    let state = domstate(&instance.id)?;
-    if state != "down" {
-        bail!("VM is already {state}");
-    }
+fn start_vm(env: &Env, flake_dir: &Path, instance: &Instance, is_build: bool) -> anyhow::Result<PathBuf> {
+    let system_profile = read_system_profile(instance)?;
     let pv_socket = instance.runtime_dir.join("pv.sock");
     let pid_path = instance.runtime_dir.join("agentsandbox.pid");
+    let domain_profile = instance.runtime_dir.join("domain-profile");
     let _ = fs::remove_file(&pv_socket);
     let _ = fs::remove_file(&pid_path);
-    let system_profile = run_build(env, false)?;
+    let _ = fs::remove_file(&domain_profile);
     let (mut parent_sock, mut child_sock) = UnixStream::pair().context("create supervisor socket pair")?;
     let supervisor_pid = spawn_mapped_namespace(false, false, || -> anyhow::Result<()> {
         let result = (|| -> anyhow::Result<()> {
-            mount_change("/", MountPropagationFlags::DOWNSTREAM | MountPropagationFlags::REC).context("set / mount propagation downstream+rec")?;
+            let downstream_rec = MountPropagationFlags::DOWNSTREAM | MountPropagationFlags::REC;
+            mount_change("/", downstream_rec).context("set / mount propagation downstream+rec")?;
             mount_bind_recursive(&instance.persistent, &instance.persistent).context("self bind persistent dir")?;
-            mount_change(&instance.persistent, MountPropagationFlags::SHARED | MountPropagationFlags::REC).context("set persistent mount shared+rec")?;
-            apply_mounts(&env, &flake_dir, &instance).context("apply configured mounts")?;
+            let shared_rec = MountPropagationFlags::SHARED | MountPropagationFlags::REC;
+            mount_change(&instance.persistent, shared_rec).context("set persistent mount shared+rec")?;
+            apply_mounts(env, flake_dir, instance, &system_profile).context("apply configured mounts")?;
             fs::write(&pid_path, format!("{}\n", process::id())).context("write pid file")?;
 
             let mut mask = KernelSigSet::empty();
@@ -629,7 +642,8 @@ fn run_up(env: &Env, _detach: bool) -> anyhow::Result<()> {
                 };
                 match unsafe { kernel_sigtimedwait(&mask, Some(&timeout)) } {
                     Ok(_info) => {
-                        if let Err(err) = apply_mounts(&env, &flake_dir, &instance).context("reload configured mounts on HUP") {
+                        let reload_result = apply_mounts(env, flake_dir, instance, &system_profile).context("reload mounts");
+                        if let Err(err) = reload_result {
                             eprintln!("apply_mounts: {err}");
                         }
                         continue;
@@ -666,6 +680,7 @@ fn run_up(env: &Env, _detach: bool) -> anyhow::Result<()> {
         .env("INSTANCE_ID", &instance.id)
         .env("DOMAIN_UUID", &domain_uuid)
         .env("MACHINE_ID", machine_id)
+        .env("AGENTSANDBOX_BUILD", if is_build { "1" } else { "" })
         .env(
             "PERSISTENT_SOCKET_XML",
             pv_socket
@@ -697,8 +712,8 @@ fn run_up(env: &Env, _detach: bool) -> anyhow::Result<()> {
             status.code().map_or("signal".to_owned(), |code| code.to_string())
         );
     }
-    Ok(())
-    // TODO: wait for domain to be ready.
+    symlink(&system_profile, domain_profile).context("write runtime domain-profile symlink")?;
+    Ok(system_profile)
 }
 
 /// Get compatible uid/gid maps from host.
@@ -715,9 +730,10 @@ fn capture_host_idmap(path: &str, map_root: bool) -> anyhow::Result<String> {
 }
 
 /// Apply mounts from mounts file to the guest system.
-fn apply_mounts(env: &Env, flake_dir: &Path, instance: &Instance) -> anyhow::Result<()> {
+fn apply_mounts(env: &Env, flake_dir: &Path, instance: &Instance, system_profile: &Path) -> anyhow::Result<()> {
     let mounts_path = flake_dir.join("mounts");
     let workspace_dir = instance.persistent.join("workspace");
+    let config_dir = instance.persistent.join("etc/nixos");
     let mut mounted = Vec::new();
 
     // Collect all mounted directories under /persistent/workspace.
@@ -727,7 +743,8 @@ fn apply_mounts(env: &Env, flake_dir: &Path, instance: &Instance) -> anyhow::Res
     }
     for target in String::from_utf8_lossy(&output.stdout).lines() {
         let target = Path::new(target);
-        if target == workspace_dir || target.strip_prefix(&workspace_dir).is_ok_and(|suffix| !suffix.as_os_str().is_empty()) {
+        if target == config_dir || target.starts_with(&workspace_dir)
+        {
             mounted.push(target.to_path_buf());
         }
     }
@@ -760,8 +777,14 @@ fn apply_mounts(env: &Env, flake_dir: &Path, instance: &Instance) -> anyhow::Res
         validate_mount_name_field(name)?;
         let target = workspace_dir.join(name);
         let is_dir = source_abs.is_dir();
-        parsed_mounts.push((source_abs, target, is_dir));
+        parsed_mounts.push((source_abs, target, is_dir, true));
     }
+    parsed_mounts.push((
+        flake_dir.canonicalize().context("canonicalize config dir")?,
+        instance.persistent.join("etc/nixos"),
+        true,
+        system_profile.join("mutable-sandbox-config").exists(),
+    ));
     parsed_mounts.sort_by(|a, b| a.1.cmp(&b.1));
 
     // Unmount all mounted directories in order of depth.
@@ -788,7 +811,7 @@ fn apply_mounts(env: &Env, flake_dir: &Path, instance: &Instance) -> anyhow::Res
     }
 
     // Mount all mounts from mounts file.
-    for (source_abs, target, is_dir) in parsed_mounts {
+    for (source_abs, target, is_dir, writable) in parsed_mounts {
         if is_dir {
             fs::create_dir_all(&target).context("create target dir")?;
             mount_bind_recursive(&source_abs, &target).context("bind-mount dir")?;
@@ -800,6 +823,9 @@ fn apply_mounts(env: &Env, flake_dir: &Path, instance: &Instance) -> anyhow::Res
                 fs::write(&target, "").context("create target file")?;
             }
             mount_bind(&source_abs, &target).context("bind-mount file")?;
+        }
+        if !writable {
+            mount_remount(&target, MountFlags::BIND | MountFlags::RDONLY, c"").context("remount file read-only")?;
         }
     }
     Ok(())
@@ -840,7 +866,14 @@ fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bo
             if !source_abs.is_dir() && !source_abs.is_file() {
                 bail!("mount source is neither file nor directory: {}", source_abs.display());
             }
-            let name = name.unwrap_or((source_abs.file_name().expect("failed to infer mount name from path").to_string_lossy()).to_string());
+            let name = match name {
+                Some(name) => name,
+                None => source_abs
+                    .file_name()
+                    .expect("failed to infer mount name from path")
+                    .to_string_lossy()
+                    .to_string(),
+            };
             validate_mount_name_field(&name)?;
             (Some((source_rel, name)), None)
         }
@@ -941,17 +974,13 @@ fn run_destroy(env: &Env, system: bool, data: bool, logs: bool, conf: bool) -> a
     Ok(())
 }
 #[inline(never)]
-fn run_ssh(env: &Env, args: &[String], is_root: bool) -> anyhow::Result<()> {
+fn run_ssh<S: AsRef<str>>(env: &Env, args: &[S], is_root: bool) -> anyhow::Result<()> {
     let flake_dir = resolve_flake_dir(env)?;
     let instance = resolve_instance(env, &flake_dir)?;
-    if domstate(&instance.id)? != "running" {
-        bail!("VM is not running");
-    }
-    let system_profile = fs::read_link(instance.sysroot.join("nix/var/nix/profiles/system")).context("read system profile symlink")?;
-    let rel_system_profile_path = system_profile.strip_prefix("/").context("require absolute system profile symlink")?;
+    run_wait(&instance, &["running"])?;
     let mut ssh_port = None;
-    for line in fs::read_to_string(instance.sysroot.join(rel_system_profile_path).join("port-forwards"))
-        .context("read system profile port-forwards")?
+    for line in fs::read_to_string(read_domain_profile(&instance)?.join("port-forwards"))
+        .context("read domain profile port-forwards")?
         .lines()
     {
         let mut parts = line.split('\t');
@@ -977,19 +1006,29 @@ fn run_ssh(env: &Env, args: &[String], is_root: bool) -> anyhow::Result<()> {
         Some(port) => port,
         None => bail!("ssh port forward for guest tcp/22 is not configured"),
     };
-    bail!(
-        process::Command::new("ssh")
+    for attempt in 1..=120 {
+        let status = process::Command::new("ssh")
             .arg(if is_root { "root@127.0.0.1" } else { "vscode@127.0.0.1" })
             .arg("-p")
             .arg(ssh_port.to_string())
-            .args(["-o", "LogLevel=ERROR", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"])
-            .args(args)
+            .args(["-o", "ConnectTimeout=1", "-o", "LogLevel=ERROR"])
+            .args(["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"])
+            .args(args.iter().map(AsRef::as_ref))
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
-            .exec()
-            .to_string()
-    )
+            .status()
+            .context("run ssh")?;
+        if status.success() {
+            return Ok(());
+        }
+        if status.code() != Some(255) || domstate(&instance.id)? != "running" || attempt == 120 {
+            let status_text = status.code().map_or("signal".to_owned(), |code| code.to_string());
+            bail!("ssh failed with status {status_text}");
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    bail!("ssh did not become ready for {}", env.hostname)
 }
 
 #[inline(never)]
@@ -1007,6 +1046,17 @@ fn domstate(instance_id: &str) -> anyhow::Result<String> {
         Ok("down".to_owned())
     } else {
         bail!("{}", stderr.trim())
+    }
+}
+
+#[inline(never)]
+fn run_wait<S: AsRef<str>>(instance: &Instance, states: &[S]) -> anyhow::Result<()> {
+    loop {
+        let state = domstate(&instance.id)?;
+        if states.iter().any(|expected| expected.as_ref() == state.as_str()) {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
     }
 }
 
@@ -1037,9 +1087,8 @@ fn virsh(args: &[&str]) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        APP_NAME, Cli, Instance, LOCAL_CONFIG_DIR, prepare, remove_dir_all_if_exists, resolve_env, resolve_flake_dir, resolve_instance, run_destroy, run_init,
-    };
+    use super::{APP_NAME, Cli, Instance, LOCAL_CONFIG_DIR, prepare, remove_dir_all_if_exists, resolve_env, resolve_flake_dir};
+    use super::{resolve_instance, run_destroy, run_init};
     use sha2::{Digest, Sha256};
     use std::{
         env, fs,

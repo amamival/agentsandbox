@@ -339,7 +339,23 @@ fn run_build_or_up(env: &Env, bootstrap: bool, is_up: bool, detach: bool) -> any
     if bootstrap || !instance.sysroot.join("nix/var/nix/profiles/system").is_symlink() {
         install_initial_nixos_profile(&env.workspace, &instance.sysroot, &env.hostname)?;
     }
-    match domstate(&instance.id)?.as_str() {
+    if !flake_dir.join("flake.lock").exists() {
+        let status = process::Command::new("nix")
+            .args(["--extra-experimental-features", "nix-command flakes", "flake", "lock"])
+            .arg(format!("path:{}", flake_dir.display()))
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .context("run host nix flake lock")?;
+        if !status.success() {
+            bail!(
+                "nix flake lock failed with status {}",
+                status.code().map_or("signal".to_owned(), |code| code.to_string())
+            );
+        }
+    }
+    let domstate = domstate(&instance.id)?;
+    match domstate.as_str() {
         "down" | "shut off" | "crashed" => {
             let domain_profile = start_vm(env, &flake_dir, &instance, true)?;
             let flake = format!("/persistent/etc/nixos#{}", env.hostname);
@@ -348,13 +364,13 @@ fn run_build_or_up(env: &Env, bootstrap: bool, is_up: bool, detach: bool) -> any
             println!("{}", new_profile.display());
             if !is_up {
                 virsh(&["destroy", &instance.id]).context("return to down")?;
-            } else if fs::canonicalize(domain_profile.join("domain.xml.sh")).context("resolve old domain.xml.sh")?
-                != fs::canonicalize(new_profile.join("domain.xml.sh")).context("resolve new domain.xml.sh")?
-            {
-                virsh(&["destroy", &instance.id]).context("restart")?;
-                start_vm(env, &flake_dir, &instance, false).context("restart")?;
             } else {
-                run_ssh(env, &["systemctl", "isolate", "multi-user.target"], true).context("starting")?;
+                if fs::read(domain_profile.join("domain.xml.sh"))? != fs::read(new_profile.join("domain.xml.sh"))? {
+                    virsh(&["destroy", &instance.id]).context("restart")?;
+                    start_vm(env, &flake_dir, &instance, false).context("restart")?;
+                } else {
+                    run_ssh(env, &["systemctl", "isolate", "multi-user.target"], true).context("starting")?;
+                }
             }
         }
         "running" => {
@@ -363,9 +379,7 @@ fn run_build_or_up(env: &Env, bootstrap: bool, is_up: bool, detach: bool) -> any
             let switch_or_boot = if is_switch { "switch" } else { "boot" };
             run_ssh(env, &["nixos-rebuild", switch_or_boot, "--flake", &flake], true)?;
             let new_profile = read_system_profile(&instance)?;
-            if fs::canonicalize(domain_profile.join("domain.xml.sh")).context("resolve old domain.xml.sh")?
-                != fs::canonicalize(new_profile.join("domain.xml.sh")).context("resolve new domain.xml.sh")?
-            {
+            if fs::read(domain_profile.join("domain.xml.sh"))? != fs::read(new_profile.join("domain.xml.sh"))? {
                 eprintln!("build: domain definition changed; please restart the VM for the changes to take effect");
             }
             if !detach {
@@ -743,8 +757,7 @@ fn apply_mounts(env: &Env, flake_dir: &Path, instance: &Instance, system_profile
     }
     for target in String::from_utf8_lossy(&output.stdout).lines() {
         let target = Path::new(target);
-        if target == config_dir || target.starts_with(&workspace_dir)
-        {
+        if target == config_dir || target.starts_with(&workspace_dir) {
             mounted.push(target.to_path_buf());
         }
     }

@@ -74,8 +74,8 @@
             libvirtDomainXmlGen = pkgs.writeShellScript "domain.xml.sh" ''
               TOPLEVEL="$(cd -- "$(dirname -- "$0")" && pwd -P)"
               SYSROOT="''${NIX_DIR%/nix}"
-              KERNEL="$(readlink "$TOPLEVEL/kernel")"
-              INITRD="$(readlink "$TOPLEVEL/initrd")"
+              KERNEL="$SYSROOT$(readlink "$TOPLEVEL/kernel")"
+              INITRD="$SYSROOT$(readlink "$TOPLEVEL/initrd")"
               UID_IDMAP_XML="$(
                   while read -r START TARGET COUNT; do
                     echo "                    <uid start='$START' target='$TARGET' count='$COUNT'/>"
@@ -86,8 +86,6 @@
                     echo "                    <gid start='$START' target='$TARGET' count='$COUNT'/>"
                   done <<<"$GID_MAP"
                 )"
-              [[ "$KERNEL" == /* ]] && KERNEL="$SYSROOT$KERNEL" || KERNEL="$TOPLEVEL/$KERNEL"
-              [[ "$INITRD" == /* ]] && INITRD="$SYSROOT$INITRD" || INITRD="$TOPLEVEL/$INITRD"
               BUILD_UNIT=''${AGENTSANDBOX_BUILD:+systemd.unit=agentsandbox-build.target}
               cat <<EOF
               <domain type='kvm'>
@@ -153,7 +151,7 @@
             '';
           in
           lib.mkAfter ''
-            ln -s ${libvirtDomainXmlGen} "$out/domain.xml.sh"
+            cp ${libvirtDomainXmlGen} "$out/domain.xml.sh"
             cp ${portForwardsFile} "$out/port-forwards"
             ${lib.optionalString config.agentsandbox.mutableSandboxConfig ''
               touch "$out/mutable-sandbox-config"
@@ -166,6 +164,7 @@
         # Boot.AgentSandbox
         virtualisation.fileSystems."/" = { device = "none"; fsType = "tmpfs"; options = [ "mode=755" "nosuid" "nodev" "noexec" ]; };
         virtualisation.fileSystems."/nix" = { device = "nix"; fsType = "virtiofs"; options = [ "nosuid" "nodev" ]; };
+        boot.kernel.sysctl."fs.file-max" = lib.mkDefault "10485760";
         boot.kernel.sysctl."vm.overcommit_memory" = lib.mkDefault "1"; # Stability in low memory situations.
         boot.kernelParams = [
           "panic=1" # Since we can't manually respond to a panic, just reboot.
@@ -176,8 +175,8 @@
         services.getty.autologinUser = "root";
         systemd.targets.agentsandbox-build = {
           description = "AgentSandbox build environment";
-          wants = [ "sshd.service" ];
-          after = [ "sshd.service" ];
+          wants = [ "network-setup.service" "dhcpcd.service" "sshd.service" "serial-getty@ttyS0.service" ];
+          after = [ "dhcpcd.service" ];
           unitConfig.AllowIsolate = true;
         };
 
@@ -208,7 +207,7 @@
         services.openssh.hostKeys = [{ type = "ed25519"; path = "/etc/ssh/ssh_host_ed25519_key"; }];
 
         # Networking
-        networking.proxy.default = "http://10.0.2.2:3128";
+        #networking.proxy.default = "http://10.0.2.2:3128";
         security.pki.certificates = [
           ''
             -----BEGIN CERTIFICATE-----

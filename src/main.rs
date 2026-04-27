@@ -236,7 +236,7 @@ fn write_template_config(target: &Path, workspace: &Path, force: bool) -> anyhow
     for (name, contents) in [
         ("flake.nix", include_str!("../share/agentsandbox/template/flake.nix").to_owned()),
         ("configuration.nix", include_str!("../share/agentsandbox/template/configuration.nix").to_owned()),
-        ("allowed_hosts", String::new()),
+        ("allowed_hosts", include_str!("../share/agentsandbox/template/allowed_hosts").to_owned()),
         ("mounts", format!("# <rel-host-path><TAB><guest-name>\n.\t{workspace_name}\n")),
         (
             "agentsandbox/flake.nix",

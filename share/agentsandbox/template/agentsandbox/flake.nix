@@ -157,19 +157,18 @@
               touch "$out/mutable-sandbox-config"
             ''}
           '';
+        boot.loader.external = { enable = true; installHook = "${pkgs.coreutils}/bin/true"; };
+        # Keep initrd module set minimal; root and early mounts only need virtiofs here.
+        boot.initrd.kernelModules = [ "virtiofs" ];
+
+        # Boot.AgentSandbox
         assertions = [{
           assertion = lib.versionAtLeast config.boot.kernelPackages.kernel.version "6.19";
           message = "agentsandbox requires Linux 6.19+ for fuse.inval_wq.";
         }];
         boot.kernelPackages = pkgs.linuxPackages_latest;
-        # Keep initrd module set minimal; root and early mounts only need virtiofs here.
-        boot.initrd.kernelModules = [ "virtiofs" ];
-        #boot.loader.external = { enable = true; installHook = "${pkgs.coreutils}/bin/true"; };
-
-        # Boot.AgentSandbox
         virtualisation.fileSystems."/" = { device = "none"; fsType = "tmpfs"; options = [ "mode=755" "nosuid" "nodev" "noexec" ]; };
         virtualisation.fileSystems."/nix" = { device = "nix"; fsType = "virtiofs"; options = [ "nosuid" "nodev" ]; };
-        boot.kernel.sysctl."fs.file-max" = lib.mkDefault "10485760";
         boot.kernel.sysctl."vm.overcommit_memory" = lib.mkDefault "1"; # Stability in low memory situations.
         systemd.services.fuse-inval-wq = {
           description = "Seed fuse.inval_wq before virtiofs mounts";
@@ -194,7 +193,7 @@
         services.getty.autologinUser = "root";
         systemd.targets.agentsandbox-build = {
           description = "AgentSandbox build environment";
-          wants = [ "network-setup.service" "dhcpcd.service" "sshd.service" "serial-getty@ttyS0.service" ];
+          wants = [ "dhcpcd.service" "sshd.service" "dbus.service" "serial-getty@ttyS0.service" ];
           after = [ "dhcpcd.service" ];
           unitConfig.AllowIsolate = true;
         };

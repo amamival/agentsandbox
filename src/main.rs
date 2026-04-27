@@ -341,7 +341,7 @@ fn run_build_or_up(env: &Env, bootstrap: bool, is_up: bool, detach: bool) -> any
     }
     if !flake_dir.join("flake.lock").exists() {
         let status = process::Command::new("nix")
-            .args(["--extra-experimental-features", "nix-command flakes", "flake", "lock"])
+            .args(["flake", "lock", "--extra-experimental-features", "nix-command flakes"])
             .arg(format!("path:{}", flake_dir.display()))
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -396,10 +396,25 @@ fn read_domain_profile(instance: &Instance) -> anyhow::Result<PathBuf> {
 
 /// Read the NixOS profile to be used to start the VM next time.
 fn read_system_profile(instance: &Instance) -> anyhow::Result<PathBuf> {
-    let profile_link = instance.sysroot.join("nix/var/nix/profiles/system");
-    let system_profile = fs::read_link(profile_link).context("read system profile symlink")?;
-    let rel_system_profile_path = system_profile.strip_prefix("/").context("require absolute system profile symlink")?;
-    Ok(instance.sysroot.join(rel_system_profile_path))
+    let mut path = instance.sysroot.join("nix/var/nix/profiles/system");
+    for _ in 0..16 {
+        let target = fs::read_link(&path).context("read system profile symlink")?;
+        path = if target.is_absolute() {
+            instance
+                .sysroot
+                .join(target.strip_prefix("/").context("resolve absolute system profile symlink target")?)
+        } else {
+            path.parent().context("resolve relative system profile symlink parent")?.join(target)
+        };
+        if !fs::symlink_metadata(&path)
+            .context("read resolved system profile metadata")?
+            .file_type()
+            .is_symlink()
+        {
+            return Ok(path);
+        }
+    }
+    bail!("system profile symlink chain is too deep")
 }
 
 #[inline(never)]

@@ -1173,10 +1173,7 @@ mod tests {
         let (root, home, global) = test_root("init");
         let workspace = root.join("workspace");
         assert_dirs(&[&workspace, &home]);
-        let mounts = format!(
-            "# <host-path><TAB><guest-name>\n{}\tworkspace\n",
-            fs::canonicalize(&workspace).unwrap().display()
-        );
+        let mounts = "# <rel-host-path><TAB><guest-name>\n.\tworkspace\n".to_string();
         let (local_env, global_env) = (
             env_from_input(workspace.clone(), home.clone(), false, None),
             env_from_input(workspace.clone(), home.clone(), true, None),
@@ -1190,10 +1187,13 @@ mod tests {
             }
             assert_eq!(fs::read_to_string(dir.join("mounts")).unwrap(), mounts);
         }
-        assert_eq!(run_init(&local_env, false).unwrap_err(), format!("{} already exists", local.display()));
+        assert_eq!(run_init(&local_env, false).unwrap_err().to_string(), format!("{} already exists", local.display()));
         fs::write(global.join("allowed_hosts"), "stale\n").unwrap();
         run_init(&global_env, true).unwrap();
-        assert_eq!(fs::read_to_string(global.join("allowed_hosts")).unwrap(), "");
+        assert_eq!(
+            fs::read_to_string(global.join("allowed_hosts")).unwrap(),
+            include_str!("../share/agentsandbox/template/allowed_hosts")
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

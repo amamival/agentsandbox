@@ -11,6 +11,7 @@ rustPlatform.buildRustPackage rec {
   };
   cargoLock.lockFile = ./Cargo.lock;
   nativeBuildInputs = [ makeWrapper ];
+  doCheck = false; # Cannot have a nested container.
   postInstall = "cp -r share $out/share";
   postFixup = ''
     wrapProgram "$out/bin/${pname}" \

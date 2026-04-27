@@ -501,6 +501,7 @@ fn install_initial_nixos_profile(workspace: &Path, sysroot: &Path, hostname: &st
             eprintln!("install: execing nix build for hostname={hostname}");
             bail!(
                 process::Command::new("/nix/var/nix/profiles/default/bin/nix")
+                    .env("NIX_SSL_CERT_FILE", "/etc/ssl/certs/ca-bundle.crt")
                     .args([
                         "--extra-experimental-features",
                         "nix-command flakes",

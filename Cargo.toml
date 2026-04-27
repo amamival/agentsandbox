@@ -1,7 +1,9 @@
 [package]
-name = "agentsandbox_rs"
-version = "0.0.0"
+name = "agentsandbox"
+version = "0.1.0"
+description = "Manage isolated NixOS VM sandboxes for agentic workflows"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 anyhow = "1"

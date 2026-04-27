@@ -499,15 +499,11 @@ fn install_initial_nixos_profile(workspace: &Path, sysroot: &Path, hostname: &st
             eprintln!("install: execing nix build for hostname={hostname}");
             bail!(
                 process::Command::new("/nix/var/nix/profiles/default/bin/nix")
-                    .env("NIX_SSL_CERT_FILE", "/etc/ssl/certs/ca-bundle.crt")
-                    .args([
-                        "--extra-experimental-features",
-                        "nix-command flakes",
-                        "build",
-                        &format!("/etc/nixos#nixosConfigurations.{hostname}.config.system.build.toplevel"),
-                        "--out-link",
-                        "/nix/var/nix/profiles/system",
-                    ])
+                    .args(["build", &format!("/etc/nixos#nixosConfigurations.{hostname}.config.system.build.toplevel")])
+                    .args(["--extra-experimental-features", "nix-command flakes"])
+                    .args(["--option", "ssl-cert-file", "/etc/ssl/certs/ca-bundle.crt"])
+                    .args(["--option", "max-jobs", "auto"])
+                    .args(["--out-link", "/nix/var/nix/profiles/system"])
                     .exec()
                     .to_string()
             )

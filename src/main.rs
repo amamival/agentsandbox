@@ -16,7 +16,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     env, fs,
-    io::{Read as _, Write as _},
+    io::{IsTerminal as _, Read as _, Write as _},
     os::fd::AsRawFd,
     os::unix::net::{UnixListener, UnixStream},
     os::unix::{fs::symlink, process::CommandExt},
@@ -183,8 +183,8 @@ fn main() {
             Some(Command::Mount { path, name }) => run_mount(&env, path, name, true).context("mount"),
             Some(Command::Unmount { path }) => run_mount(&env, Some(path), None, false).context("unmount"),
             Some(Command::Destroy { system, data, logs, conf }) => run_destroy(&env, system, data, logs, conf).context("destroy"),
-            Some(Command::Ssh { args }) => run_ssh(&env, &args, false).context("ssh"),
-            Some(Command::Exec { args }) => run_ssh(&env, &args, true).context("exec"),
+            Some(Command::Ssh { args }) => run_ssh(&env, &args, false, false).context("ssh"),
+            Some(Command::Exec { args }) => run_ssh(&env, &args, true, false).context("exec"),
             Some(Command::Wait { states }) => run_wait(&resolve_instance(&env, &resolve_flake_dir(&env)?)?, &states).context("wait"),
             Some(Command::Verify) => run_verify(&env).context("verify"),
             None | Some(_) => Ok(println!("Comming soon(tm)...")),
@@ -359,31 +359,29 @@ fn run_build_or_up(env: &Env, bootstrap: bool, is_up: bool, detach: bool) -> any
         "down" | "shut off" | "crashed" => {
             let domain_profile = start_vm(env, &flake_dir, &instance, true)?;
             let flake = format!("/persistent/etc/nixos#{}", env.hostname);
-            run_ssh(env, &["nixos-rebuild", "boot", "--flake", &flake], true)?;
+            run_ssh(env, &["nixos-rebuild", "boot", "--flake", &flake], true, true)?;
             let new_profile = read_system_profile(&instance)?;
             println!("{}", new_profile.display());
             if !is_up {
                 virsh(&["destroy", &instance.id]).context("return to down")?;
+            } else if fs::read(domain_profile.join("domain.xml.sh"))? != fs::read(new_profile.join("domain.xml.sh"))? {
+                virsh(&["destroy", &instance.id]).context("restart")?;
+                start_vm(env, &flake_dir, &instance, false).context("restart")?;
             } else {
-                if fs::read(domain_profile.join("domain.xml.sh"))? != fs::read(new_profile.join("domain.xml.sh"))? {
-                    virsh(&["destroy", &instance.id]).context("restart")?;
-                    start_vm(env, &flake_dir, &instance, false).context("restart")?;
-                } else {
-                    run_ssh(env, &["systemctl", "isolate", "multi-user.target"], true).context("starting")?;
-                }
+                run_ssh(env, &["systemctl", "isolate", "multi-user.target"], true, true).context("starting")?;
             }
         }
         "running" => {
             let domain_profile = read_domain_profile(&instance)?;
             let flake = format!("/persistent/etc/nixos#{}", env.hostname);
             let switch_or_boot = if is_switch { "switch" } else { "boot" };
-            run_ssh(env, &["nixos-rebuild", switch_or_boot, "--flake", &flake], true)?;
+            run_ssh(env, &["nixos-rebuild", switch_or_boot, "--flake", &flake], true, true)?;
             let new_profile = read_system_profile(&instance)?;
             if fs::read(domain_profile.join("domain.xml.sh"))? != fs::read(new_profile.join("domain.xml.sh"))? {
                 eprintln!("build: domain definition changed; please restart the VM for the changes to take effect");
             }
-            if !detach {
-                run_ssh::<&str>(env, &[], false).context("detach")?;
+            if detach {
+                run_ssh::<&str>(env, &[], false, false).context("detach")?;
             }
         }
         domstate => bail!("VM is {domstate}; expected running, down, shut off, or crashed"),
@@ -988,7 +986,7 @@ fn run_destroy(env: &Env, system: bool, data: bool, logs: bool, conf: bool) -> a
     Ok(())
 }
 #[inline(never)]
-fn run_ssh<S: AsRef<str>>(env: &Env, args: &[S], is_root: bool) -> anyhow::Result<()> {
+fn run_ssh<S: AsRef<str>>(env: &Env, args: &[S], is_root: bool, inherit_tty: bool) -> anyhow::Result<()> {
     let flake_dir = resolve_flake_dir(env)?;
     let instance = resolve_instance(env, &flake_dir)?;
     run_wait(&instance, &["running"])?;
@@ -1025,10 +1023,11 @@ fn run_ssh<S: AsRef<str>>(env: &Env, args: &[S], is_root: bool) -> anyhow::Resul
             .arg(if is_root { "root@127.0.0.1" } else { "vscode@127.0.0.1" })
             .arg("-p")
             .arg(ssh_port.to_string())
+            .args((inherit_tty && std::io::stdin().is_terminal()).then_some("-t"))
             .args(["-o", "ConnectTimeout=1", "-o", "LogLevel=ERROR"])
             .args(["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"])
             .args(args.iter().map(AsRef::as_ref))
-            .stdin(Stdio::inherit())
+            .stdin(Stdio::inherit()) // allow ssh to read input and ioctl.
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .status()

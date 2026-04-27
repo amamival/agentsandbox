@@ -5,6 +5,7 @@
     home-manager.url = "github:nix-community/home-manager/release-25.11";
     home-manager.inputs.nixpkgs.follows = "nixpkgs";
     agentsandbox.url = "path:./agentsandbox";
+    agentsandbox.inputs.nixpkgs.follows = "nixpkgs";
     opencode.url = "github:anomalyco/opencode/dev";
     opencode.inputs.nixpkgs.follows = "nixpkgs-unstable";
   };
@@ -33,6 +34,8 @@
               --replace-fail 'const prettier = await import("prettier")' 'const prettier: any = { format: async (s: string) => s }' \
               --replace-fail 'const babel = await import("prettier/plugins/babel")' 'const babel = {}' \
               --replace-fail 'const estree = await import("prettier/plugins/estree")' 'const estree = {}'
+            substituteInPlace package.json \
+              --replace-fail '"packageManager": "bun@1.3.13"' '"packageManager": "bun@1.3.11"'
           '';
         });
       });

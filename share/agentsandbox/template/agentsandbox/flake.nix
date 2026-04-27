@@ -113,7 +113,7 @@
                   <filesystem type='mount'>
                     <driver type='virtiofs' queue='1024'/>
                     <binary path='${pkgs.virtiofsd}/bin/virtiofsd' xattr='on'>
-                      <cache mode='always'/>
+                      <!-- Omit <cache>; libvirt only accepts none/always, and virtiofsd default is auto. -->
                       <sandbox mode='namespace'/>
                       <!-- Rust virtiofsd 1.13.x does not advertise lock support to libvirt:
                             https://virtio-fs.gitlab.io/virtiofsd/doc/virtiofsd/fuse/struct.FsOptions.html -->
@@ -157,6 +157,11 @@
               touch "$out/mutable-sandbox-config"
             ''}
           '';
+        assertions = [{
+          assertion = lib.versionAtLeast config.boot.kernelPackages.kernel.version "6.19";
+          message = "agentsandbox requires Linux 6.19+ for fuse.inval_wq.";
+        }];
+        boot.kernelPackages = pkgs.linuxPackages_latest;
         # Keep initrd module set minimal; root and early mounts only need virtiofs here.
         boot.initrd.kernelModules = [ "virtiofs" ];
         #boot.loader.external = { enable = true; installHook = "${pkgs.coreutils}/bin/true"; };
@@ -166,6 +171,20 @@
         virtualisation.fileSystems."/nix" = { device = "nix"; fsType = "virtiofs"; options = [ "nosuid" "nodev" ]; };
         boot.kernel.sysctl."fs.file-max" = lib.mkDefault "10485760";
         boot.kernel.sysctl."vm.overcommit_memory" = lib.mkDefault "1"; # Stability in low memory situations.
+        systemd.services.fuse-inval-wq = {
+          description = "Seed fuse.inval_wq before virtiofs mounts";
+          wantedBy = [ "local-fs-pre.target" ];
+          before = [ "local-fs-pre.target" "nix.mount" ];
+          unitConfig.DefaultDependencies = false;
+          serviceConfig.Type = "oneshot";
+          script = ''
+            ${pkgs.kmod}/bin/modprobe fuse
+            if [ -w /sys/module/fuse/parameters/inval_wq ]; then
+              echo 0 > /sys/module/fuse/parameters/inval_wq
+              echo 5 > /sys/module/fuse/parameters/inval_wq
+            fi
+          '';
+        };
         boot.kernelParams = [
           "panic=1" # Since we can't manually respond to a panic, just reboot.
           "boot.panic_on_fail" # Panics on boot failure.

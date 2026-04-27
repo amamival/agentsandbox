@@ -1,4 +1,9 @@
+# Rust
 target/
+# Nix
 share/agentsandbox/template/flake.lock
 result*
+# eBPF
 *.bpf
+# agentsandbox
+.agentsandbox

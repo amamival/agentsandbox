@@ -24,7 +24,8 @@
               src = ./.;
               cargoLock.lockFile = ./Cargo.lock;
             };
-          in {
+          in
+          {
             default = pkgs.stdenvNoCC.mkDerivation {
               pname = "agentsandbox";
               version = "0.0.0-dev";
@@ -100,24 +101,25 @@
             } // { inherit system; })
           ).config;
           testGuestToplevel = testGuestConfig.system.build.toplevel;
-          testLibvirtXml = pkgs.runCommand "${testInstanceId}.xml" {
-            DOMAIN_UUID = testDomainUuid;
-            GID_MAP = ''
-                     100        100          1
-                       0     100000        100
-                     101     100100     165435
-            '';
-            INSTANCE_ID = testInstanceId;
-            MACHINE_ID = testShortMachineId;
-            NIX_DIR = "${testDataDir}/sysroot/nix";
-            PERSISTENT_DIR = "${testDataDir}/persistent";
-            RUNTIME_DIR = testRuntimeDir;
-            UID_MAP = ''
-                      1000       1000          1
-                         0     100000       1000
-                      1001     101000     164535
-            '';
-          } ''
+          testLibvirtXml = pkgs.runCommand "${testInstanceId}.xml"
+            {
+              DOMAIN_UUID = testDomainUuid;
+              GID_MAP = ''
+                100        100          1
+                  0     100000        100
+                101     100100     165435
+              '';
+              INSTANCE_ID = testInstanceId;
+              MACHINE_ID = testShortMachineId;
+              NIX_DIR = "${testDataDir}/sysroot/nix";
+              PERSISTENT_DIR = "${testDataDir}/persistent";
+              RUNTIME_DIR = testRuntimeDir;
+              UID_MAP = ''
+                1000       1000          1
+                   0     100000       1000
+                1001     101000     164535
+              '';
+            } ''
             "${testGuestToplevel}/domain.xml.sh" > "$out"
           '';
           rootLock = builtins.fromJSON (builtins.readFile ./flake.lock);
@@ -197,7 +199,8 @@
               };
             };
           });
-        in {
+        in
+        {
           lint = pkgs.runCommand "lint" { } ''${pkgs.shellcheck}/bin/shellcheck ${./bin}/* > "$out"'';
           nixos-e2e = pkgs.testers.runNixOSTest {
             name = "agentsandbox-nixos-e2e";

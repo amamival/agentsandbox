@@ -234,13 +234,13 @@ fn write_template_config(target: &Path, workspace: &Path, force: bool) -> anyhow
     let workspace_name = workspace.file_name().and_then(|name| name.to_str()).context("derive workspace name")?;
     fs::create_dir_all(target.join("agentsandbox")).context("create agentsandbox dir")?;
     for (name, contents) in [
-        ("flake.nix", include_str!("../share/agentsandbox/template/flake.nix").to_owned()),
-        ("configuration.nix", include_str!("../share/agentsandbox/template/configuration.nix").to_owned()),
-        ("allowed_hosts", include_str!("../share/agentsandbox/template/allowed_hosts").to_owned()),
+        ("flake.nix", include_str!("../template/flake.nix").to_owned()),
+        ("configuration.nix", include_str!("../template/configuration.nix").to_owned()),
+        ("allowed_hosts", include_str!("../template/allowed_hosts").to_owned()),
         ("mounts", format!("# <rel-host-path><TAB><guest-name>\n.\t{workspace_name}\n")),
         (
             "agentsandbox/flake.nix",
-            include_str!("../share/agentsandbox/template/agentsandbox/flake.nix").to_owned(),
+            include_str!("../template/agentsandbox/flake.nix").to_owned(),
         ),
     ] {
         fs::write(target.join(name), contents).context("write template file")?;
@@ -1192,7 +1192,7 @@ mod tests {
         run_init(&global_env, true).unwrap();
         assert_eq!(
             fs::read_to_string(global.join("allowed_hosts")).unwrap(),
-            include_str!("../share/agentsandbox/template/allowed_hosts")
+            include_str!("../template/allowed_hosts")
         );
         fs::remove_dir_all(root).unwrap();
     }

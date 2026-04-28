@@ -7,12 +7,11 @@ rustPlatform.buildRustPackage rec {
   version = cargoToml.package.version;
   src = lib.fileset.toSource {
     root = ./.;
-    fileset = lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./src ./share ];
+    fileset = lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./src ./template ];
   };
   cargoLock.lockFile = ./Cargo.lock;
   nativeBuildInputs = [ makeWrapper ];
   doCheck = false; # Cannot have a nested container.
-  postInstall = "cp -r share $out/share";
   postFixup = ''
     wrapProgram "$out/bin/${pname}" \
       --prefix PATH : ${lib.makeBinPath [ libvirt openssh util-linux virtiofsd ]}

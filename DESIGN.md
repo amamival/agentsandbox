@@ -1,4 +1,4 @@
-# Agent Sandbox: an unshared, efficient, reproducible NixOS Linux VM for self-improving agentic workflows
+# Agent Sandbox: a secure, efficient, reproducible NixOS Linux VM for self-improving agentic workflows
 
 In 2026, agentic loops are becoming increasingly unattended as LLM-based coding harnesses improve. However, the use of such harnesses and external LLM providers still raises security and privacy concerns.
 

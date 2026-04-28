@@ -13,7 +13,7 @@
   outputs = { self, nixpkgs, ... }:
     let
       eachSystem = f:
-        nixpkgs.lib.genAttrs [ "aarch64-linux" "x86_64-linux" ]
+        nixpkgs.lib.genAttrs [ "x86_64-linux" ]
           (system: f system (import nixpkgs { inherit system; }));
     in
     {

@@ -1,6 +1,6 @@
 # Tests
 
-This file defines a single end-to-end scenario sequence that exercises every `agentsandbox` subcommand in one run. It is written from the user perspective and assumes a local Linux host with Nix installed and a writable workspace.
+This file defines a single end-to-end scenario sequence that exercises every `agentsandbox` subcommand in one run. It is written from the user perspective and assumes a local Linux host with a writable workspace.
 
 ## Scenario
 
@@ -15,7 +15,7 @@ This file defines a single end-to-end scenario sequence that exercises every `ag
    - Here, deny-by-default means that removing every active `allowed_hosts` entry must still block unmatched hosts rather than falling back to allow-all.
 
 3. Inspect launcher metadata.
-   - Run `agentsandbox help`.
+   - Run `agentsandbox --help`.
    - Run `agentsandbox version`.
    - Run `agentsandbox doctor`.
    - Run `agentsandbox verify`.
@@ -125,6 +125,6 @@ This file defines a single end-to-end scenario sequence that exercises every `ag
 
 ## Acceptance
 
-- Every subcommand listed in `agentsandbox help` is executed at least once in this sequence.
+- Every subcommand listed in `agentsandbox --help` is executed at least once in this sequence.
 - The sequence covers local config, global config resolution, guest build, VM startup, guest attachment, logs, stats, mount management, allowlist editing, proxy log tailing, lifecycle control, and cleanup.
 - The sequence must pass without manual edits between steps other than the explicit host directories and log records created for the scenario.

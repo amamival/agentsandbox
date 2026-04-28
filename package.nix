@@ -20,6 +20,6 @@ rustPlatform.buildRustPackage rec {
     description = cargoToml.package.description;
     license = lib.licenses.mit;
     mainProgram = pname;
-    platforms = lib.platforms.linux;
+    platforms = [ "x86_64-linux" ];
   };
 }

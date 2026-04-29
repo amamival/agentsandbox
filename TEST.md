@@ -11,7 +11,9 @@ This file defines a single end-to-end scenario sequence that exercises every `ag
 2. Initialize the workspace.
    - Run `agentsandbox init`.
    - Verify that `.agentsandbox/flake.nix`, `.agentsandbox/configuration.nix`, `.agentsandbox/allowed_hosts`, and `.agentsandbox/mounts` were created.
-   - Verify that `allowed_hosts` is deny-by-default and `mounts` contains only the template header.
+   - Verify that `allowed_hosts` is deny-by-default and `mounts` contains the header line
+     `# <rel-host-path><TAB><guest-name>` and a default workspace line `.\t` plus the workspace directory
+     name (the final path component of the project directory).
    - Here, deny-by-default means that removing every active `allowed_hosts` entry must still block unmatched hosts rather than falling back to allow-all.
 
 3. Inspect launcher metadata.
@@ -22,11 +24,11 @@ This file defines a single end-to-end scenario sequence that exercises every `ag
    - Verify that the current `verify` stub announces the planned repair commands `nixos-rebuild --repair` and `nix store verify --repair`.
    - Verify that the command list, version string, and dependency diagnostics are printed.
 
-4. Confirm config resolution.
-   - Run `agentsandbox __resolve-active-config "$PWD"`.
-   - Verify that the active config dir resolves to the local `.agentsandbox/` directory.
-   - Run `agentsandbox __resolve-instance "$PWD" "$PWD/.agentsandbox" default`.
-   - Verify that the instance id, machine id, data dir, state dir, runtime dir, and domain name are all reported.
+4. Confirm config and instance resolution from `doctor`.
+   - Run `agentsandbox doctor` (or use the output from step 3).
+   - Verify that `ResolvedFlakeDir` is the local `.agentsandbox/` directory for this workspace.
+   - Verify that `ResolvedInstanceId`, `ResolvedDataDir`, `ResolvedStateDir`, and `ResolvedRuntimeDir`
+     appear in the output.
 
 5. Prepare allowlist entries.
    - Run `agentsandbox allow-domain Example.COM`.
@@ -45,6 +47,13 @@ This file defines a single end-to-end scenario sequence that exercises every `ag
    - Verify that the current mount list is printed.
    - Run `agentsandbox unmount ./alpha`.
    - Verify that the `alpha` entry is removed from `mounts`.
+
+6.5. Validate `-w` and mount path resolution.
+   - Under the project directory, create two directories `ws-a/alpha` and `ws-b/alpha`.
+   - Run `agentsandbox -w "$PWD/ws-a" init` and `agentsandbox -w "$PWD/ws-a" mount ./alpha`.
+   - Run `agentsandbox -w "$PWD/ws-b" init` and `agentsandbox -w "$PWD/ws-b" mount ./alpha`.
+   - Verify that `ws-a/.agentsandbox/mounts` contains `.\tws-a` and a tab-separated line whose guest name is `alpha`.
+   - Verify that `ws-b/.agentsandbox/mounts` contains `.\tws-b` and a tab-separated line whose guest name is `alpha`.
 
 7. Build the guest system.
    - Run `agentsandbox build`.
@@ -110,10 +119,15 @@ This file defines a single end-to-end scenario sequence that exercises every `ag
     - Verify that the sysroot is removed.
     - Verify that the `persistent/` tree remains.
     - Run `agentsandbox destroy -d`.
-    - Verify that `persistent/` is removed and `sysroot/` remains.
+    - Verify that `persistent/` is removed (the `sysroot/` directory is already absent from `destroy -s`).
     - Run `agentsandbox destroy -sd`.
     - Verify that the whole data dir is removed.
-    - Verify that a later `agentsandbox up` reuses the persistent state.
+    - Verify that a later `agentsandbox up` does not reuse prior guest persistent data from before `-sd`.
+    - Run `agentsandbox destroy -l`.
+    - Verify that the instance state directory (as reported by `ResolvedStateDir` from `doctor`) is removed.
+    - Run `agentsandbox destroy -c`.
+    - Verify that the resolved config directory (`.agentsandbox/`) is removed.
+    - Run `agentsandbox init` to recreate the local configuration files needed for the following step.
 
 16. Validate the remaining utility commands in the same session.
    - Run `agentsandbox port`.
@@ -128,3 +142,4 @@ This file defines a single end-to-end scenario sequence that exercises every `ag
 - Every subcommand listed in `agentsandbox --help` is executed at least once in this sequence.
 - The sequence covers local config, global config resolution, guest build, VM startup, guest attachment, logs, stats, mount management, allowlist editing, proxy log tailing, lifecycle control, and cleanup.
 - The sequence must pass without manual edits between steps other than the explicit host directories and log records created for the scenario.
+- Config and instance resolution are checked via `agentsandbox doctor`.

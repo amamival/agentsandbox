@@ -247,10 +247,7 @@ fn write_template_config(target: &Path, workspace: &Path, force: bool) -> anyhow
         ("configuration.nix", include_str!("../template/configuration.nix").to_owned()),
         ("allowed_hosts", include_str!("../template/allowed_hosts").to_owned()),
         ("mounts", format!("# <rel-host-path><TAB><guest-name>\n.\t{workspace_name}\n")),
-        (
-            "agentsandbox/flake.nix",
-            include_str!("../template/agentsandbox/flake.nix").to_owned(),
-        ),
+        ("agentsandbox/flake.nix", include_str!("../template/agentsandbox/flake.nix").to_owned()),
     ] {
         fs::write(target.join(name), contents).context("write template file")?;
     }
@@ -890,7 +887,7 @@ fn validate_mount_source_field(value: &str) -> anyhow::Result<()> {
 }
 
 fn validate_mount_name_field(value: &str) -> anyhow::Result<()> {
-    if value.is_empty() || value == "." || value == ".." || value.contains('\t') || value.contains('\n') {
+    if value.is_empty() || matches!(value, "." | "..") || value.contains(['\t', '\n']) || value.contains("../") {
         bail!("invalid mount name: contains control separator characters or empty");
     }
     Ok(())
@@ -1097,7 +1094,10 @@ fn run_doctor(env: &Env) -> anyhow::Result<()> {
             }
             match list_instance_ids(env, flake_dir) {
                 Ok(instance_ids) => {
-                    println!("InstanceIds:\t{}", if instance_ids.is_empty() { "none".to_owned() } else { instance_ids.join(",") });
+                    println!(
+                        "InstanceIds:\t{}",
+                        if instance_ids.is_empty() { "none".to_owned() } else { instance_ids.join(",") }
+                    );
                 }
                 Err(err) => {
                     println!("InstanceIdsError:\t{err:#}");
@@ -1360,7 +1360,10 @@ mod tests {
             }
             assert_eq!(fs::read_to_string(dir.join("mounts")).unwrap(), mounts);
         }
-        assert_eq!(run_init(&local_env, false).unwrap_err().to_string(), format!("{} already exists", local.display()));
+        assert_eq!(
+            run_init(&local_env, false).unwrap_err().to_string(),
+            format!("{} already exists", local.display())
+        );
         fs::write(global.join("allowed_hosts"), "stale\n").unwrap();
         run_init(&global_env, true).unwrap();
         assert_eq!(

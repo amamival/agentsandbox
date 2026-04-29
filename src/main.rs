@@ -110,7 +110,7 @@ enum Command {
     },
     /// List VM statuses for all hostnames in the current config
     Ps,
-    /// Run a command as a user in a running VM, or attach if omitted.
+    /// Run a command as a user in a running VM, or attach if omitted
     ///
     /// Resolves SSH host port from `port-forwards` using guest `tcp/22`.
     /// Fails when no matching mapping exists.
@@ -129,9 +129,9 @@ enum Command {
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
-    /// Display percentage of CPU, memory, network I/O, block I/O and PIDs for VMs
+    /// Display statistics of CPU time, memory for VMs
     Stats,
-    /// Block until this VM becomes one of the states. Wait for stop states by default.
+    /// Block until this VM becomes one of the states. Wait for stop states by default
     Wait {
         #[arg(default_values = ["down", "shut off", "crashed"])]
         states: Vec<String>,

@@ -32,8 +32,10 @@ Linux host (x86_64/amd64) with KVM support is required.
 
 - `agentsandbox`
   If the VM is running, attach to it; otherwise, rebuild and start it.
+- `agentsandbox <command>`
+  Run one of the commands below against the selected workspace/config/hostname.
 
-The subcommands are similar to those of **Docker Compose**.
+The commands are similar to those of **Docker Compose**.
 ```
 Usage: agentsandbox [OPTIONS] [COMMAND]
 
@@ -52,7 +54,7 @@ Commands:
   ssh             Run a command as a user in a running VM, or attach if omitted
   exec            Run a command as root in a running VM, or attach if omitted
   logs            Show logs from a running VM. Runs `journalctl` with `-en1000` by default
-  stats           Display percentage of CPU, memory, network I/O, block I/O and PIDs for VMs
+  stats           Display statistics of CPU time, memory for VMs
   wait            Block until this VM becomes one of the states. Wait for stop states by default
   mount           Mount a file or directory into a running VM, or show mounts entries
   unmount         Unmount a file or directory from a running VM now and on future starts
@@ -232,17 +234,81 @@ $XDG_RUNTIME_DIR/agentsandbox/<instance-id>/
 
 ## Build flow
 
-- The launcher resolves the active config dir and the selected hostname in
-  `nixosConfigurations`.
-- The launcher resolves the instance id and each XDG path.
-- In the first bootstrap phase, the launcher creates the sysroot. The bootstrap
-  source uses the same Nix base sysroot as `sandbox.sh`.
-- The build runs in a Nix environment that uses sysroot as its root and realizes
-  the selected `nixosConfigurations.<hostname>` `toplevel` into `sysroot/nix/store`.
-- The guest boot path uses `init`, `kernel-params`, kernel, and initrd under the
-  selected `toplevel`.
-- The launcher evaluates the selected host config's libvirt XML definition,
-  gets an XML path in the Nix store, and passes that path to `virsh create`.
+- The launcher resolves active config dir (`.agentsandbox` upward search, else
+  `$XDG_CONFIG_HOME/agentsandbox`) and selected `hostname`.
+- The launcher resolves `instance-id` and instance paths under XDG roots.
+- The launcher creates instance directories:
+  - data: `sysroot/`, `persistent/`
+  - state: `logs/`
+  - runtime: pid/socket/lock files
+- If `sysroot/nix/var/nix/profiles/default` is missing, bootstrap `sysroot`
+  from Docker image `nixos/nix` (linux/amd64 manifest).
+- If `--bootstrap` is specified, or system profile is missing, write template
+  config into `sysroot/etc/nixos` and build initial profile with:
+  `nix build /etc/nixos#nixosConfigurations.<hostname>.config.system.build.toplevel`
+  in a mapped user+mount namespace.
+- During mapped namespace setup, child enters `NEWUSER|NEWNS`, parent writes
+  uid/gid mappings (`newuidmap`/`newgidmap`), then child continues.
+- VM startup path:
+  1. start mount supervisor in mapped namespace
+  2. apply dynamic mounts to exported `/persistent`
+  3. start `virtiofsd` on runtime socket
+  4. render domain XML by executing `<system-profile>/domain.xml.sh`
+  5. write XML to `<runtime-dir>/domain.xml`
+  6. `virsh create <runtime-dir>/domain.xml`
+- After boot path is available, run guest-side rebuild over SSH:
+  `nixos-rebuild boot|switch --flake /persistent/etc/nixos#<hostname>`.
+- Guest-centered rebuild is the security boundary: flake evaluation/build for
+  the operational system runs inside the guest path rather than host runtime.
+- If `domain.xml.sh` output differs from the runtime `domain-profile`, domain
+  changes are applied by destroy+recreate semantics.
+- On `up` for a running VM, guest rebuild uses `nixos-rebuild switch`; on
+  `build` (non-up), guest rebuild uses `nixos-rebuild boot`.
+- After guest rebuild on a running VM, the launcher compares
+  `domain-profile/domain.xml.sh` and `new-system-profile/domain.xml.sh`.
+  - If unchanged, the launcher keeps the current transient domain and runs
+    `systemctl isolate multi-user.target` inside the guest.
+  - If changed, the launcher applies restart semantics by recreating the
+    transient domain.
+- Security design intent: this split minimizes unnecessary domain recreation
+  (smaller control-plane disruption) while ensuring virtualization-boundary
+  changes from `domain.xml.sh` are never partially applied.
+- Threat model intent: guest-side flake execution is assumed potentially
+  adversarial; host-side behavior therefore limits itself to deterministic,
+  narrow actions (profile comparison, domain recreate-or-continue decision)
+  instead of broad host execution of flake-defined logic.
+
+## Runtime contracts (implementation-level)
+
+- Domain profile contract:
+  - Runtime symlink: `<runtime-dir>/domain-profile -> <system-profile>`
+  - SSH/port resolution and other runtime reads must use this profile.
+- Domain XML input contract (`domain.xml.sh` environment):
+  - `NIX_DIR`: `<sysroot>/nix`
+  - `UID_MAP`, `GID_MAP`: host-compatible idmap strings
+  - `INSTANCE_ID`: resolved instance id
+  - `DOMAIN_UUID`: UUID derived from `machine-id`
+  - `MACHINE_ID`: 32-hex machine id
+  - `AGENTSANDBOX_BUILD`: `"1"` on build path, empty otherwise
+  - `PERSISTENT_SOCKET_XML`: escaped virtiofs socket path fragment
+- SSH port resolution contract:
+  - Read `<domain-profile>/port-forwards`
+  - Parse rows: `<name>\t<proto>\t<host-start>\t<host-end>\t<guest>`
+  - Select `proto=tcp` row covering guest port 22 and compute host port by
+    range offset.
+- Mounts file contract:
+  - File: `<active-config>/mounts`
+  - Row format: `<host-path>\t<guest-name>`
+  - Relative host paths are resolved from `workspace`.
+  - `mount`/`unmount` edits this file; runtime reload is signaled by `HUP` to
+    supervisor pid.
+- Mutable sandbox config contract:
+  - `mutableSandboxConfig` is represented by marker file
+    `<system-profile>/mutable-sandbox-config`.
+  - If marker is absent, config mount is remounted read-only.
+- Policy file protection:
+  - `allowed_hosts` and `mounts` inside guest-visible config path are always
+    bind-mounted and remounted read-only.
 
 ## Guest system contract
 
@@ -357,15 +423,37 @@ $XDG_RUNTIME_DIR/agentsandbox/<instance-id>/
 
 ## Lifecycle
 
-- `build` realizes the selected `nixosConfiguration` `toplevel` into sysroot.
-- `up` starts the runtime helpers and starts the transient domain with
-  `virsh create`.
+- `build`
+  - Resolve config/instance, prepare instance dirs.
+  - Bootstrap sysroot/default profile when absent.
+  - Ensure `flake.lock` exists for active config.
+  - If VM is down (`down`/`shut off`/`crashed`): start VM, run guest
+    `nixos-rebuild boot`, then explicitly return to down by `virsh destroy`.
+  - If VM is running: run guest `nixos-rebuild boot`.
+  - With `--bootstrap`: force initial profile rebuild path first.
+  - `build` is a reconciliation operation, not a persistent runtime transition;
+    it may boot temporarily for guest-side realization but returns to a non-running end state when started from down.
+- `up`
+  - Same build path as `build`, but keep VM running.
+  - If VM is running, use guest `nixos-rebuild switch`.
+  - Attach to guest shell by default; skip attach with `--detach`.
 - `down` requests guest shutdown.
-- `kill` immediately destroys the transient domain.
-- `destroy` stops the transient domain and removes runtime helper state only.
-- `destroy --system` removes the instance `sysroot/`.
-- `destroy --data` removes the instance `persistent/`.
-- `destroy --system --data` removes the whole instance data dir.
-- `destroy --logs` removes the whole instance state dir.
-- `destroy --conf` removes the resolved config dir.
-- `port` resolves the host port from the selected `portForwards`.
+- `kill`
+  - `virsh destroy`.
+- `pause` / `unpause`
+  - Apply `virsh suspend` / `virsh resume` to all instance ids sharing current
+    machine-prefix scope.
+- `destroy` (alias: `destory`)
+  - Always attempts `virsh destroy` first.
+  - `--system`: remove `sysroot/` (mapped namespace path)
+  - `--data`: remove `persistent/` (mapped namespace path)
+  - `--system --data`: remove whole data dir
+  - `--logs`: remove whole state dir
+  - `--conf`: remove resolved config dir
+- `stats`
+  - Uses `virsh domstats --raw --state --cpu-total --vcpu --balloon`.
+  - Prints: state code/reason, cpu time/user/system ns, vcpu current/maximum,
+    balloon current/rss/available/usable KiB.
+- `verify`
+  - Host side: `nix-store --verify --check-contents --repair --store local?root=<sysroot>`
+  - Guest side (running VM): `nixos-rebuild build --repair --flake /persistent/etc/nixos#<hostname>`

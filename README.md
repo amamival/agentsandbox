@@ -52,7 +52,7 @@ Commands:
   ssh             Run a command as a user in a running VM, or attach if omitted
   exec            Run a command as root in a running VM, or attach if omitted
   logs            Show logs from a running VM. Runs `journalctl` with `-en1000` by default
-  stats           Display percentage of CPU, memory, network I/O, block I/O and PIDs for VMs
+  stats           Display statistics of CPU time, memory for VMs
   wait            Block until this VM becomes one of the states. Wait for stop states by default
   mount           Mount a file or directory into a running VM, or show mounts entries
   unmount         Unmount a file or directory from a running VM now and on future starts
@@ -64,11 +64,29 @@ Commands:
   help            Print this message or the help of the given subcommand(s)
 
 Options:
-  -g, --global                 Use the global sandbox scope instead of resolving the active workspace's local `.agentsandbox`
-  -n, --hostname <HOSTNAME>    Select sandbox hostname [default: default]
+  -g, --global                 Use only global config (`$XDG_CONFIG_HOME/agentsandbox`) and skip local upward search
+  -n, --hostname <HOSTNAME>    Select sandbox hostname (build target and instance identity input) [default: default]
   -w, --workspace <WORKSPACE>  Resolve the active workspace and config as if running from this directory
   -h, --help                   Print help
   -V, --version                Print version
+```
+
+## Quick Start
+```bash
+# 1) Initialize local config in current workspace
+agentsandbox init
+# 2) Build and start VM (attaches if startup succeeds)
+agentsandbox up
+# 3) Open guest shell (user)
+agentsandbox ssh
+# 4) Run command as root in guest
+agentsandbox exec -- uname -a
+# 5) Stop VM gracefully
+agentsandbox down
+```
+For global (project-less) usage, initialize once with:
+```bash
+agentsandbox --global init
 ```
 
 ## Development

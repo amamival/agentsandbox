@@ -7,11 +7,12 @@ rustPlatform.buildRustPackage rec {
   version = cargoToml.package.version;
   src = lib.fileset.toSource {
     root = ./.;
-    fileset = lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./src ./template ];
+    fileset = lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./src ./template ./man ];
   };
   cargoLock.lockFile = ./Cargo.lock;
   nativeBuildInputs = [ makeWrapper ];
   doCheck = false; # Cannot have a nested container.
+  postInstall = "install -D ${./man/agentsandbox.1} -t $out/share/man/man1";
   postFixup = ''
     wrapProgram "$out/bin/${pname}" \
       --prefix PATH : ${lib.makeBinPath [ libvirt openssh util-linux virtiofsd ]}

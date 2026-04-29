@@ -980,8 +980,11 @@ fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bo
 #[inline(never)]
 fn run_virsh_action(env: &Env, action: &str) -> anyhow::Result<()> {
     let instance = resolve_instance(env, &resolve_flake_dir(env)?)?;
-    virsh(&[action, &instance.id])
-    // TODO: wait for domain to be the desired state.
+    virsh(&[action, &instance.id])?;
+    match action {
+        "shutdown" => run_wait(&instance, &["down", "shut off", "crashed"]),
+        _ => Ok(()),
+    }
 }
 
 #[inline(never)]
@@ -991,7 +994,6 @@ fn run_virsh_action_all(env: &Env, action: &str) -> anyhow::Result<()> {
         virsh(&[action, &id])?;
     }
     Ok(())
-    // TODO: wait for domains to be the desired state.
 }
 
 #[inline(never)]

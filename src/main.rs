@@ -146,6 +146,13 @@ enum Command {
     /// Follow MITM proxy logs
     ProxyLogs,
     /// Verify and repair build
+    ///
+    /// 1) Uses host nix to run verify/repair against the guest store.
+    /// 2) If guest is running, runs nixos-rebuild --repair inside the guest.
+    ///
+    /// Limitations:
+    /// - Uses host nix binary (see doctor: HostNixStoreBinForVerify), substituter, trusted keys, etc.
+    /// - Verifies/repairs store/system state; does not analyze malicious flake.nix or other executables.
     Verify,
 }
 
@@ -1138,11 +1145,33 @@ fn run_doctor(env: &Env) -> anyhow::Result<()> {
     println!("CmdVirtiofsdPath:\t{}", resolve_cmd_path("virtiofsd"));
     println!("CmdUnsharePath:\t{}", resolve_cmd_path("unshare"));
     println!("CmdNixPath:\t{}", resolve_cmd_path("nix"));
+    println!("HostNixStoreBinForVerify:\t{}", resolve_cmd_path("nix-store"));
     Ok(())
 }
 
 #[inline(never)]
-fn run_verify(_env: &Env) -> anyhow::Result<()> {
+fn run_verify(env: &Env) -> anyhow::Result<()> {
+    let instance = resolve_instance(env, &resolve_flake_dir(env)?)?;
+    // Tried to obtain signatures for untrusted paths, but not effective.
+    // $ nix store copy-sigs -rvs https://cache.nixos.org /nix/var/nix/profiles/system
+    let output = process::Command::new("nix-store")
+        .args(["--verify", "--check-contents", "--repair", "--store"])
+        .arg(format!("local?root={}", instance.sysroot.display()))
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .output()
+        .context("depends on host nix-store binary as store verifier")?;
+    match output.status.code().context("guest nix store verify failed")? {
+        0 => eprintln!("verify: nix store verify/repair succeeded (no remaining store corruptions)"),
+        _ => eprintln!("verify: nix store verify/repair failed (unverifiable paths or remaining store corruptions)"),
+    }
+    if domstate(&instance.id)? != "running" {
+        bail!("guest is not running, skipping nixos-rebuild --repair");
+    }
+    let flake = format!("/persistent/etc/nixos#{}", env.hostname);
+    run_ssh(env, &["nixos-rebuild", "build", "--repair", "--flake", &flake], true, true)?;
+    eprintln!("verify: nixos-rebuild build --repair succeeded (no remaining system profile corruptions)");
     Ok(())
 }
 

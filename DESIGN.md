@@ -14,7 +14,7 @@ It gives you a real booted NixOS userland with `systemd`, persistence, and SSH a
 
 This is a good fit for packaging, service work, NixOS modules, and NixOS learning in general. You can iterate on a real [`configuration.nix`](configuration.nix), rebuild, and observe how services, users, SSH, packages, and persistent state behave together without sacrificing security and privacy.
 
-This is not a polished runtime. It is still an experimental launcher that requires a small amount of host-side setup to boot guest `systemd`.
+This is not yet a polished runtime. It remains an experimental launcher under heavy development.
 
 The target host platform is recent `amd64` Linux in general, not just NixOS. If this does not run on a reasonably current Linux machine, that should be treated as a bug rather than an unsupported edge case.
 
@@ -22,9 +22,9 @@ The entrypoint is [`agentsandbox`](agentsandbox), which handles sysroot bootstra
 
 ## Installation
 
-- NixOS - flake.nix
-- Arch Linux - PKGBUILD
-- Debian/Ubuntu - package release
+- Nix Flakes: `nix run github:<OWNER>/<REPO>`
+- Debian/Ubuntu, Fedora/RHEL, Arch: install packages from [GitHub Releases](https://github.com/<OWNER>/<REPO>/releases)
+  - `.deb` / `.rpm` / `.pkg.tar.zst`
 
 ## Using
 
@@ -33,51 +33,46 @@ The entrypoint is [`agentsandbox`](agentsandbox), which handles sysroot bootstra
 
 The subcommands are similar to those of **Docker Compose**.
 ```
-help                Show help
-version             Show version
-doctor              Show diagnostics
+Usage: agentsandbox [OPTIONS] [COMMAND]
 
-init                Create `.agentsandbox/` and copy the initial `{flake.nix,configuration.nix,allowed_hosts,mounts}`
-build               Build the guest system
-up                  Rebuild and start a VM; fails if it is already running
-down                Tear down the VM gracefully
-kill                Forcibly stop the VM
-pause               Pause all running VMs
-unpause             Unpause all running VMs
-destroy             Delete the guest system while preserving persistent data
+Commands:
+  version         Show version
+  doctor          Show diagnostics
+  init            Create `.agentsandbox/` and write the initial template files
+  build           Build the guest system
+  up              Rebuild and start a VM; if already running, build and switch
+  down            Tear down the VM gracefully
+  kill            Forcibly stop the VM
+  pause           Pause running VMs for all hostnames in the current config
+  unpause         Unpause VMs for all hostnames in the current config
+  destroy         Kill and delete guest files selected by flags (none by default)
+  ps              List VM statuses for all hostnames in the current config
+  ssh             Run a command as a user in a running VM, or attach if omitted
+  exec            Run a command as root in a running VM, or attach if omitted
+  logs            Show logs from a running VM. Runs `journalctl` with `-en1000` by default
+  stats           Display percentage of CPU, memory, network I/O, block I/O and PIDs for VMs
+  wait            Block until this VM becomes one of the states. Wait for stop states by default
+  mount           Mount a file or directory into a running VM, or show mounts entries
+  unmount         Unmount a file or directory from a running VM now and on future starts
+  port            Prints the public port for a port binding
+  allow-domain    Add a firewall rule that allows outbound traffic to a domain
+  unallow-domain  Remove the rule for the domain
+  proxy-logs      Follow MITM proxy logs
+  verify          Verify and repair build
+  help            Print this message or the help of the given subcommand(s)
 
-ps                  Show status of the VMs
-ssh                 Connect to a regular user shell in a running VM. Equivalent to `ssh -p <port> vscode@127.0.0.1 ...`
-exec                Execute a command in a running VM, or attach if omitted
-logs                Show logs from a running VM. Runs `journalctl` with `-en1000` by default
-stats               Display percentage of CPU, memory, network I/O, block I/O and PIDs for VMs
-wait                Wait for running VMs to stop
-
-mount               Mount a directory into a running VM now and on future starts, or show current mounts
-unmount             Unmount a directory from a running VM now and on future starts
-
-port                Prints the public port for a port binding.
-allow-domain        Add a firewall rule that allows outbound traffic to a domain
-unallow-domain      Remove the rule for the domain
-proxy-logs          Follow MITM proxy logs
-verify              Verify and repair build
+Options:
+  -g, --global                 Use the global sandbox scope instead of resolving the active workspace's local `.agentsandbox`
+  -n, --hostname <HOSTNAME>    Select sandbox hostname [default: default]
+  -w, --workspace <WORKSPACE>  Resolve the active workspace and config as if running from this directory
+  -h, --help                   Print help
+  -V, --version                Print version
 ```
-<!--[notimpl]
-#systemd             create systemd unit file and register its compose stacks
-#pull                pull stack images
-#push                push stack images
-#run                 create a VM similar to a service to run a one-off command
-#start               start specific services
-#stop                stop specific services
-#restart             restart specific services
-#config              displays the compose file
-#images              List images used by the created VMs
--->
 
 ## Development
 
-Nix users can run `nix develop --command ./agentsandbox`.\
-Otherwise, install dependencies: **TODO**
+Nix users can run `nix develop` then `cargo run <subcommand> <options>`.\
+Otherwise, install dependencies (`cargo`, `libvirt`, `virtiofsd`, `mitmproxy`, `openssh`, `util-linux`).
 
 ## License
 

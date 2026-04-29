@@ -1,0 +1,22 @@
+# nix shell nixpkgs#act -c act -W .github/workflows/cargo.yml -j ci -P ubuntu-latest=ghcr.io/catthehacker/ubuntu:act-latest
+name: Cargo CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Run cargo checks
+        run: cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo package --locked --no-verify

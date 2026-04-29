@@ -184,7 +184,10 @@ fn main() {
         let cli = Cli::parse();
         let env = resolve_env(&cli).context("resolve environment")?;
         match cli.command {
-            Some(Command::Version) => Ok(println!("{}", env!("CARGO_PKG_VERSION"))),
+            Some(Command::Version) => {
+                println!("{}", env!("CARGO_PKG_VERSION"));
+                Ok(())
+            }
             Some(Command::Init { force }) => run_init(&env, force).context("init"),
             Some(Command::Build { bootstrap }) => run_build_or_up(&env, bootstrap, false, false).context("build"),
             Some(Command::Up { detach }) => run_build_or_up(&env, false, true, !detach).context("up"),
@@ -203,7 +206,10 @@ fn main() {
             Some(Command::Stats) => run_stats(&env).context("stats"),
             Some(Command::Wait { states }) => run_wait(&resolve_instance(&env, &resolve_flake_dir(&env)?)?, &states).context("wait"),
             Some(Command::Verify) => run_verify(&env).context("verify"),
-            None | Some(_) => Ok(println!("Comming soon(tm)...")),
+            None | Some(_) => {
+                println!("Comming soon(tm)...");
+                Ok(())
+            }
         }
     })() {
         eprintln!("{err:#}");
@@ -939,7 +945,10 @@ fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bo
             (None, Some(source_rel.display().to_string()))
         }
         // list mounts.
-        (_, _) => return Ok(println!("{}", fs::read_to_string(&mounts_path)?)),
+        (_, _) => {
+            println!("{}", fs::read_to_string(&mounts_path)?);
+            return Ok(());
+        }
     };
 
     let kill_matcher = format!("{}\t", kill_entry.as_deref().unwrap_or(""));

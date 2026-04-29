@@ -31,10 +31,7 @@
 
       devShells = eachSystem (_: pkgs: {
         default = pkgs.mkShell {
-          packages = with pkgs; [
-            bubblewrap cargo clippy curl jq libvirt mitmproxy openssh passt
-            rust-analyzer rustc rustfmt socat util-linux virtiofsd zstd
-          ];
+          packages = with pkgs; [ rustup cargo clippy rust-analyzer util-linux libvirt virtiofsd openssh mitmproxy ];
           LIBVIRT_DEFAULT_URI = "qemu:///session";
         };
       });

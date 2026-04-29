@@ -4,6 +4,20 @@ version = "0.1.0"
 description = "Manage isolated NixOS VM sandboxes for agentic workflows"
 edition = "2024"
 license = "MIT"
+repository = "https://github.com/YOUR_GITHUB_OWNER/agentsandbox"
+homepage = "https://github.com/YOUR_GITHUB_OWNER/agentsandbox"
+readme = "README.md"
+keywords = ["nix", "nixos", "vm", "sandbox", "cli"]
+categories = ["command-line-utilities", "virtualization"]
+include = [
+  "src/**",
+  "man/**",
+  "template/**",
+  "Cargo.toml",
+  "Cargo.lock",
+  "README.md",
+  "LICENSE",
+]
 
 [dependencies]
 anyhow = "1"

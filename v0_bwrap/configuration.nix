@@ -58,7 +58,7 @@ let
     };
   };
   BootConfigs = builtins.attrValues Boot;
-  
+
   Networking = {
     networking.hostName = HostConf.hostName;
     networking.resolvconf.enable = false; # Provided by host.

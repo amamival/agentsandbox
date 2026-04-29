@@ -1,0 +1,94 @@
+# nix shell nixpkgs#act -c act -W .github/workflows/package-release.yml -j package -P ubuntu-latest=ghcr.io/catthehacker/ubuntu:act-latest --artifact-server-path /tmp/act-artifacts
+name: Package Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # Build a non-Nix-store-dependent release binary.
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build binary
+        run: |
+          cargo build --release --locked --target x86_64-unknown-linux-musl
+          mkdir -p stage/usr/{bin,share/man/man1}
+          cp ./target/x86_64-unknown-linux-musl/release/agentsandbox ./stage/usr/bin/agentsandbox
+          cp ./man/agentsandbox.1 ./stage/usr/share/man/man1/agentsandbox.1
+
+      - name: Build deb/rpm/archlinux packages
+        run: |
+          ref_name="${{ github.ref_name }}"
+          version="${ref_name#v}"
+          cat > nfpm.yaml <<EOF
+          name: agentsandbox
+          arch: amd64
+          platform: linux
+          version: ${version}
+          section: default
+          priority: optional
+          maintainer: agentsandbox maintainers
+          description: agentsandbox CLI
+          license: MIT
+          overrides:
+            deb:
+              depends:
+                - libvirt-clients
+                - openssh-client
+                - util-linux
+                - virtiofsd
+            rpm:
+              depends:
+                - libvirt-client
+                - openssh-clients
+                - util-linux
+                - virtiofsd
+            archlinux:
+              depends:
+                - libvirt
+                - openssh
+                - util-linux
+                - virtiofsd
+          contents:
+            - src: ./stage/usr/bin/agentsandbox
+              dst: /usr/bin/agentsandbox
+            - src: ./stage/usr/share/man/man1/agentsandbox.1
+              dst: /usr/share/man/man1/agentsandbox.1
+          EOF
+
+          mkdir -p dist
+          nix shell nixpkgs#nfpm -c nfpm package --config nfpm.yaml --packager deb --target dist/
+          nix shell nixpkgs#nfpm -c nfpm package --config nfpm.yaml --packager rpm --target dist/
+          nix shell nixpkgs#nfpm -c nfpm package --config nfpm.yaml --packager archlinux --target dist/
+          (cd dist && sha256sum ./* > SHA256SUMS)
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-release
+          path: dist/*
+
+      - name: Attach files to GitHub Release
+        if: ${{ !env.ACT }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

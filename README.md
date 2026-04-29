@@ -28,6 +28,8 @@ The entrypoint is [`agentsandbox`](agentsandbox), which handles sysroot bootstra
 
 ## Using
 
+Linux host (x86_64/amd64) with KVM support is required.
+
 - `agentsandbox`
   If the VM is running, attach to it; otherwise, rebuild and start it.
 
@@ -73,6 +75,7 @@ Options:
 
 Nix users can run `nix develop` then `cargo run <subcommand> <options>`.\
 Otherwise, install dependencies (`cargo`, `libvirt`, `virtiofsd`, `mitmproxy`, `openssh`, `util-linux`).
+Use `doctor` subcommand to verify host setup.
 
 ## License
 

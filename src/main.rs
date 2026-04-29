@@ -34,10 +34,10 @@ const LOCAL_CONFIG_DIR: &str = ".agentsandbox";
     version
 )]
 struct Cli {
-    /// Use the global sandbox scope instead of resolving the active workspace's local `.agentsandbox`.
+    /// Use only global config (`$XDG_CONFIG_HOME/agentsandbox`) and skip local upward search.
     #[arg(short = 'g', long, global = true)]
     global: bool,
-    /// Select sandbox hostname.
+    /// Select sandbox hostname (build target and instance identity input).
     #[arg(short = 'n', long, global = true, default_value = "default")]
     hostname: String,
     /// Resolve the active workspace and config as if running from this directory.
@@ -110,7 +110,10 @@ enum Command {
     },
     /// List VM statuses for all hostnames in the current config
     Ps,
-    /// Run a command as a user in a running VM, or attach if omitted
+    /// Run a command as a user in a running VM, or attach if omitted.
+    ///
+    /// Resolves SSH host port from `port-forwards` using guest `tcp/22`.
+    /// Fails when no matching mapping exists.
     Ssh {
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,

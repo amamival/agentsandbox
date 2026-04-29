@@ -28,6 +28,8 @@ The entrypoint is [`agentsandbox`](agentsandbox), which handles sysroot bootstra
 
 ## Using
 
+Linux host (x86_64/amd64) with KVM support is required.
+
 - `agentsandbox`
   If the VM is running, attach to it; otherwise, rebuild and start it.
 
@@ -62,21 +64,41 @@ Commands:
   help            Print this message or the help of the given subcommand(s)
 
 Options:
-  -g, --global                 Use the global sandbox scope instead of resolving the active workspace's local `.agentsandbox`
-  -n, --hostname <HOSTNAME>    Select sandbox hostname [default: default]
+  -g, --global                 Use only global config (`$XDG_CONFIG_HOME/agentsandbox`) and skip local upward search
+  -n, --hostname <HOSTNAME>    Select sandbox hostname (build target and instance identity input) [default: default]
   -w, --workspace <WORKSPACE>  Resolve the active workspace and config as if running from this directory
   -h, --help                   Print help
   -V, --version                Print version
+```
+
+## Quick Start
+```bash
+# 1) Initialize local config in current workspace
+agentsandbox init
+# 2) Build and start VM (attaches if startup succeeds)
+agentsandbox up
+# 3) Open guest shell (user)
+agentsandbox ssh
+# 4) Run command as root in guest
+agentsandbox exec -- uname -a
+# 5) Stop VM gracefully
+agentsandbox down
+```
+For global (project-less) usage, initialize once with:
+```bash
+agentsandbox --global init
 ```
 
 ## Development
 
 Nix users can run `nix develop` then `cargo run <subcommand> <options>`.\
 Otherwise, install dependencies (`cargo`, `libvirt`, `virtiofsd`, `mitmproxy`, `openssh`, `util-linux`).
+Use `doctor` subcommand to verify host setup.
 
 ## License
 
 MIT
+
 
 ## Design notes
 
@@ -91,13 +113,11 @@ In our experiments, *gVisor* could not run *SystemD* as PID 1 because it lacks t
 
 ## Design decisions
 
-- Guest builds live under `nixosConfigurations.<hostname>`, and runtime hostnames live
-  under `sandboxConfigurations.<name>`. Each `sandboxConfiguration` selects the
-  `nixosConfiguration` it uses.
+- Guest builds live under `nixosConfigurations.<hostname>`.
+- Runtime settings are resolved from the selected host entry in
+  `nixosConfigurations`.
 - The execution path is fixed to Linux `qemu:///session`, KVM, libvirt, virtiofs,
   NixOS, and home-manager.
-- On the first project-less run, if no global config exists, automatically run
-  `agentsandbox init --global` and then continue the build.
 - The host is not assumed to be NixOS. Each instance has its own dedicated
   `sysroot`. The `/nix` shown to the guest uses the instance `sysroot/nix`, not
   the host `/nix`.
@@ -158,47 +178,19 @@ In our experiments, *gVisor* could not run *SystemD* as PID 1 because it lacks t
 
 ## Flake contract
 
-- `nixosConfigurations.<hostname>` represents a guest system build.
-- `nixosConfigurations.<hostname>` is self-contained and usable directly as
-  `nixos-rebuild --flake <config-dir>#name`, where `<config-dir>` is either
-  `.agentsandbox` or `$XDG_CONFIG_HOME/agentsandbox`.
-```nix
-# Evaluated by launcher with AgentSandbox's nixosModule.
-{
-  nixosConfiguration = "dev"; # Defaults to <name>.
-  mutableSandboxConfig = false;
-  memoryMiB = 8192;
-  vcpus = 4;
-  portForwards = [
-    { proto = "tcp"; host = 2223; guest = 22; }
-  ];
-  libvirtXml = {
-    pkgs,
-    name,
-    uuid,
-    machineId,
-    toplevel,
-    sysrootNixDir,
-    persistentDir,
-    runtimeDir,
-    memoryMiB,
-    vcpus,
-    portForwards,
-  }: pkgs.writeText "domain.xml" ''
-    ...
-  '';
-}
-```
-
-- `toplevel` uses the selected
-  `nixosConfigurations.<hostname>.config.system.build.toplevel`.
-- `libvirtXml` returns an XML path in the Nix store.
+- The active config dir is either local `.agentsandbox` or
+  `$XDG_CONFIG_HOME/agentsandbox`.
+- `nixosConfigurations.<hostname>` is the guest build contract.
+- The launcher uses
+  `nixosConfigurations.<hostname>.config.system.build.toplevel` as the build
+  output and boot source.
+- Runtime configuration values are read from the selected host under
+  `nixosConfigurations` and consumed directly by the launcher.
 - The launcher builds the dynamic mount set from the active config dir's
   `mounts` file. It includes the initial workspace mount and any additional
   mounts added through `mount`.
 - The OpenSnitch endpoint lives at
-  `services.opensnitch.settings.Server.Address` in the selected
-  `nixosConfiguration`.
+  `services.opensnitch.settings.Server.Address` in the selected host config.
 
 ## Instance layout
 
@@ -224,14 +216,7 @@ $XDG_STATE_HOME/agentsandbox/<instance-id>/
 
 $XDG_RUNTIME_DIR/agentsandbox/<instance-id>/
   lock
-  virtiofs/nix.pid
-  virtiofs/nix.sock
-  virtiofs/persistent.pid
-  virtiofs/persistent.sock
-  mount-helper.pid
-  proxy.pid
-  opensnitch-forward.pid
-  opensnitch-watchdog.pid
+  ... runtime pid/socket files for helpers and sidecars
 ```
 
 - `sysroot/` contains an instance-specific Nix root and the source of guest boot
@@ -240,13 +225,15 @@ $XDG_RUNTIME_DIR/agentsandbox/<instance-id>/
 - `mounts` stores the dynamic mount set for the active config, including the
   initial workspace mount.
 - `logs/` stores the active log files and their rotated archives.
-- The runtime dir contains sockets, pid files, and helper state for the private
-  mount namespace and long-lived sidecars.
+- The runtime dir contains instance-scoped sockets, pid files, and helper state
+  for mount namespace and sidecars.
+- Runtime filename details are implementation details and are not a fixed
+  public contract.
 
 ## Build flow
 
-- The launcher resolves the active config dir and the selected
-  `sandboxConfiguration`.
+- The launcher resolves the active config dir and the selected hostname in
+  `nixosConfigurations`.
 - The launcher resolves the instance id and each XDG path.
 - In the first bootstrap phase, the launcher creates the sysroot. The bootstrap
   source uses the same Nix base sysroot as `sandbox.sh`.
@@ -254,8 +241,8 @@ $XDG_RUNTIME_DIR/agentsandbox/<instance-id>/
   the selected `nixosConfigurations.<hostname>` `toplevel` into `sysroot/nix/store`.
 - The guest boot path uses `init`, `kernel-params`, kernel, and initrd under the
   selected `toplevel`.
-- The launcher evaluates the selected `sandboxConfiguration.libvirtXml`, gets an
-  XML path in the Nix store, and passes that path to `virsh create`.
+- The launcher evaluates the selected host config's libvirt XML definition,
+  gets an XML path in the Nix store, and passes that path to `virsh create`.
 
 ## Guest system contract
 
@@ -307,8 +294,8 @@ $XDG_RUNTIME_DIR/agentsandbox/<instance-id>/
 - VM networking uses libvirt user networking with `passt`.
 - `portForwards` is represented as an array of `{ proto, host, guest }` for
   host-to-guest publication only.
-- Apply all `portForwards` from the selected `sandboxConfiguration` when the
-  domain is created.
+- Apply all `portForwards` from the selected host config when the domain is
+  created.
 - The `ssh` subcommand uses the `tcp` forward where `guest = 22`.
 - Gateway restriction is enforced with a guest-side firewall, and host-gateway
   paths are concentrated on the proxy port and the OpenSnitch forward port.

@@ -26,10 +26,12 @@ Host \fBnix-store\fR.
 .TP
 .B -g, --global
 Resolve and operate on the global config
-(\fB$XDG_CONFIG_HOME/agentsandbox\fR) instead of local workspace config.
+(\fB$XDG_CONFIG_HOME/agentsandbox\fR) only.
+Skips local upward search for \fB.agentsandbox/flake.nix\fR.
 .TP
 .BI "-n, --hostname " HOSTNAME
 Select sandbox hostname.
+This value selects build target and contributes to instance identity.
 .br
 Default: \fBdefault\fR.
 .TP
@@ -125,6 +127,10 @@ List VM states for all hostnames in the resolved config.
 Run command as guest user \fBvscode\fR, or attach shell if no args.
 .TP
 .BI "agentsandbox ssh " [args...]
+.PP
+Host port is auto-resolved from \fBport-forwards\fR by selecting
+guest \fBtcp/22\fR.
+If no such mapping exists, command fails.
 .SS exec
 Run command as guest user \fBroot\fR, or attach shell if no args.
 .TP

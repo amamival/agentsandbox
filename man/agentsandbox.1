@@ -1,233 +1,255 @@
 .TH AGENTSANDBOX 1 "2026-04-29" "agentsandbox" "User Commands"
 .SH NAME
-agentsandbox \- secure, reproducible NixOS Linux VM for agentic workflows
+agentsandbox \- manage a local NixOS VM sandbox
 .SH SYNOPSIS
 .B agentsandbox
-[\fIglobal-options\fR] \fIcommand\fR
+[\fIglobal-options\fR] \fIcommand\fR [\fIcommand-options\fR]
 .SH DESCRIPTION
-agentsandbox manages per-workspace Linux VMs built from NixOS templates.
-It also provides convenience commands to control libvirt domains, mount
-host paths into a running guest, and attach via SSH.
-
-Some subcommands are listed in the CLI but are not yet wired to the
-runtime (they may print a generic "Comming soon(tm)..." message). See
-each command's section for the current status.
+\fBagentsandbox\fR manages per-workspace Linux VMs built from NixOS templates.
+It resolves a configuration directory, derives an instance identity from that
+configuration plus hostname, and runs lifecycle/attach operations through
+libvirt and SSH.
+.P
+Some subcommands are listed in CLI help but not yet dispatched by the runtime.
+See \fBNOT IMPLEMENTED\fR.
+.SH REQUIREMENTS
+.TP
+Host OS
+Linux.
+.TP
+Required host commands
+\fBvirsh\fR, \fBssh\fR, \fBvirtiofsd\fR, \fBunshare\fR.
+.TP
+Additional for \fBverify\fR
+Host \fBnix-store\fR.
 .SH GLOBAL OPTIONS
 .TP
-.B -g , --global
-Use the global sandbox scope instead of resolving the active workspace's
-local \fI\&.agentsandbox\fR.
+.B -g, --global
+Resolve and operate on the global config
+(\fB$XDG_CONFIG_HOME/agentsandbox\fR) instead of local workspace config.
 .TP
-.B -n , --hostname HOSTNAME
+.BI "-n, --hostname " HOSTNAME
 Select sandbox hostname.
-.RI (Default: default)
-.TP
-.B -w , --workspace PATH
-Resolve the active workspace and config as if running from this directory.
-.RI (Default: current directory)
 .br
-This affects how \fI\&.agentsandbox\fR is resolved.
+Default: \fBdefault\fR.
+.TP
+.BI "-w, --workspace " PATH
+Resolve local config as if invoked from \fIPATH\fR.
+.br
+Default: current directory.
+.SH CONFIG RESOLUTION
+Without \fB--global\fR, the tool searches upward from \fB--workspace\fR for
+\fB.agentsandbox/flake.nix\fR. If not found, it falls back to global config.
+With \fB--global\fR, only global config is used.
 .SH COMMANDS
 .SS version
-Print the version.
-
-Alias: none.
+Print program version.
 .TP
-.BI agentsandbox version
+.B agentsandbox version
 .SS doctor
-Show diagnostics (resolved config/instance paths, relevant host commands).
+Print resolution and dependency diagnostics.
 .TP
-.BI agentsandbox doctor
+.B agentsandbox doctor
 .SS init
-Create \fI\&.agentsandbox/\fR and write the initial template files.
+Create template config files.
 .TP
-.BI agentsandbox init
-.BR -f , --force
+.B agentsandbox init
+.RS
+.TP
+.B -f, --force
 Overwrite existing files.
+.RE
 .SS build
-Build the guest system from the template-based system profile.
+Build guest system profile. If guest is down, starts VM temporarily, runs
+\fBnixos-rebuild boot\fR, then returns VM to down state.
 .TP
-.BI agentsandbox build
-.BR -b , --bootstrap
-Build the initial template-based system profile instead.
-.br
-Current configs are kept.
+.B agentsandbox build
+.RS
+.TP
+.B -b, --bootstrap
+Reinstall initial template-based profile before build.
+.RE
 .SS up
-Rebuild and start a VM.
+Build and start VM. If already running, runs rebuild in-place; if domain XML
+changed, VM restart is required (command reports this).
 .TP
-.BI agentsandbox up
-.BR -d , --detach
-Detach after starting.
-.br
-If the VM is already running, it rebuilds and proceeds to the next steps.
+.B agentsandbox up
+.RS
+.TP
+.B -d, --detach
+Do not attach to guest after rebuild/start.
+.RE
 .SS down
-Tear down the VM gracefully.
+Request graceful shutdown, then wait for stop state.
 .TP
-.BI agentsandbox down
+.B agentsandbox down
 .SS kill
-Forcibly stop the VM and delete guest files selected by destroy flags
-via \fBdestroy\fR.
+Forcibly stop VM (\fBvirsh destroy\fR).
 .TP
-.BI agentsandbox kill
+.B agentsandbox kill
 .SS destroy
-Kill and delete guest files selected by flags (none by default).
-.br
-For the non-project instance, use \fB\-\-global\fR.
+Delete selected host-side instance data. No flags means no file deletion.
 .TP
-.BI agentsandbox destroy
-.BR -s , --system
+.B agentsandbox destroy
+.RS
+.TP
+.B -s, --system
 Remove sysroot.
 .TP
-.BR -d , --data
+.B -d, --data
 Remove persistent data.
 .TP
-.BR -l , --logs
-Remove the instance states such as logs.
+.B -l, --logs
+Remove state directory (including logs).
 .TP
-.BR -c , --conf
-Remove the resolved config dir.
-.br
-Note: command has alias \fBdestory\fR.
+.B -c, --conf
+Remove resolved config directory.
+.PP
+For non-project instance deletion, \fB--global\fR is required.
+.PP
+Alias: \fBdestory\fR.
+.RE
 .SS pause
-Pause running VMs for all hostnames in the current config.
+Pause running VMs for all hostnames in the resolved config.
 .TP
-.BI agentsandbox pause
+.B agentsandbox pause
 .SS unpause
-Unpause VMs for all hostnames in the current config.
+Resume paused VMs for all hostnames in the resolved config.
 .TP
-.BI agentsandbox unpause
+.B agentsandbox unpause
 .SS ps
-List VM statuses for all hostnames in the current config.
+List VM states for all hostnames in the resolved config.
 .TP
-.BI agentsandbox ps
+.B agentsandbox ps
 .SS ssh
-Run a command as a user in a running VM, or attach if omitted.
+Run command as guest user \fBvscode\fR, or attach shell if no args.
 .TP
-.BI agentsandbox ssh
-[\fIargs\fR...]
-.br
-The SSH port is selected from the guest's \fIport-forwards\fR configuration.
+.BI "agentsandbox ssh " [args...]
 .SS exec
-Run a command as root in a running VM, or attach if omitted.
+Run command as guest user \fBroot\fR, or attach shell if no args.
 .TP
-.BI agentsandbox exec
-[\fIargs\fR...]
-.br
-The SSH port is selected from the guest's \fIport-forwards\fR configuration.
+.BI "agentsandbox exec " [args...]
 .SS logs
-Show logs from a running VM.
+Run guest \fBjournalctl\fR via \fBexec\fR path.
 .TP
-.BI agentsandbox logs
-[\fIargs\fR...]
+.BI "agentsandbox logs " [args...]
 .br
-By default, runs journalctl with \fB\-en1000\fR and then applies extra args.
+Default args: \fB-en1000\fR.
 .SS stats
-Display percentage of CPU, memory, network I/O, block I/O and PIDs for VMs.
+Show selected \fBvirsh domstats\fR fields for resolved instances.
 .TP
-.BI agentsandbox stats
+.B agentsandbox stats
 .SS wait
-Block until the VM becomes one of the given states.
+Wait until VM state equals one of provided states.
 .TP
-.BI agentsandbox wait
-[\fIstates\fR...]
+.BI "agentsandbox wait " [states...]
 .br
-Wait for stop states by default.
+Default states: \fBdown\fR, \fBshut off\fR, \fBcrashed\fR.
 .br
-Default states:
-.nf
-down, shut off, crashed
-.fi
+State matching uses raw \fBvirsh domstate\fR text (plus synthetic
+\fBdown\fR when domain is absent).
 .SS mount
-Mount a file or directory into a running VM, or show mounts entries.
+Add/update mount entry, or print \fBmounts\fR file if no args.
 .TP
-.BI agentsandbox mount
-[\fIpath\fR] [\fIname\fR]
+.BI "agentsandbox mount " [path] [name]
 .br
-If \fIpath\fR and \fIname\fR are omitted, it prints the current \fImounts\fR
-entries from the resolved config.
+\fIpath\fR may be file or directory.
 .SS unmount
-Unmount a file or directory from a running VM now and on future starts.
+Remove mount entry for \fIpath\fR.
 .TP
-.BI agentsandbox unmount
-\fIpath\fR
-.SS port
-Print the public port for a port binding.
-.TP
-.BI agentsandbox port
-[\fIguest_port\fR] [\fIguest_proto\fR]
-.br
-Status: CLI entry exists, but runtime dispatch is not wired yet.
-.SS allow-domain
-Add a firewall rule that allows outbound traffic to a domain.
-.TP
-.BI agentsandbox allow-domain
-\fIdomain\fR
-.br
-Status: CLI entry exists, but runtime dispatch is not wired yet.
-.SS unallow-domain
-Remove the rule for the domain.
-.TP
-.BI agentsandbox unallow-domain
-\fIdomain\fR
-.br
-Status: CLI entry exists, but runtime dispatch is not wired yet.
-.SS proxy-logs
-Follow MITM proxy logs.
-.TP
-.BI agentsandbox proxy-logs
-.br
-Status: CLI entry exists, but runtime dispatch is not wired yet.
+.BI "agentsandbox unmount " path
 .SS verify
-Verify and repair build.
+Run store/system repair checks.
 .TP
-.BI agentsandbox verify
+.B agentsandbox verify
 .br
-Behavior:
+1) Runs host \fBnix-store --verify --check-contents --repair\fR against guest
+store root.
 .br
-1) Uses host \fBnix-store\fR to run verify/repair against the guest store.
-.br
-2) If the guest is running, runs \fBnixos-rebuild --repair\fR inside the guest.
-.br
-Limitations:
-.br
-It uses the host \fBnix\fR and related tools for store verification/repair.
-.br
-It does not analyze malicious \fBflake.nix\fR or other executables.
+2) If guest is running, runs guest
+\fBnixos-rebuild build --repair --flake /persistent/etc/nixos#<hostname>\fR.
+.SH KNOWN LIMITATIONS
+.TP
+Undispatched commands in CLI
+\fBport\fR, \fBallow-domain\fR, \fBunallow-domain\fR, \fBproxy-logs\fR.
+.TP
+SSH attach prerequisites
+\fBssh\fR/\fBexec\fR require guest \fBtcp/22\fR to be covered by resolved
+\fBport-forwards\fR data.
+.TP
+Host nix dependency
+When \fBflake.lock\fR is missing, \fBbuild\fR/\fBup\fR call host \fBnix flake lock\fR.
+.TP
+Verify running-state requirement
+\fBverify\fR fails after store verification if guest is not running.
+.SH NOT IMPLEMENTED
+These commands are visible in CLI help but currently fall through to a generic
+placeholder path:
+.TP
+.B port
+Port mapping query.
+.TP
+.B allow-domain
+Outbound domain allow rule add.
+.TP
+.B unallow-domain
+Outbound domain allow rule remove.
+.TP
+.B proxy-logs
+MITM proxy log follow.
+.SH ENVIRONMENT
+The following environment variables are used for path resolution:
+.TP
+\fBHOME\fR
+Fallback root for XDG directories.
+.TP
+\fBXDG_CONFIG_HOME\fR, \fBXDG_DATA_HOME\fR, \fBXDG_STATE_HOME\fR, \fBXDG_RUNTIME_DIR\fR
+Base paths for config/data/state/runtime roots.
 .SH FILES
 .TP
-\fI\&.agentsandbox/\fR
-Local config root created by \fBinit\fR when not using \fB\-\-global\fR.
+\fI<workspace>/.agentsandbox/\fR
+Local config directory created by \fBinit\fR.
 .TP
-.nf
-mounts
-allowed_hosts
-flake.nix
-configuration.nix
-.fi
-Template files written under the resolved config directory.
+\fI$XDG_CONFIG_HOME/agentsandbox/\fR
+Global config directory.
+.TP
+\fI<config>/mounts\fR
+Mount entry source of truth.
+.TP
+\fI<config>/allowed_hosts\fR
+Outbound policy input file.
+.TP
+\fI<config>/machine-prefix\fR
+Instance identity prefix seed.
 .SH EXIT STATUS
 .TP
 0
 Success.
 .TP
 1
-Failure (errors are printed to stderr).
+Error.
 .SH EXAMPLES
 .TP
-Build and start:
+Initialize local config:
+.nf
+agentsandbox init
+.fi
+.TP
+Build then start:
 .nf
 agentsandbox build
 agentsandbox up
 .fi
 .TP
-Mount a workspace subpath into the guest:
+Run command in guest:
 .nf
-agentsandbox mount ./alpha my-alpha
+agentsandbox exec -- uname -a
 .fi
 .TP
-Run a command in the guest:
+Add and remove mount entry:
 .nf
-agentsandbox ssh -- uname -a
+agentsandbox mount ./alpha sandbox-alpha
+agentsandbox unmount ./alpha
 .fi
 .SH SEE ALSO
 virsh(1), ssh(1), journalctl(1), nixos-rebuild(8)

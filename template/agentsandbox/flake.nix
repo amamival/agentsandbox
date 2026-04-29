@@ -63,7 +63,7 @@
             portForwardsFile = pkgs.writeText "port-forwards" (lib.concatStringsSep "\n" portForwards + "\n");
             portForwardsXml = lib.concatMapStrings
               (f: ''
-                <portForward proto='${lib.escapeXML f.proto}'>${
+                <portForward proto='${lib.escapeXML f.proto}' address='127.0.0.1' dev='lo'>${
                 if f.host.start == f.host.end then
                   "<range start='${toString f.host.start}' to='${toString f.guest}'/>"
                 else

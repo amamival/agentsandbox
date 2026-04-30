@@ -250,6 +250,7 @@ fn main() {
                 println!("{}", env!("CARGO_PKG_VERSION"));
                 Ok(())
             }
+            Some(Command::Doctor) => run_doctor(&env).context("doctor"),
             Some(Command::Init { force }) => run_init(&env, force).context("init"),
             Some(Command::Build { bootstrap }) => run_build_or_up(&env, bootstrap, false, false).context("build"),
             Some(Command::Up { detach }) => run_build_or_up(&env, false, true, !detach).context("up"),
@@ -257,17 +258,16 @@ fn main() {
             Some(Command::Kill) => run_virsh_action(&env, "destroy").context("kill"),
             Some(Command::Pause) => run_virsh_action_all(&env, "suspend").context("pause"),
             Some(Command::Unpause) => run_virsh_action_all(&env, "resume").context("unpause"),
-            Some(Command::Ps) => run_ps(&env).context("ps"),
-            Some(Command::Doctor) => run_doctor(&env).context("doctor"),
-            Some(Command::Mount { path, name }) => run_mount(&env, path, name, true).context("mount"),
-            Some(Command::Unmount { path }) => run_mount(&env, Some(path), None, false).context("unmount"),
             Some(Command::Destroy { system, data, logs, conf }) => run_destroy(&env, system, data, logs, conf).context("destroy"),
+            Some(Command::Ps) => run_ps(&env).context("ps"),
             Some(Command::Ssh { args }) => run_ssh(&env, &args, false, false).context("ssh"),
             Some(Command::Exec { args }) => run_ssh(&env, &args, true, false).context("exec"),
-            Some(Command::Port { guest_port, protocol }) => run_port(&env, guest_port, protocol.as_deref()).context("port"),
             Some(Command::Logs { args }) => run_logs(&env, &args).context("logs"),
             Some(Command::Stats) => run_stats(&env).context("stats"),
             Some(Command::Wait { states }) => run_wait(&resolve_instance(&env, &resolve_flake_dir(&env)?)?, &states).context("wait"),
+            Some(Command::Mount { path, name }) => run_mount(&env, path, name, true).context("mount"),
+            Some(Command::Unmount { path }) => run_mount(&env, Some(path), None, false).context("unmount"),
+            Some(Command::Port { guest_port, protocol }) => run_port(&env, guest_port, protocol.as_deref()).context("port"),
             Some(Command::Verify) => run_verify(&env).context("verify"),
             Some(Command::Audit { args }) => run_audit(&env, &args).context("audit"),
             None | Some(_) => {
@@ -300,33 +300,79 @@ fn resolve_env(cli: &Cli) -> anyhow::Result<Env> {
     })
 }
 
-// Create the config dir and initial files for local/global init, or return a displayable error.
 #[inline(never)]
-fn run_init(env: &Env, force: bool) -> anyhow::Result<()> {
-    let target = if env.is_global {
-        env.config_root.clone()
-    } else {
-        env.workspace.join(LOCAL_CONFIG_DIR)
+fn run_doctor(env: &Env) -> anyhow::Result<()> {
+    let resolve_cmd_path = |name: &str| -> String {
+        let output = process::Command::new("which").arg(name).output();
+        match output {
+            Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+            Ok(_) => "missing!".to_owned(),
+            Err(err) => format!("missing! ({err:#})"),
+        }
     };
-    write_template_config(&target, &env.workspace, force)?;
-    eprintln!("init: wrote template files to {}", target.display());
-    Ok(())
-}
+    println!("AppName:\t\t\t{}", APP_NAME);
+    println!("Version:\t\t\t{}", env!("CARGO_PKG_VERSION"));
+    println!("CmdVirshPath:\t\t\t{}", resolve_cmd_path("virsh"));
+    println!("CmdSshPath:\t\t\t{}", resolve_cmd_path("ssh"));
+    println!("CmdVirtiofsdPath:\t\t{}", resolve_cmd_path("virtiofsd"));
+    println!("CmdUnsharePath:\t\t\t{}", resolve_cmd_path("unshare"));
+    println!("CmdNixStorePathForVerifyCmd:\t{}", resolve_cmd_path("nix-store"));
+    println!("CmdVulnixPathForAuditCmd:\t{}", resolve_cmd_path("vulnix"));
 
-fn write_template_config(target: &Path, workspace: &Path, force: bool) -> anyhow::Result<()> {
-    if target.exists() && !force {
-        bail!("{} already exists", target.display());
+    println!("ResolvedConfigRoot:\t\t{}", env.config_root.display());
+    println!("ResolvedDataRoot:\t\t{}", env.data_root.display());
+    println!("ResolvedStateRoot:\t\t{}", env.state_root.display());
+    println!("ResolvedRuntimeRoot:\t\t{}", env.runtime_root.display());
+    println!("WorkspaceArg:\t\t\t{}", env.workspace.display());
+    println!("IsUserGlobalProject:\t\t{}", env.is_global);
+    println!("InstanceHostnameArg:\t\t{}", env.hostname);
+
+    let flake_dir = resolve_flake_dir(env);
+    match &flake_dir {
+        Err(err) => println!("ResolveFlakeDirError:\t\t{err:#}"),
+        Ok(flake_dir) => {
+            println!("ResolvedFlakeDir:\t\t{}", flake_dir.display());
+            println!("FileFlakeNixExists:\t\t{}", flake_dir.join("flake.nix").is_file());
+            println!("FileMountsExists:\t\t{}", flake_dir.join("mounts").is_file());
+            println!("FileMachinePrefixExists:\t{}", flake_dir.join("machine-prefix").is_file());
+            println!("FileAllowedHostsExists:\t\t{}", flake_dir.join("allowed_hosts").is_file());
+            println!("FileFlakeLockExists:\t\t{}", flake_dir.join("flake.lock").is_file());
+            match list_instance_ids(env, &flake_dir) {
+                Err(err) => println!("ListInstanceIdsError:\t\t{err:#}"),
+                Ok(ids) => println!("InstanceIds:\n\t{}", if ids.is_empty() { "none".into() } else { ids.join("\n\t") }),
+            }
+        }
     }
-    let workspace_name = workspace.file_name().and_then(|name| name.to_str()).context("derive workspace name")?;
-    fs::create_dir_all(target.join("agentsandbox")).context("create agentsandbox dir")?;
-    for (name, contents) in [
-        ("flake.nix", include_str!("../template/flake.nix").to_owned()),
-        ("configuration.nix", include_str!("../template/configuration.nix").to_owned()),
-        ("allowed_hosts", include_str!("../template/allowed_hosts").to_owned()),
-        ("mounts", format!("# <rel-host-path><TAB><guest-name>\n.\t{workspace_name}\n")),
-        ("agentsandbox/flake.nix", include_str!("../template/agentsandbox/flake.nix").to_owned()),
-    ] {
-        fs::write(target.join(name), contents).context("write template file")?;
+
+    let instance = flake_dir.ok().map(|flake_dir| resolve_instance(env, &flake_dir));
+    match instance {
+        None => println!("InstanceId:\t\t\tN/A"),
+        Some(Err(err)) => println!("ResolveInstanceError:\t\t{err:#}"),
+        Some(Ok(instance)) => {
+            println!("InstanceId:\t\t\t{}", instance.id);
+            println!("InstanceIsGlobal:\t\t{}", instance.is_global);
+            println!("InstanceDataDir:\t\t{}", instance.data_dir.display());
+            println!("InstanceSysrootDir:\t\t{}", instance.sysroot.display());
+            println!("InstancePersistentDir:\t\t{}", instance.persistent.display());
+            println!("InstanceStateDir:\t\t{}", instance.state_dir.display());
+            println!("InstanceLogsDir:\t\t{}", instance.logs_dir.display());
+            println!("InstanceRuntimeDir:\t\t{}", instance.runtime_dir.display());
+            match read_port_forwards_lookup(&instance, None, None) {
+                Ok((forwards, _)) => println!(
+                    "InstancePortForwards:\n{}",
+                    if forwards.is_empty() {
+                        "\tnone".into()
+                    } else {
+                        forwards
+                            .iter()
+                            .map(|(name, f)| format!("\t{name}\t{}\t{}:{}-{}\t{}", f.proto, f.address, f.host_start, f.host_end, f.guest))
+                            .collect::<Vec<String>>()
+                            .join("\n")
+                    }
+                ),
+                Err(err) => println!("ReadPortForwardsLookupError:\t{err:#}"),
+            }
+        }
     }
     Ok(())
 }
@@ -406,19 +452,58 @@ fn resolve_instance(env: &Env, flake_dir: &Path) -> anyhow::Result<Instance> {
     })
 }
 
-fn list_instance_ids(env: &Env, flake_dir: &Path) -> anyhow::Result<Vec<String>> {
-    let prefix = fs::read_to_string(flake_dir.join("machine-prefix")).context("read machine-prefix")?;
-    let prefix = prefix.trim();
-    Ok(fs::read_dir(&env.data_root)?
-        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
-        .filter(|id| id.get(id.len().saturating_sub(32)..id.len().saturating_sub(8)) == Some(prefix))
-        .collect())
+fn read_port_forwards_lookup(
+    instance: &Instance,
+    guest_port: Option<u16>,
+    protocol: Option<&str>,
+) -> anyhow::Result<(BTreeMap<String, PortForward>, Option<(String, u16)>)> {
+    let forwards: BTreeMap<String, PortForward> =
+        serde_json::from_str(&fs::read_to_string(read_domain_profile(instance)?.join("port-forwards")).context("read port-forwards")?)
+            .context("parse port-forwards json").unwrap_or(BTreeMap::from([("ssh".into(), PortForward { proto: "tcp".to_owned(), address: "127.0.0.1".to_owned(), dev: None, host_start: 2223, host_end: 2223, guest: 22 })]));
+    match guest_port {
+        Some(guest_port) => {
+            for (_, f) in forwards {
+                if protocol.is_some_and(|proto| f.proto != proto) {
+                    continue;
+                }
+                let count = f.host_end - f.host_start + 1;
+                if f.guest <= guest_port && guest_port <= f.guest + count - 1 {
+                    return Ok((BTreeMap::new(), Some((f.address.clone(), f.host_start + (guest_port - f.guest)))));
+                }
+            }
+            Ok((BTreeMap::new(), None))
+        }
+        None => Ok((forwards, None)),
+    }
 }
 
-// Prepare the minimal instance directories before sysroot build, virtiofsd, or log writers touch them.
-fn prepare(instance: &Instance) -> anyhow::Result<()> {
-    for dir in [&instance.sysroot, &instance.persistent, &instance.logs_dir, &instance.runtime_dir] {
-        fs::create_dir_all(dir)?;
+// Create the config dir and initial files for local/global init, or return a displayable error.
+#[inline(never)]
+fn run_init(env: &Env, force: bool) -> anyhow::Result<()> {
+    let target = if env.is_global {
+        env.config_root.clone()
+    } else {
+        env.workspace.join(LOCAL_CONFIG_DIR)
+    };
+    write_template_config(&target, &env.workspace, force)?;
+    eprintln!("init: wrote template files to {}", target.display());
+    Ok(())
+}
+
+fn write_template_config(target: &Path, workspace: &Path, force: bool) -> anyhow::Result<()> {
+    if target.exists() && !force {
+        bail!("{} already exists", target.display());
+    }
+    let workspace_name = workspace.file_name().and_then(|name| name.to_str()).context("derive workspace name")?;
+    fs::create_dir_all(target.join("agentsandbox")).context("create agentsandbox dir")?;
+    for (name, contents) in [
+        ("flake.nix", include_str!("../template/flake.nix").to_owned()),
+        ("configuration.nix", include_str!("../template/configuration.nix").to_owned()),
+        ("allowed_hosts", include_str!("../template/allowed_hosts").to_owned()),
+        ("mounts", format!("# <rel-host-path><TAB><guest-name>\n.\t{workspace_name}\n")),
+        ("agentsandbox/flake.nix", include_str!("../template/agentsandbox/flake.nix").to_owned()),
+    ] {
+        fs::write(target.join(name), contents).context("write template file")?;
     }
     Ok(())
 }
@@ -428,7 +513,10 @@ fn run_build_or_up(env: &Env, bootstrap: bool, is_up: bool, attach: bool) -> any
     let is_switch = is_up;
     let flake_dir = resolve_flake_dir(env)?;
     let instance = resolve_instance(env, &flake_dir)?;
-    prepare(&instance).context("prepare instance directories")?;
+    // Prepare the minimal instance directories before sysroot build, virtiofsd, or log writers touch them.
+    for dir in [&instance.sysroot, &instance.persistent, &instance.logs_dir, &instance.runtime_dir] {
+        fs::create_dir_all(dir).context("prepare instance directories")?;
+    }
     if !instance.sysroot.join("nix/var/nix/profiles/default").is_symlink() {
         fetch_nix_dockerhub(&instance.sysroot).context("fetch")?;
     }
@@ -483,34 +571,6 @@ fn run_build_or_up(env: &Env, bootstrap: bool, is_up: bool, attach: bool) -> any
         domstate => bail!("VM is {domstate}; expected running, down, shut off, or crashed"),
     };
     Ok(())
-}
-
-/// Read the NixOS profile which the domain is created with.
-fn read_domain_profile(instance: &Instance) -> anyhow::Result<PathBuf> {
-    fs::read_link(instance.runtime_dir.join("domain-profile")).context("read domain-profile symlink")
-}
-
-/// Read the NixOS profile to be used to start the VM next time.
-fn read_system_profile(instance: &Instance) -> anyhow::Result<PathBuf> {
-    let mut path = instance.sysroot.join("nix/var/nix/profiles/system");
-    for _ in 0..16 {
-        let target = fs::read_link(&path).context("read system profile symlink")?;
-        path = if target.is_absolute() {
-            instance
-                .sysroot
-                .join(target.strip_prefix("/").context("resolve absolute system profile symlink target")?)
-        } else {
-            path.parent().context("resolve relative system profile symlink parent")?.join(target)
-        };
-        if !fs::symlink_metadata(&path)
-            .context("read resolved system profile metadata")?
-            .file_type()
-            .is_symlink()
-        {
-            return Ok(path);
-        }
-    }
-    bail!("system profile symlink chain is too deep")
 }
 
 #[inline(never)]
@@ -622,6 +682,78 @@ fn install_initial_nixos_profile(workspace: &Path, sysroot: &Path, hostname: &st
     })
     .context("install")?;
     Ok(())
+}
+
+#[inline(never)]
+fn domstate(instance_id: &str) -> anyhow::Result<String> {
+    let output = process::Command::new("virsh")
+        .arg("domstate")
+        .arg(instance_id)
+        .output()
+        .context("run virsh domstate")?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("failed to get domain") {
+        Ok("down".to_owned())
+    } else {
+        bail!("{}", stderr.trim())
+    }
+}
+
+/// Read the NixOS profile to be used to start the VM next time.
+fn read_system_profile(instance: &Instance) -> anyhow::Result<PathBuf> {
+    let mut path = instance.sysroot.join("nix/var/nix/profiles/system");
+    for _ in 0..16 {
+        let target = fs::read_link(&path).context("read system profile symlink")?;
+        path = if target.is_absolute() {
+            instance
+                .sysroot
+                .join(target.strip_prefix("/").context("resolve absolute system profile symlink target")?)
+        } else {
+            path.parent().context("resolve relative system profile symlink parent")?.join(target)
+        };
+        if !fs::symlink_metadata(&path)
+            .context("read resolved system profile metadata")?
+            .file_type()
+            .is_symlink()
+        {
+            return Ok(path);
+        }
+    }
+    bail!("system profile symlink chain is too deep")
+}
+
+/// Read the NixOS profile which the domain is created with.
+fn read_domain_profile(instance: &Instance) -> anyhow::Result<PathBuf> {
+    fs::read_link(instance.runtime_dir.join("domain-profile")).context("read domain-profile symlink")
+}
+
+#[inline(never)]
+fn virsh(args: &[&str]) -> anyhow::Result<()> {
+    let status = process::Command::new("virsh")
+        .args(args)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("run virsh")?;
+    if !status.success() {
+        bail!(
+            "virsh failed with status {}",
+            status.code().map_or("signal".to_owned(), |code| code.to_string())
+        );
+    }
+    Ok(())
+}
+
+fn list_instance_ids(env: &Env, flake_dir: &Path) -> anyhow::Result<Vec<String>> {
+    let prefix = fs::read_to_string(flake_dir.join("machine-prefix")).context("read machine-prefix")?;
+    let prefix = prefix.trim();
+    Ok(fs::read_dir(&env.data_root)?
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter(|id| id.get(id.len().saturating_sub(32)..id.len().saturating_sub(8)) == Some(prefix))
+        .collect())
 }
 
 fn spawn_mapped_namespace<F>(map_root: bool, wait_child: bool, child: F) -> anyhow::Result<Pid>
@@ -836,19 +968,6 @@ fn start_vm(env: &Env, flake_dir: &Path, instance: &Instance, is_build: bool) ->
     Ok(system_profile)
 }
 
-/// Get compatible uid/gid maps from host.
-fn capture_host_idmap(path: &str, map_root: bool) -> anyhow::Result<String> {
-    let output = process::Command::new("unshare")
-        .args(["--map-auto", if map_root { "--map-root-user" } else { "--map-current-user" }, "cat", path])
-        .output()
-        .context(format!("resolve host idmap from {path}"))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
-    } else {
-        bail!("unshare cat {path} failed: {}", String::from_utf8_lossy(&output.stderr).trim())
-    }
-}
-
 /// Apply mounts from mounts file to the guest system.
 fn apply_mounts(env: &Env, flake_dir: &Path, instance: &Instance, system_profile: &Path) -> anyhow::Result<()> {
     let mounts_path = flake_dir.join("mounts");
@@ -956,11 +1075,17 @@ fn apply_mounts(env: &Env, flake_dir: &Path, instance: &Instance, system_profile
     Ok(())
 }
 
-fn validate_mount_source_field(value: &str) -> anyhow::Result<()> {
-    if value.is_empty() || value.contains('\t') || value.contains('\n') {
-        bail!("invalid mount source: contains control separator characters or empty");
+/// Get compatible uid/gid maps from host.
+fn capture_host_idmap(path: &str, map_root: bool) -> anyhow::Result<String> {
+    let output = process::Command::new("unshare")
+        .args(["--map-auto", if map_root { "--map-root-user" } else { "--map-current-user" }, "cat", path])
+        .output()
+        .context(format!("resolve host idmap from {path}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    } else {
+        bail!("unshare cat {path} failed: {}", String::from_utf8_lossy(&output.stderr).trim())
     }
-    Ok(())
 }
 
 fn validate_mount_name_field(value: &str) -> anyhow::Result<()> {
@@ -968,6 +1093,156 @@ fn validate_mount_name_field(value: &str) -> anyhow::Result<()> {
         bail!("invalid mount name: contains control separator characters or empty");
     }
     Ok(())
+}
+
+fn run_virsh_action(env: &Env, action: &str) -> anyhow::Result<()> {
+    let instance = resolve_instance(env, &resolve_flake_dir(env)?)?;
+    virsh(&[action, &instance.id])?;
+    match action {
+        "shutdown" => run_wait(&instance, &["down", "shut off", "crashed"]),
+        _ => Ok(()),
+    }
+}
+
+fn run_virsh_action_all(env: &Env, action: &str) -> anyhow::Result<()> {
+    let flake_dir = resolve_flake_dir(env)?;
+    for id in list_instance_ids(env, &flake_dir)? {
+        virsh(&[action, &id])?;
+    }
+    Ok(())
+}
+
+#[inline(never)]
+fn run_destroy(env: &Env, system: bool, data: bool, logs: bool, conf: bool) -> anyhow::Result<()> {
+    let flake_dir = resolve_flake_dir(env)?;
+    let instance = resolve_instance(env, &flake_dir)?;
+    let _ = virsh(&["destroy", &instance.id]);
+    if instance.is_global && !env.is_global {
+        bail!("destroy files for the non-project instance requires --global");
+    }
+    if system {
+        spawn_mapped_namespace(false, true, || remove_dir_all_if_exists(&instance.sysroot)).context("destroy sysroot")?;
+    }
+    if data {
+        spawn_mapped_namespace(true, true, || remove_dir_all_if_exists(&instance.persistent)).context("destroy persistent")?;
+    }
+    if system && data {
+        remove_dir_all_if_exists(&instance.data_dir)?;
+    }
+    if logs {
+        remove_dir_all_if_exists(&instance.state_dir)?;
+    }
+    if conf {
+        remove_dir_all_if_exists(&flake_dir)?;
+    }
+    Ok(())
+}
+
+fn remove_dir_all_if_exists(path: &Path) -> anyhow::Result<()> {
+    if path.exists() {
+        eprintln!("remove: removing {}", path.display());
+        fs::remove_dir_all(path)?;
+    }
+    Ok(())
+}
+
+#[inline(never)]
+fn run_ps(env: &Env) -> anyhow::Result<()> {
+    let flake_dir = resolve_flake_dir(env)?;
+    for id in list_instance_ids(env, &flake_dir)? {
+        println!("{id}\t{}", domstate(&id)?);
+    }
+    Ok(())
+}
+
+#[inline(never)]
+fn run_ssh<S: AsRef<str>>(env: &Env, args: &[S], is_root: bool, inherit_tty: bool) -> anyhow::Result<()> {
+    let flake_dir = resolve_flake_dir(env)?;
+    let instance = resolve_instance(env, &flake_dir)?;
+    run_wait(&instance, &["running"])?;
+    let (address, ssh_port) = (read_port_forwards_lookup(&instance, Some(22), Some("tcp"))?.1)
+        .ok_or_else(|| anyhow::anyhow!("ssh port forward for guest tcp/22 is not configured"))?;
+    let user = if is_root { "root" } else { "vscode" };
+    for attempt in 1..=120 {
+        let status = process::Command::new("ssh")
+            .arg(format!("{user}@{address}"))
+            .arg("-p")
+            .arg(ssh_port.to_string())
+            .args((inherit_tty && std::io::stdin().is_terminal()).then_some("-t"))
+            .args(["-o", "ConnectTimeout=1", "-o", "LogLevel=ERROR"])
+            .args(["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"])
+            .args(args.iter().map(AsRef::as_ref))
+            .stdin(Stdio::inherit()) // allow ssh to read input and ioctl.
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .context("run ssh")?;
+        if status.success() {
+            return Ok(());
+        }
+        if status.code() != Some(255) || domstate(&instance.id)? != "running" || attempt == 120 {
+            let status_text = status.code().map_or("signal".to_owned(), |code| code.to_string());
+            bail!("ssh failed with status {status_text}");
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    bail!("ssh did not become ready for {}", env.hostname)
+}
+
+#[inline(never)]
+fn run_logs<S: AsRef<str>>(env: &Env, args: &[S]) -> anyhow::Result<()> {
+    let mut command: Vec<&str> = vec!["journalctl"];
+    command.extend(args.iter().map(AsRef::as_ref));
+    run_ssh(env, &command, true, true)
+}
+
+#[inline(never)]
+fn run_stats(env: &Env) -> anyhow::Result<()> {
+    let flake_dir = resolve_flake_dir(env)?;
+    for id in list_instance_ids(env, &flake_dir)? {
+        let output = process::Command::new("virsh")
+            .args(["domstats", &id, "--raw", "--state", "--cpu-total", "--vcpu", "--balloon"])
+            .output()
+            .context("run virsh domstats")?;
+        if !output.status.success() {
+            eprintln!("{}", String::from_utf8_lossy(&output.stderr).trim());
+            continue;
+        }
+        let stats: std::collections::HashMap<String, String> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter_map(|line| line.split_once('='))
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect();
+        println!("Domain:\t{id}");
+        for (label, key) in [
+            ("StateCode", "state.state"),
+            ("StateReason", "state.reason"),
+            ("CpuTimeNs", "cpu.time"),
+            ("CpuUserNs", "cpu.user"),
+            ("CpuSystemNs", "cpu.system"),
+            ("VcpuCurrent", "vcpu.current"),
+            ("VcpuMaximum", "vcpu.maximum"),
+            ("MemCurrentKiB", "balloon.current"),
+            ("MemRssKiB", "balloon.rss"),
+            ("MemAvailableKiB", "balloon.available"),
+            ("MemUsableKiB", "balloon.usable"),
+        ] {
+            println!("{label}:\t{}", stats.get(key).map(String::as_str).unwrap_or("N/A"));
+        }
+    }
+    Ok(())
+}
+
+#[inline(never)]
+fn run_wait<S: AsRef<str>>(instance: &Instance, states: &[S]) -> anyhow::Result<()> {
+    loop {
+        let state = domstate(&instance.id)?;
+        if states.iter().any(|expected| expected.as_ref() == state.as_str()) {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
 }
 
 #[inline(never)]
@@ -1058,148 +1333,24 @@ fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bo
     Ok(())
 }
 
-fn run_virsh_action(env: &Env, action: &str) -> anyhow::Result<()> {
-    let instance = resolve_instance(env, &resolve_flake_dir(env)?)?;
-    virsh(&[action, &instance.id])?;
-    match action {
-        "shutdown" => run_wait(&instance, &["down", "shut off", "crashed"]),
-        _ => Ok(()),
-    }
-}
-
-fn run_virsh_action_all(env: &Env, action: &str) -> anyhow::Result<()> {
-    let flake_dir = resolve_flake_dir(env)?;
-    for id in list_instance_ids(env, &flake_dir)? {
-        virsh(&[action, &id])?;
+fn validate_mount_source_field(value: &str) -> anyhow::Result<()> {
+    if value.is_empty() || value.contains('\t') || value.contains('\n') {
+        bail!("invalid mount source: contains control separator characters or empty");
     }
     Ok(())
 }
 
 #[inline(never)]
-fn run_ps(env: &Env) -> anyhow::Result<()> {
+fn run_port(env: &Env, guest_port: Option<u16>, protocol: Option<&str>) -> anyhow::Result<()> {
     let flake_dir = resolve_flake_dir(env)?;
-    for id in list_instance_ids(env, &flake_dir)? {
-        println!("{id}\t{}", domstate(&id)?);
-    }
-    Ok(())
-}
-
-#[inline(never)]
-fn run_logs<S: AsRef<str>>(env: &Env, args: &[S]) -> anyhow::Result<()> {
-    let mut command: Vec<&str> = vec!["journalctl"];
-    command.extend(args.iter().map(AsRef::as_ref));
-    run_ssh(env, &command, true, false)
-}
-
-#[inline(never)]
-fn run_stats(env: &Env) -> anyhow::Result<()> {
-    let flake_dir = resolve_flake_dir(env)?;
-    for id in list_instance_ids(env, &flake_dir)? {
-        let output = process::Command::new("virsh")
-            .args(["domstats", &id, "--raw", "--state", "--cpu-total", "--vcpu", "--balloon"])
-            .output()
-            .context("run virsh domstats")?;
-        if !output.status.success() {
-            eprintln!("{}", String::from_utf8_lossy(&output.stderr).trim());
-            continue;
-        }
-        let stats: std::collections::HashMap<String, String> = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .map(str::trim)
-            .filter_map(|line| line.split_once('='))
-            .map(|(key, value)| (key.to_owned(), value.to_owned()))
-            .collect();
-        println!("Domain:\t{id}");
-        for (label, key) in [
-            ("StateCode", "state.state"),
-            ("StateReason", "state.reason"),
-            ("CpuTimeNs", "cpu.time"),
-            ("CpuUserNs", "cpu.user"),
-            ("CpuSystemNs", "cpu.system"),
-            ("VcpuCurrent", "vcpu.current"),
-            ("VcpuMaximum", "vcpu.maximum"),
-            ("MemCurrentKiB", "balloon.current"),
-            ("MemRssKiB", "balloon.rss"),
-            ("MemAvailableKiB", "balloon.available"),
-            ("MemUsableKiB", "balloon.usable"),
-        ] {
-            println!("{label}:\t{}", stats.get(key).map(String::as_str).unwrap_or("N/A"));
-        }
-    }
-    Ok(())
-}
-
-#[inline(never)]
-fn run_doctor(env: &Env) -> anyhow::Result<()> {
-    let resolve_cmd_path = |name: &str| -> String {
-        let output = process::Command::new("which").arg(name).output();
-        match output {
-            Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout).trim().to_owned(),
-            Ok(_) => "missing!".to_owned(),
-            Err(err) => format!("missing! ({err:#})"),
-        }
-    };
-    println!("AppName:\t\t\t{}", APP_NAME);
-    println!("Version:\t\t\t{}", env!("CARGO_PKG_VERSION"));
-    println!("CmdVirshPath:\t\t\t{}", resolve_cmd_path("virsh"));
-    println!("CmdSshPath:\t\t\t{}", resolve_cmd_path("ssh"));
-    println!("CmdVirtiofsdPath:\t\t{}", resolve_cmd_path("virtiofsd"));
-    println!("CmdUnsharePath:\t\t\t{}", resolve_cmd_path("unshare"));
-    println!("CmdNixStorePathForVerifyCmd:\t{}", resolve_cmd_path("nix-store"));
-    println!("CmdVulnixPathForAuditCmd:\t{}", resolve_cmd_path("vulnix"));
-
-    println!("ResolvedConfigRoot:\t\t{}", env.config_root.display());
-    println!("ResolvedDataRoot:\t\t{}", env.data_root.display());
-    println!("ResolvedStateRoot:\t\t{}", env.state_root.display());
-    println!("ResolvedRuntimeRoot:\t\t{}", env.runtime_root.display());
-    println!("WorkspaceArg:\t\t\t{}", env.workspace.display());
-    println!("IsUserGlobalProject:\t\t{}", env.is_global);
-    println!("InstanceHostnameArg:\t\t{}", env.hostname);
-
-    let flake_dir = resolve_flake_dir(env);
-    match &flake_dir {
-        Err(err) => println!("ResolveFlakeDirError:\t\t{err:#}"),
-        Ok(flake_dir) => {
-            println!("ResolvedFlakeDir:\t\t{}", flake_dir.display());
-            println!("FileFlakeNixExists:\t\t{}", flake_dir.join("flake.nix").is_file());
-            println!("FileMountsExists:\t\t{}", flake_dir.join("mounts").is_file());
-            println!("FileMachinePrefixExists:\t{}", flake_dir.join("machine-prefix").is_file());
-            println!("FileAllowedHostsExists:\t\t{}", flake_dir.join("allowed_hosts").is_file());
-            println!("FileFlakeLockExists:\t\t{}", flake_dir.join("flake.lock").is_file());
-            match list_instance_ids(env, &flake_dir) {
-                Err(err) => println!("ListInstanceIdsError:\t\t{err:#}"),
-                Ok(ids) => println!("InstanceIds:\n\t{}", if ids.is_empty() { "none".into() } else { ids.join("\n\t") }),
-            }
-        }
-    }
-
-    let instance = flake_dir.ok().map(|flake_dir| resolve_instance(env, &flake_dir));
-    match instance {
-        None => println!("InstanceId:\t\t\tN/A"),
-        Some(Err(err)) => println!("ResolveInstanceError:\t\t{err:#}"),
-        Some(Ok(instance)) => {
-            println!("InstanceId:\t\t\t{}", instance.id);
-            println!("InstanceIsGlobal:\t\t{}", instance.is_global);
-            println!("InstanceDataDir:\t\t{}", instance.data_dir.display());
-            println!("InstanceSysrootDir:\t\t{}", instance.sysroot.display());
-            println!("InstancePersistentDir:\t\t{}", instance.persistent.display());
-            println!("InstanceStateDir:\t\t{}", instance.state_dir.display());
-            println!("InstanceLogsDir:\t\t{}", instance.logs_dir.display());
-            println!("InstanceRuntimeDir:\t\t{}", instance.runtime_dir.display());
-            match read_port_forwards_lookup(&instance, None, None) {
-                Ok((forwards, _)) => println!(
-                    "InstancePortForwards:\n{}",
-                    if forwards.is_empty() {
-                        "\tnone".into()
-                    } else {
-                        forwards
-                            .iter()
-                            .map(|(name, f)| format!("\t{name}\t{}\t{}:{}-{}\t{}", f.proto, f.address, f.host_start, f.host_end, f.guest))
-                            .collect::<Vec<String>>()
-                            .join("\n")
-                    }
-                ),
-                Err(err) => println!("ReadPortForwardsLookupError:\t{err:#}"),
+    let instance = resolve_instance(env, &flake_dir)?;
+    match read_port_forwards_lookup(&instance, guest_port, protocol)? {
+        (_, Some((address, host_port))) => println!("{address}:{host_port}"),
+        (forwards, _) => {
+            for (name, f) in forwards {
+                for host_port in f.host_start..=f.host_end {
+                    println!("{name}\t{}\t{}:{host_port}\t{}", f.proto, f.address, f.dev.clone().unwrap_or_default());
+                }
             }
         }
     }
@@ -1229,162 +1380,6 @@ fn run_verify(env: &Env) -> anyhow::Result<()> {
     let flake = format!("/persistent/etc/nixos#{}", env.hostname);
     run_ssh(env, &["nixos-rebuild", "build", "--repair", "--flake", &flake], true, true)?;
     eprintln!("verify: nixos-rebuild build --repair succeeded (no remaining system profile corruptions)");
-    Ok(())
-}
-
-#[inline(never)]
-fn run_destroy(env: &Env, system: bool, data: bool, logs: bool, conf: bool) -> anyhow::Result<()> {
-    let flake_dir = resolve_flake_dir(env)?;
-    let instance = resolve_instance(env, &flake_dir)?;
-    let _ = virsh(&["destroy", &instance.id]);
-    if instance.is_global && !env.is_global {
-        bail!("destroy files for the non-project instance requires --global");
-    }
-    if system {
-        spawn_mapped_namespace(false, true, || remove_dir_all_if_exists(&instance.sysroot)).context("destroy sysroot")?;
-    }
-    if data {
-        spawn_mapped_namespace(true, true, || remove_dir_all_if_exists(&instance.persistent)).context("destroy persistent")?;
-    }
-    if system && data {
-        remove_dir_all_if_exists(&instance.data_dir)?;
-    }
-    if logs {
-        remove_dir_all_if_exists(&instance.state_dir)?;
-    }
-    if conf {
-        remove_dir_all_if_exists(&flake_dir)?;
-    }
-    Ok(())
-}
-
-fn read_port_forwards_lookup(
-    instance: &Instance,
-    guest_port: Option<u16>,
-    protocol: Option<&str>,
-) -> anyhow::Result<(BTreeMap<String, PortForward>, Option<(String, u16)>)> {
-    let forwards: BTreeMap<String, PortForward> =
-        serde_json::from_str(&fs::read_to_string(read_domain_profile(instance)?.join("port-forwards")).context("read port-forwards")?)
-            .context("parse port-forwards json").unwrap_or(BTreeMap::from([("ssh".into(), PortForward { proto: "tcp".to_owned(), address: "127.0.0.1".to_owned(), dev: None, host_start: 2223, host_end: 2223, guest: 22 })]));
-    match guest_port {
-        Some(guest_port) => {
-            for (_, f) in forwards {
-                if protocol.is_some_and(|proto| f.proto != proto) {
-                    continue;
-                }
-                let count = f.host_end - f.host_start + 1;
-                if f.guest <= guest_port && guest_port <= f.guest + count - 1 {
-                    return Ok((BTreeMap::new(), Some((f.address.clone(), f.host_start + (guest_port - f.guest)))));
-                }
-            }
-            Ok((BTreeMap::new(), None))
-        }
-        None => Ok((forwards, None)),
-    }
-}
-
-#[inline(never)]
-fn run_port(env: &Env, guest_port: Option<u16>, protocol: Option<&str>) -> anyhow::Result<()> {
-    let flake_dir = resolve_flake_dir(env)?;
-    let instance = resolve_instance(env, &flake_dir)?;
-    match read_port_forwards_lookup(&instance, guest_port, protocol)? {
-        (_, Some((address, host_port))) => println!("{address}:{host_port}"),
-        (forwards, _) => {
-            for (name, f) in forwards {
-                for host_port in f.host_start..=f.host_end {
-                    println!("{name}\t{}\t{}:{host_port}\t{}", f.proto, f.address, f.dev.clone().unwrap_or_default());
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-#[inline(never)]
-fn run_ssh<S: AsRef<str>>(env: &Env, args: &[S], is_root: bool, inherit_tty: bool) -> anyhow::Result<()> {
-    let flake_dir = resolve_flake_dir(env)?;
-    let instance = resolve_instance(env, &flake_dir)?;
-    run_wait(&instance, &["running"])?;
-    let (address, ssh_port) = (read_port_forwards_lookup(&instance, Some(22), Some("tcp"))?.1)
-        .ok_or_else(|| anyhow::anyhow!("ssh port forward for guest tcp/22 is not configured"))?;
-    let user = if is_root { "root" } else { "vscode" };
-    for attempt in 1..=120 {
-        let status = process::Command::new("ssh")
-            .arg(format!("{user}@{address}"))
-            .arg("-p")
-            .arg(ssh_port.to_string())
-            .args((inherit_tty && std::io::stdin().is_terminal()).then_some("-t"))
-            .args(["-o", "ConnectTimeout=1", "-o", "LogLevel=ERROR"])
-            .args(["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"])
-            .args(args.iter().map(AsRef::as_ref))
-            .stdin(Stdio::inherit()) // allow ssh to read input and ioctl.
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .context("run ssh")?;
-        if status.success() {
-            return Ok(());
-        }
-        if status.code() != Some(255) || domstate(&instance.id)? != "running" || attempt == 120 {
-            let status_text = status.code().map_or("signal".to_owned(), |code| code.to_string());
-            bail!("ssh failed with status {status_text}");
-        }
-        std::thread::sleep(std::time::Duration::from_secs(1));
-    }
-    bail!("ssh did not become ready for {}", env.hostname)
-}
-
-#[inline(never)]
-fn domstate(instance_id: &str) -> anyhow::Result<String> {
-    let output = process::Command::new("virsh")
-        .arg("domstate")
-        .arg(instance_id)
-        .output()
-        .context("run virsh domstate")?;
-    if output.status.success() {
-        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains("failed to get domain") {
-        Ok("down".to_owned())
-    } else {
-        bail!("{}", stderr.trim())
-    }
-}
-
-#[inline(never)]
-fn run_wait<S: AsRef<str>>(instance: &Instance, states: &[S]) -> anyhow::Result<()> {
-    loop {
-        let state = domstate(&instance.id)?;
-        if states.iter().any(|expected| expected.as_ref() == state.as_str()) {
-            return Ok(());
-        }
-        std::thread::sleep(std::time::Duration::from_secs(1));
-    }
-}
-
-fn remove_dir_all_if_exists(path: &Path) -> anyhow::Result<()> {
-    if path.exists() {
-        eprintln!("remove: removing {}", path.display());
-        fs::remove_dir_all(path)?;
-    }
-    Ok(())
-}
-
-#[inline(never)]
-fn virsh(args: &[&str]) -> anyhow::Result<()> {
-    let status = process::Command::new("virsh")
-        .args(args)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .context("run virsh")?;
-    if !status.success() {
-        bail!(
-            "virsh failed with status {}",
-            status.code().map_or("signal".to_owned(), |code| code.to_string())
-        );
-    }
     Ok(())
 }
 

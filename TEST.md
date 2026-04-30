@@ -1,28 +1,99 @@
 # Tests
 
-This file defines a single end-to-end scenario sequence that exercises every `agentsandbox` subcommand in one run. It is written from the user perspective and assumes a local Linux host with a writable workspace.
+This file defines a end-to-end scenario sequence that exercises every subcommand.
+
+## Requirements
+
+- Archtecture: x86_64
+- Kernel: Linux 6.1 or later
+- Volume: writable home directory
 
 ## Scenario
 
-1. Start in a clean project directory.
-   - Create a new empty directory and `cd` into it.
-   - Confirm that no `.agentsandbox/` directory exists yet.
+0. Check installation
+   - Run `nix shell <repo>` where `<repo>` is the path to the clone of this repository
+   - Run `agentsandbox --help` and verify that the help message is printed
+   - Run `agentsandbox help` and verify that the help message is printed
+   - Run `agentsandbox --version` and verify that the version string is printed
+   - Run `agentsandbox version` and verify that the version string is printed
+   - Run `agentsandbox doctor` and verify that `Cmd*` dependencies are available
+     (we'll see other fields in the output later)
 
-2. Initialize the workspace.
-   - Run `agentsandbox init`.
-   - Verify that `.agentsandbox/flake.nix`, `.agentsandbox/configuration.nix`, `.agentsandbox/allowed_hosts`, and `.agentsandbox/mounts` were created.
-   - Verify that `allowed_hosts` is deny-by-default and `mounts` contains the header line
-     `# <rel-host-path><TAB><guest-name>` and a default workspace line `.\t` plus the workspace directory
-     name (the final path component of the project directory).
-   - Here, deny-by-default means that removing every active `allowed_hosts` entry must still block unmatched hosts rather than falling back to allow-all.
+1. Using the project workspace
+   - Create a new empty directory and `cd` into it
+   - Confirm that no `.agentsandbox/` directory exists yet
+   - Run `agentsandbox init`
+   - Verify that `.agentsandbox/{flake.nix,configuration.nix,allowed_hosts,mounts}` were created
+   - Run `agentsandbox doctor` and verify that `ResolvedFlakeDir` is the local `.agentsandbox/` directory
+   - Run `agentsandbox doctor` and verify that `InstanceId` (starts with `<dirname>-`),
+     `Instance{Data,State,Runtime}Dir` appear in the output
+   - Run `agentsandbox init` again and verify that the message "init: $PWD/.agentsandbox already exists" is printed
+   - Run `agentsandbox init -f` and verify that the message "init: wrote template files to $PWD/.agentsandbox" is printed
+     and timestamps of the files are updated
+   - Temporarily `cd` to a different directory and verify that `agentsandbox doctor` reports *different* `ResolvedFlakeDir`
+   - In the temporary directory, verify that `agentsandbox doctor -w <original-dir>` reports *same* `ResolvedFlakeDir` as before
+   - Run ` agentsandbox destroy -c` and verify that the local `.agentsandbox/` directory is removed
+
+2. Using the global workspace
+   - Create a new empty directory and `cd` into it
+   - Confirm that no `.agentsandbox/` directory exists yet
+   - Run `agentsandbox init --global`
+   - Verify that `$XDG_CONFIG_HOME/agentsandbox/{flake.nix,configuration.nix,allowed_hosts,mounts}`
+     were created (`$XDG_CONFIG_HOME` is typically `~/.config/`)
+   - Run `agentsandbox doctor` (note that without `-g` flag) and verify that `ResolvedFlakeDir` is the
+     global `$XDG_CONFIG_HOME/agentsandbox/` directory
+   - Run `agentsandbox doctor` and verify that `InstanceId` (starts with `agentsandbox-`), and
+     `Instance{Data,State,Runtime}Dir` appear in the output
+   - Run `agentsandbox init --global` again and verify that the message "init: $XDG_CONFIG_HOME/agentsandbox already exists" is printed
+   - Run `agentsandbox init --global -f` and verify that the message "init: wrote template files to $XDG_CONFIG_HOME/agentsandbox" is printed
+     and timestamps of the files are updated
+   - `cd` to a different directory without `.agentsandbox/` and verify that `agentsandbox doctor` reports *same* `ResolvedFlakeDir` as before
+   - Run ` agentsandbox destroy -gc` and verify that the global `$XDG_CONFIG_HOME/agentsandbox/` directory is removed
+
+3. Build the initial guest system
+   - Create a new empty directory and `cd` into it
+   - Run `agentsandbox init`
+   - Run `agentsandbox build` and be patient as it takes a while
+   - Optionally examine generated `domain.xml`, `agentsandbox ps`, and `virsh console <domain>` in other terminals
+   - Finally it destroys the new domain. Example output:
+```
+Domain 'test-default-3dfcf2a48071b66ed848db7937a8eec1' created from /run/user/1000/agentsandbox/test-default-3dfcf2a48071b66ed848db7937a8eec1/domain.xml
+
+Connection timed out during banner exchange
+Connection timed out during banner exchange
+Connection timed out during banner exchange
+Connection timed out during banner exchange
+building the system configuration...
+Done. The new configuration is /nix/store/kapg52qccy514hm0rqwaaxj8xcghvk7z-nixos-system-agentsandbox-25.11.20260429.755f5aa
+/home/user/.local/share/agentsandbox/test-default-3dfcf2a48071b66ed848db7937a8eec1/sysroot/nix/store/kapg52qccy514hm0rqwaaxj8xcghvk7z-nixos-system-agentsandbox-25.11.20260429.755f5aa
+Domain 'test-default-3dfcf2a48071b66ed848db7937a8eec1' destroyed
+```
+
+4. Start the VM
+   - Run `agentsandbox up` and be patient as it takes a little while
+   - Verify that the VM starts, four virtiofs processes start
+   - Verify that `runtime.log` exists and that `requests.jsonl` exists.
+   - Verify that the SSH port reported by `agentsandbox port 22 --protocol tcp` matches the forwarded port used by `up`.
+   - Verify that the instance `/etc/machine-id` file is stable across repeated `build` runs.
+
+
 
 3. Inspect launcher metadata.
-   - Run `agentsandbox --help`.
-   - Run `agentsandbox version`.
-   - Run `agentsandbox doctor`.
+   - Verify that `allowed_hosts` is populated and `mounts` contains the header line
+     `# <rel-host-path><TAB><guest-name>` and a default workspace line `.\t` plus the
+     workspace directory name (the final path component of the project directory).
    - Run `agentsandbox verify`.
    - Verify that the current `verify` stub announces the planned repair commands `nixos-rebuild --repair` and `nix store verify --repair`.
    - Verify that the command list, version string, and dependency diagnostics are printed.
+
+3.5 Validate `audit` command wiring (`run_audit`).
+   - Ensure host `vulnix` is available in the current shell (recommended: run under this repo's `nix develop`).
+   - Run `agentsandbox audit -- --version`.
+   - Verify that the command invokes host `vulnix` and version output is visible via inherited stdout/stderr.
+   - Run `agentsandbox audit -- -j` and stop after confirming scan output starts.
+   - Verify argument contract: launcher prepends `-g <instance-sysroot>`, then forwards user args unchanged.
+   - Verify exit-code contract: launcher process exit status matches vulnix exit status.
+   - If host `vulnix` is missing, verify that the error message points to the patched host binary requirement in this repository environment.
 
 4. Confirm config and instance resolution from `doctor`.
    - Run `agentsandbox doctor` (or use the output from step 3).
@@ -59,7 +130,6 @@ This file defines a single end-to-end scenario sequence that exercises every `ag
    - Run `agentsandbox build`.
    - Verify that the sysroot is created under `$XDG_DATA_HOME/agentsandbox/<instance-id>/sysroot`.
    - Verify that the guest top-level build exists inside the sysroot.
-   - Verify that the instance `machine-id` is stable across repeated `build` runs.
 
 8. Start the VM.
    - Run `agentsandbox up`.
@@ -136,6 +206,9 @@ This file defines a single end-to-end scenario sequence that exercises every `ag
    - Verify that the OpenSnitch port or other forwarded port can be resolved when configured.
    - Run `agentsandbox wait` again after stopping the VM.
    - Verify that it exits cleanly when nothing is running.
+
+   - Here, deny-by-default means that removing every active `allowed_hosts` entry must still block unmatched hosts rather than falling back to allow-all.
+
 
 ## Acceptance
 

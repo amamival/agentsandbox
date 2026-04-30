@@ -477,7 +477,7 @@ fn run_build_or_up(env: &Env, bootstrap: bool, is_up: bool, attach: bool) -> any
                 eprintln!("build: domain definition changed; please restart the VM for the changes to take effect");
             }
             if attach {
-                run_ssh::<&str>(env, &[], false, false).context("attach")?;
+                run_ssh::<&str>(env, &[], false, true).context("attach")?;
             }
         }
         domstate => bail!("VM is {domstate}; expected running, down, shut off, or crashed"),

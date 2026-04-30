@@ -7,7 +7,7 @@
     agentsandbox.url = "path:./agentsandbox";
     agentsandbox.inputs.nixpkgs.follows = "nixpkgs";
     opencode.url = "github:anomalyco/opencode/dev";
-    opencode.inputs.nixpkgs.follows = "nixpkgs-unstable";
+    opencode.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs = { self, nixpkgs, nixpkgs-unstable, home-manager, agentsandbox, opencode, ... }:

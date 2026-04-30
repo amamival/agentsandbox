@@ -27,7 +27,7 @@ This file defines a single end-to-end scenario sequence that exercises every `ag
 4. Confirm config and instance resolution from `doctor`.
    - Run `agentsandbox doctor` (or use the output from step 3).
    - Verify that `ResolvedFlakeDir` is the local `.agentsandbox/` directory for this workspace.
-   - Verify that `ResolvedInstanceId`, `ResolvedDataDir`, `ResolvedStateDir`, and `ResolvedRuntimeDir`
+   - Verify that `InstanceId`, `InstanceDataDir`, `InstanceStateDir`, and `InstanceRuntimeDir`
      appear in the output.
 
 5. Prepare allowlist entries.
@@ -65,7 +65,7 @@ This file defines a single end-to-end scenario sequence that exercises every `ag
    - Run `agentsandbox up`.
    - Verify that the VM starts, the proxy sidecar starts, both virtiofs daemons start, and the transient libvirt domain is created.
    - Verify that `runtime.log` exists and that `requests.jsonl` exists.
-   - Verify that the SSH port reported by `agentsandbox port 22 tcp` matches the forwarded port used by `up`.
+   - Verify that the SSH port reported by `agentsandbox port 22 --protocol tcp` matches the forwarded port used by `up`.
 
 9. Inspect the running VM.
    - Run `agentsandbox ps`.
@@ -124,7 +124,7 @@ This file defines a single end-to-end scenario sequence that exercises every `ag
     - Verify that the whole data dir is removed.
     - Verify that a later `agentsandbox up` does not reuse prior guest persistent data from before `-sd`.
     - Run `agentsandbox destroy -l`.
-    - Verify that the instance state directory (as reported by `ResolvedStateDir` from `doctor`) is removed.
+    - Verify that the instance state directory (as reported by `InstanceStateDir` from `doctor`) is removed.
     - Run `agentsandbox destroy -c`.
     - Verify that the resolved config directory (`.agentsandbox/`) is removed.
     - Run `agentsandbox init` to recreate the local configuration files needed for the following step.
@@ -132,7 +132,7 @@ This file defines a single end-to-end scenario sequence that exercises every `ag
 16. Validate the remaining utility commands in the same session.
    - Run `agentsandbox port`.
    - Verify that it prints the host port for the configured guest port.
-   - Run `agentsandbox port 50052 tcp`.
+   - Run `agentsandbox port 22 --protocol tcp`.
    - Verify that the OpenSnitch port or other forwarded port can be resolved when configured.
    - Run `agentsandbox wait` again after stopping the VM.
    - Verify that it exits cleanly when nothing is running.

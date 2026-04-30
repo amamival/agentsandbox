@@ -19,6 +19,16 @@
           type = lib.types.attrsOf (lib.types.submodule {
             options = {
               proto = lib.mkOption { type = lib.types.enum [ "tcp" "udp" ]; };
+              address = lib.mkOption {
+                type = lib.types.addCheck lib.types.str (x: builtins.match "[.0-9:A-Fa-f]+" x != null);
+                default = "0.0.0.0";
+                description = "Host bind address for the forwarded port.";
+              };
+              dev = lib.mkOption {
+                type = lib.types.nullOr (lib.types.addCheck lib.types.str (x: builtins.match "[-a-zA-Z0-9_.]+" x != null));
+                default = null;
+                description = "Optional host device name for binding restriction.";
+              };
               host = lib.mkOption {
                 type = lib.types.addCheck
                   (lib.types.coercedTo lib.types.int
@@ -39,7 +49,7 @@
               };
             };
           });
-          default = { ssh = { proto = "tcp"; host = 2223; guest = 22; }; };
+          default = { ssh = { proto = "tcp"; address = "127.0.0.1"; dev = "lo"; host = 2223; guest = 22; }; };
         };
       };
 
@@ -57,18 +67,16 @@
         system.systemBuilderCommands =
           let
             kernelParams = lib.escapeXML (lib.concatStringsSep " " config.boot.kernelParams);
-            portForwards = lib.mapAttrsToList
-              (name: f: "${name}\t${f.proto}\t${toString f.host.start}\t${toString f.host.end}\t${toString f.guest}")
-              config.agentsandbox.portForwards;
-            portForwardsFile = pkgs.writeText "port-forwards" (lib.concatStringsSep "\n" portForwards + "\n");
+            portForwardsFile = pkgs.writeText "port-forwards" (builtins.toJSON config.agentsandbox.portForwards);
             portForwardsXml = lib.concatMapStrings
               (f: ''
-                <portForward proto='${lib.escapeXML f.proto}' address='127.0.0.1' dev='lo'>${
-                if f.host.start == f.host.end then
-                  "<range start='${toString f.host.start}' to='${toString f.guest}'/>"
-                else
-                  "<range start='${toString f.host.start}' end='${toString f.host.end}' to='${toString f.guest}'/>"
-                }</portForward>
+                <portForward proto='${f.proto}' address='${f.address}'${
+                  lib.optionalString (f.dev != null) " dev='${f.dev}'"
+                }>
+                <range start='${toString f.host.start}'${
+                  lib.optionalString (f.host.start != f.host.end) " end='${toString f.host.end}'"
+                } to='${toString f.guest}'/>
+                </portForward>
               '')
               (lib.attrValues config.agentsandbox.portForwards);
             libvirtDomainXmlGen = pkgs.writeShellScript "domain.xml.sh" ''

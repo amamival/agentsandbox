@@ -362,7 +362,14 @@ $XDG_RUNTIME_DIR/agentsandbox/<instance-id>/
   host-to-guest publication only.
 - Apply all `portForwards` from the selected host config when the domain is
   created.
-- The `ssh` subcommand uses the `tcp` forward where `guest = 22`.
+- `port` prints the public host endpoint for a guest port binding.
+- `port` accepts an optional `guest_port` argument to resolve guest-to-host
+  port mapping.
+- `port` accepts an optional `--protocol <tcp|udp>` filter.
+- If `--protocol` is omitted, `port` tries `tcp` first and then `udp`.
+- If `guest_port` is omitted, `port` returns all published bindings, one per
+  line, as `<ipv4addr>:<port>/<proto>`.
+- The `ssh` subcommand uses the `tcp` forward where `guest_port = 22`.
 - Gateway restriction is enforced with a guest-side firewall, and host-gateway
   paths are concentrated on the proxy port and the OpenSnitch forward port.
 - `allowed_hosts` uses the plain-text file in the active config dir.

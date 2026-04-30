@@ -12,6 +12,7 @@ use rustix::{
     runtime::{Fork, How, KernelSigSet, Timespec, exit_group, kernel_fork, kernel_sigprocmask, kernel_sigtimedwait},
     thread::{UnshareFlags, unshare_unsafe},
 };
+use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
@@ -141,7 +142,13 @@ enum Command {
     /// Unmount a file or directory from a running VM now and on future starts
     Unmount { path: String },
     /// Prints the public port for a port binding
-    Port { guest_port: Option<u16>, guest_proto: Option<String> },
+    Port {
+        /// Guest port to resolve to a host port
+        guest_port: Option<u16>,
+        /// Protocol
+        #[arg(long, value_parser = ["tcp", "udp"])]
+        protocol: Option<String>,
+    },
     /// Add a firewall rule that allows outbound traffic to a domain
     AllowDomain { domain: String },
     /// Remove the rule for the domain
@@ -154,7 +161,7 @@ enum Command {
     /// 2) If guest is running, runs nixos-rebuild --repair inside the guest.
     ///
     /// Limitations:
-    /// - Uses host nix binary (see doctor: HostNixStoreBinForVerify), substituter, trusted keys, etc.
+    /// - Uses host nix binary (see doctor), substituter, trusted keys, etc.
     /// - Verifies/repairs store/system state; does not analyze malicious flake.nix or other executables.
     Verify,
 }
@@ -182,6 +189,16 @@ struct Instance {
     logs_dir: PathBuf,
 }
 
+#[derive(Deserialize)]
+struct PortForward {
+    proto: String,
+    address: String,
+    dev: Option<String>,
+    host_start: u16,
+    host_end: u16,
+    guest: u16,
+}
+
 fn main() {
     if let Err(err) = (|| -> anyhow::Result<()> {
         let cli = Cli::parse();
@@ -205,6 +222,7 @@ fn main() {
             Some(Command::Destroy { system, data, logs, conf }) => run_destroy(&env, system, data, logs, conf).context("destroy"),
             Some(Command::Ssh { args }) => run_ssh(&env, &args, false, false).context("ssh"),
             Some(Command::Exec { args }) => run_ssh(&env, &args, true, false).context("exec"),
+            Some(Command::Port { guest_port, protocol }) => run_port(&env, guest_port, protocol.as_deref()).context("port"),
             Some(Command::Logs { args }) => run_logs(&env, &args).context("logs"),
             Some(Command::Stats) => run_stats(&env).context("stats"),
             Some(Command::Wait { states }) => run_wait(&resolve_instance(&env, &resolve_flake_dir(&env)?)?, &states).context("wait"),
@@ -909,6 +927,7 @@ fn validate_mount_name_field(value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[inline(never)]
 fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bool) -> anyhow::Result<()> {
     let flake_dir = resolve_flake_dir(env)?;
     let instance = resolve_instance(env, &flake_dir)?;
@@ -996,7 +1015,6 @@ fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bo
     Ok(())
 }
 
-#[inline(never)]
 fn run_virsh_action(env: &Env, action: &str) -> anyhow::Result<()> {
     let instance = resolve_instance(env, &resolve_flake_dir(env)?)?;
     virsh(&[action, &instance.id])?;
@@ -1006,7 +1024,6 @@ fn run_virsh_action(env: &Env, action: &str) -> anyhow::Result<()> {
     }
 }
 
-#[inline(never)]
 fn run_virsh_action_all(env: &Env, action: &str) -> anyhow::Result<()> {
     let flake_dir = resolve_flake_dir(env)?;
     for id in list_instance_ids(env, &flake_dir)? {
@@ -1071,93 +1088,77 @@ fn run_stats(env: &Env) -> anyhow::Result<()> {
 
 #[inline(never)]
 fn run_doctor(env: &Env) -> anyhow::Result<()> {
-    let flake_dir = resolve_flake_dir(env);
     let resolve_cmd_path = |name: &str| -> String {
         let output = process::Command::new("which").arg(name).output();
         match output {
             Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout).trim().to_owned(),
-            _ => "missing!".to_owned(),
+            Ok(_) => "missing!".to_owned(),
+            Err(err) => format!("missing! ({err:#})"),
         }
     };
-    println!("AppName:\t{}", APP_NAME);
-    println!("Version:\t{}", env!("CARGO_PKG_VERSION"));
-    println!("IsUserGlobalProject:\t{}", env.is_global);
-    println!("VmHostnameArg:\t{}", env.hostname);
-    println!("WorkspaceArg:\t{}", env.workspace.display());
-    println!("ResolvedConfigRoot:\t{}", env.config_root.display());
-    println!("ResolvedDataRoot:\t{}", env.data_root.display());
-    println!("ResolvedStateRoot:\t{}", env.state_root.display());
-    println!("ResolvedRuntimeRoot:\t{}", env.runtime_root.display());
+    println!("AppName:\t\t\t{}", APP_NAME);
+    println!("Version:\t\t\t{}", env!("CARGO_PKG_VERSION"));
+    println!("CmdVirshPath:\t\t\t{}", resolve_cmd_path("virsh"));
+    println!("CmdSshPath:\t\t\t{}", resolve_cmd_path("ssh"));
+    println!("CmdVirtiofsdPath:\t\t{}", resolve_cmd_path("virtiofsd"));
+    println!("CmdUnsharePath:\t\t\t{}", resolve_cmd_path("unshare"));
+    println!("CmdNixStoreForVerifyCmd:\t{}", resolve_cmd_path("nix-store"));
+
+    println!("ResolvedConfigRoot:\t\t{}", env.config_root.display());
+    println!("ResolvedDataRoot:\t\t{}", env.data_root.display());
+    println!("ResolvedStateRoot:\t\t{}", env.state_root.display());
+    println!("ResolvedRuntimeRoot:\t\t{}", env.runtime_root.display());
+    println!("WorkspaceArg:\t\t\t{}", env.workspace.display());
+    println!("IsUserGlobalProject:\t\t{}", env.is_global);
+    println!("InstanceHostnameArg:\t\t{}", env.hostname);
+
+    let flake_dir = resolve_flake_dir(env);
     match &flake_dir {
+        Err(err) => println!("ResolveFlakeDirError:\t\t{err:#}"),
         Ok(flake_dir) => {
-            println!("ResolvedFlakeDir:\t{}", flake_dir.display());
-            println!("ResolvedFlakeSource:\t{}", if *flake_dir == env.config_root { "global" } else { "local" });
-            match resolve_instance(env, flake_dir) {
-                Ok(instance) => {
-                    println!("ResolvedIsGlobalInstance:\t{}", instance.is_global);
-                    println!("ResolvedInstanceId:\t{}", instance.id);
-                    println!("ResolvedDataDir:\t{}", instance.data_dir.display());
-                    println!("ResolvedStateDir:\t{}", instance.state_dir.display());
-                    println!("ResolvedRuntimeDir:\t{}", instance.runtime_dir.display());
-                    println!("ResolvedSysrootDir:\t{}", instance.sysroot.display());
-                    println!("ResolvedPersistentDir:\t{}", instance.persistent.display());
-                }
-                Err(err) => {
-                    println!("ResolvedInstanceError:\t{err:#}");
-                    println!("ResolvedIsGlobalInstance:\tN/A");
-                    println!("ResolvedInstanceId:\tN/A");
-                    println!("ResolvedDataDir:\tN/A");
-                    println!("ResolvedStateDir:\tN/A");
-                    println!("ResolvedRuntimeDir:\tN/A");
-                    println!("ResolvedSysrootDir:\tN/A");
-                    println!("ResolvedPersistentDir:\tN/A");
-                }
-            }
-            match list_instance_ids(env, flake_dir) {
-                Ok(instance_ids) => {
-                    println!(
-                        "InstanceIds:\t{}",
-                        if instance_ids.is_empty() { "none".to_owned() } else { instance_ids.join(",") }
-                    );
-                }
-                Err(err) => {
-                    println!("InstanceIdsError:\t{err:#}");
-                    println!("InstanceIds:\tN/A");
-                }
-            }
-            println!("FileFlakeNixExists:\t{}", flake_dir.join("flake.nix").is_file());
-            println!("FileConfigurationNixExists:\t{}", flake_dir.join("configuration.nix").is_file());
-            println!("FileMountsExists:\t{}", flake_dir.join("mounts").is_file());
-            println!("FileAllowedHostsExists:\t{}", flake_dir.join("allowed_hosts").is_file());
+            println!("ResolvedFlakeDir:\t\t{}", flake_dir.display());
+            println!("FileFlakeNixExists:\t\t{}", flake_dir.join("flake.nix").is_file());
+            println!("FileMountsExists:\t\t{}", flake_dir.join("mounts").is_file());
             println!("FileMachinePrefixExists:\t{}", flake_dir.join("machine-prefix").is_file());
-            println!("FileFlakeLockExists:\t{}", flake_dir.join("flake.lock").is_file());
-        }
-        Err(err) => {
-            println!("ResolvedFlakeDirError:\t{err:#}");
-            println!("ResolvedFlakeDir:\tN/A");
-            println!("ResolvedFlakeSource:\tN/A");
-            println!("ResolvedIsGlobalInstance:\tN/A");
-            println!("ResolvedInstanceId:\tN/A");
-            println!("ResolvedDataDir:\tN/A");
-            println!("ResolvedStateDir:\tN/A");
-            println!("ResolvedRuntimeDir:\tN/A");
-            println!("ResolvedSysrootDir:\tN/A");
-            println!("ResolvedPersistentDir:\tN/A");
-            println!("InstanceIds:\tN/A");
-            println!("FileFlakeNixExists:\tN/A");
-            println!("FileConfigurationNixExists:\tN/A");
-            println!("FileMountsExists:\tN/A");
-            println!("FileAllowedHostsExists:\tN/A");
-            println!("FileMachinePrefixExists:\tN/A");
-            println!("FileFlakeLockExists:\tN/A");
+            println!("FileAllowedHostsExists:\t\t{}", flake_dir.join("allowed_hosts").is_file());
+            println!("FileFlakeLockExists:\t\t{}", flake_dir.join("flake.lock").is_file());
+            match list_instance_ids(env, &flake_dir) {
+                Err(err) => println!("ListInstanceIdsError:\t\t{err:#}"),
+                Ok(ids) => println!("InstanceIds:\n\t{}", if ids.is_empty() { "none".into() } else { ids.join("\n\t") }),
+            }
         }
     }
-    println!("CmdVirshPath:\t{}", resolve_cmd_path("virsh"));
-    println!("CmdSshPath:\t{}", resolve_cmd_path("ssh"));
-    println!("CmdVirtiofsdPath:\t{}", resolve_cmd_path("virtiofsd"));
-    println!("CmdUnsharePath:\t{}", resolve_cmd_path("unshare"));
-    println!("CmdNixPath:\t{}", resolve_cmd_path("nix"));
-    println!("HostNixStoreBinForVerify:\t{}", resolve_cmd_path("nix-store"));
+
+    let instance = flake_dir.ok().map(|flake_dir| resolve_instance(env, &flake_dir));
+    match instance {
+        None => println!("InstanceId:\t\t\tN/A"),
+        Some(Err(err)) => println!("ResolveInstanceError:\t\t{err:#}"),
+        Some(Ok(instance)) => {
+            println!("InstanceId:\t\t\t{}", instance.id);
+            println!("InstanceIsGlobal:\t\t{}", instance.is_global);
+            println!("InstanceDataDir:\t\t{}", instance.data_dir.display());
+            println!("InstanceSysrootDir:\t\t{}", instance.sysroot.display());
+            println!("InstancePersistentDir:\t\t{}", instance.persistent.display());
+            println!("InstanceStateDir:\t\t{}", instance.state_dir.display());
+            println!("InstanceLogsDir:\t\t{}", instance.logs_dir.display());
+            println!("InstanceRuntimeDir:\t\t{}", instance.runtime_dir.display());
+            match read_port_forwards_lookup(&instance, None, None) {
+                Ok((forwards, _)) => println!(
+                    "InstancePortForwards:\n{}",
+                    if forwards.is_empty() {
+                        "\tnone".into()
+                    } else {
+                        forwards
+                            .iter()
+                            .map(|(name, f)| format!("\t{name}\t{}\t{}:{}-{}\t{}", f.proto, f.address, f.host_start, f.host_end, f.guest))
+                            .collect::<Vec<String>>()
+                            .join("\n")
+                    }
+                ),
+                Err(err) => println!("ReadPortForwardsLookupError:\t{err:#}"),
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1212,42 +1213,60 @@ fn run_destroy(env: &Env, system: bool, data: bool, logs: bool, conf: bool) -> a
     }
     Ok(())
 }
+
+fn read_port_forwards_lookup(
+    instance: &Instance,
+    guest_port: Option<u16>,
+    protocol: Option<&str>,
+) -> anyhow::Result<(Vec<(String, PortForward)>, Option<(String, u16)>)> {
+    let forwards: Vec<(String, PortForward)> =
+        serde_json::from_str(&fs::read_to_string(read_domain_profile(instance)?.join("port-forwards")).context("read port-forwards")?)
+            .context("parse port-forwards json")?;
+    match guest_port {
+        Some(guest_port) => {
+            for (_, f) in forwards {
+                if protocol.is_some_and(|proto| f.proto != proto) {
+                    continue;
+                }
+                let count = f.host_end - f.host_start + 1;
+                if f.guest <= guest_port && guest_port <= f.guest + count - 1 {
+                    return Ok((Vec::new(), Some((f.address.clone(), f.host_start + (guest_port - f.guest)))));
+                }
+            }
+            Ok((Vec::new(), None))
+        }
+        None => Ok((forwards, None)),
+    }
+}
+
+#[inline(never)]
+fn run_port(env: &Env, guest_port: Option<u16>, protocol: Option<&str>) -> anyhow::Result<()> {
+    let flake_dir = resolve_flake_dir(env)?;
+    let instance = resolve_instance(env, &flake_dir)?;
+    match read_port_forwards_lookup(&instance, guest_port, protocol)? {
+        (_, Some((address, host_port))) => println!("{address}:{host_port}"),
+        (forwards, _) => {
+            for (name, f) in forwards {
+                for host_port in f.host_start..=f.host_end {
+                    println!("{name}\t{}\t{}:{host_port}\t{}", f.proto, f.address, f.dev.clone().unwrap_or_default());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[inline(never)]
 fn run_ssh<S: AsRef<str>>(env: &Env, args: &[S], is_root: bool, inherit_tty: bool) -> anyhow::Result<()> {
     let flake_dir = resolve_flake_dir(env)?;
     let instance = resolve_instance(env, &flake_dir)?;
     run_wait(&instance, &["running"])?;
-    let mut ssh_port = None;
-    for line in fs::read_to_string(read_domain_profile(&instance)?.join("port-forwards"))
-        .context("read domain profile port-forwards")?
-        .lines()
-    {
-        let mut parts = line.split('\t');
-        let (_name, proto, start, end, guest) = match (parts.next(), parts.next(), parts.next(), parts.next(), parts.next(), parts.next()) {
-            (Some(name), Some(proto), Some(start), Some(end), Some(guest), None) => (name, proto, start, end, guest),
-            _ => bail!("invalid port-forwards entry: {line}"),
-        };
-        if proto != "tcp" {
-            continue;
-        }
-        let start = start.parse::<u64>().context("parse port-forwards host start")?;
-        let end = end.parse::<u64>().context("parse port-forwards host end")?;
-        let guest = guest.parse::<u64>().context("parse port-forwards guest port")?;
-        if end < start {
-            bail!("invalid port-forwards range: {line}");
-        }
-        if (22_u64 >= guest) && (22_u64 <= guest + (end - start)) {
-            ssh_port = Some(u16::try_from(start + 22_u64 - guest).context("ssh host port exceeds u16")?);
-            break;
-        }
-    }
-    let ssh_port = match ssh_port {
-        Some(port) => port,
-        None => bail!("ssh port forward for guest tcp/22 is not configured"),
-    };
+    let (address, ssh_port) = (read_port_forwards_lookup(&instance, Some(22), Some("tcp"))?.1)
+        .ok_or_else(|| anyhow::anyhow!("ssh port forward for guest tcp/22 is not configured"))?;
+    let user = if is_root { "root" } else { "vscode" };
     for attempt in 1..=120 {
         let status = process::Command::new("ssh")
-            .arg(if is_root { "root@127.0.0.1" } else { "vscode@127.0.0.1" })
+            .arg(format!("{user}@{address}"))
             .arg("-p")
             .arg(ssh_port.to_string())
             .args((inherit_tty && std::io::stdin().is_terminal()).then_some("-t"))

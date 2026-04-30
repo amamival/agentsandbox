@@ -15,10 +15,12 @@
       eachSystem = f:
         nixpkgs.lib.genAttrs [ "x86_64-linux" ]
           (system: f system (import nixpkgs { inherit system; }));
+      vulnix = self.packages.x86_64-linux.vulnix;
     in
     {
       packages = eachSystem (_: pkgs: {
         default = pkgs.callPackage ./package.nix { };
+        vulnix = pkgs.vulnix.overrideAttrs (_: { patches = [ ./vulnix-1.12.1-storedir.patch ]; });
       });
 
       apps = eachSystem (system: _: {
@@ -29,9 +31,13 @@
         };
       });
 
-      devShells = eachSystem (_: pkgs: {
+      devShells = eachSystem (system: pkgs: {
         default = pkgs.mkShell {
-          packages = with pkgs; [ rustup cargo clippy rust-analyzer util-linux libvirt virtiofsd openssh mitmproxy ];
+          packages = with pkgs; [ rustup cargo clippy rust-analyzer util-linux libvirt virtiofsd openssh mitmproxy vulnix ];
+          # Avoid python namespace collisions between mitmproxy and vulnix wrappers.
+          shellHook = ''
+            unset PYTHONPATH
+          '';
           LIBVIRT_DEFAULT_URI = "qemu:///session";
         };
       });

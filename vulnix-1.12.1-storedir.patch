@@ -1,0 +1,170 @@
+diff --git a/src/vulnix/main.py b/src/vulnix/main.py
+index cd1be99..02b0c09 100755
+--- a/src/vulnix/main.py
++++ b/src/vulnix/main.py
+@@ -85,13 +85,19 @@ def run(nvd, store):
+ @click.option(
+     "-p",
+     "--profile",
+-    type=click.Path(exists=True),
++    type=click.Path(),
+     multiple=True,
+     help="Scan this profile (eg: ~/.nix-profile)",
+ )
+ @click.option(
+     "-f", "--from-file", type=click.File(mode="r"), help="Read derivations from file"
+ )
++@click.option(
++    "-g",
++    "--guest",
++    type=click.Path(exists=True, file_okay=False),
++    help="Guest sysroot path that contains nix store.",
++)
+ @click.argument("path", nargs=-1, type=click.Path(exists=True))
+ # modify operation
+ @click.option(
+@@ -162,6 +168,7 @@ def main(
+     gc_roots,
+     system,
+     from_file,
++    guest,
+     profile,
+     path,
+     mirror,
+@@ -208,7 +215,7 @@ def main(
+             for wl in wh_sources:
+                 whitelist.merge(Whitelist.load(wl))
+         with Timer("Load derivations"):
+-            store = Store(requisites, closure)
++            store = Store(requisites, closure, guest)
+             if from_file:
+                 if from_file.name.endswith(".json"):
+                     _log.debug("loading packages.json")
+diff --git a/src/vulnix/nix.py b/src/vulnix/nix.py
+index 0bc275b..35d5923 100644
+--- a/src/vulnix/nix.py
++++ b/src/vulnix/nix.py
+@@ -1,5 +1,6 @@
+ import json
+ import logging
++import os
+ import os.path as p
+ 
+ from .derivation import Derive, SkipDrv, load
+@@ -9,9 +10,10 @@ _log = logging.getLogger(__name__)
+ 
+ 
+ class Store:
+-    def __init__(self, requisites=True, closure=False):
++    def __init__(self, requisites=True, closure=False, guest=None):
+         self.requisites = requisites
+         self.closure = closure
++        self.guest = p.abspath(guest) if guest else None
+         self.derivations = set()
+         self.experimental_flag_needed = None
+ 
+@@ -21,12 +23,12 @@ class Store:
+         Note that this usually includes old system versions.
+         """
+         _log.debug("Loading all live derivations")
+-        for d in call(["nix-store", "--gc", "--print-live"]).splitlines():
++        for d in self._call_nix_store(["--gc", "--print-live"]).splitlines():
+             self.update(d)
+ 
+     def add_profile(self, profile):
+         """Add derivations found in this nix profile."""
+-        json_manifest_path = p.join(profile, "manifest.json")
++        json_manifest_path = p.join(self._host_path(profile), "manifest.json")
+         if p.exists(json_manifest_path):
+             _log.debug("Loading derivations from %s", json_manifest_path)
+             with open(json_manifest_path, "r", encoding="utf-8") as f:
+@@ -59,10 +61,39 @@ class Store:
+             self.experimental_flag_needed = "--experimental-features" in call(
+                 ["nix", "--help"]
+             )
+-
++        opts = []
+         if self.experimental_flag_needed:
+-            return call(["nix", "--experimental-features", "nix-command flakes"] + args)
+-        return call(["nix"] + args)
++            opts = ["--experimental-features", "nix-command flakes"]
++        if self.guest is not None:
++            opts += ["--store", f"local?root={self.guest}"]
++        return call(["nix"] + opts + args)
++
++    def _call_nix_store(self, args):
++        opts = []
++        if self.guest is not None:
++            opts += ["--store", f"local?root={self.guest}"]
++        return call(["nix-store"] + opts + args)
++
++    def _host_drv_path(self, path):
++        if self.guest is not None:
++            return p.join(self.guest, path.removeprefix("/"))
++        return path
++
++    def _host_path(self, path):
++        if self.guest is not None:
++            if not p.isabs(path):
++                raise RuntimeError(f"path `{path}` must be absolute")
++            resolved = p.join(self.guest, path.removeprefix("/"))
++            for _ in range(16): # Follow symlink
++                if not p.islink(resolved):
++                    return resolved
++                target = os.readlink(resolved)
++                if p.isabs(target):
++                    resolved = p.join(self.guest, target.removeprefix("/"))
++                else:
++                    resolved = p.normpath(p.join(p.dirname(resolved), target))
++            raise RuntimeError(f"symlink chain is too deep: {path}")
++        return path
+ 
+     def _find_deriver(self, path, qpi_deriver="undef"):
+         if not path or not qpi_deriver:
+@@ -71,16 +102,16 @@ class Store:
+             return path
+         # Deriver from QueryPathInfo
+         if qpi_deriver == "undef":
+-            qpi_deriver = call(["nix-store", "-qd", path]).strip()
++            qpi_deriver = self._call_nix_store(["-qd", path]).strip()
+         _log.debug("qpi_deriver: %s", qpi_deriver)
+-        if qpi_deriver and qpi_deriver != "unknown-deriver" and p.exists(qpi_deriver):
++        if qpi_deriver and qpi_deriver != "unknown-deriver" and p.exists(self._host_drv_path(qpi_deriver)):
+             return qpi_deriver
+         # Deriver from QueryValidDerivers
+         qvd_deriver = list(
+             json.loads(self._call_nix(["show-derivation", path])).keys()
+         )[0]
+         _log.debug("qvd_deriver: %s", qvd_deriver)
+-        if qvd_deriver and p.exists(qvd_deriver):
++        if qvd_deriver and p.exists(self._host_drv_path(qvd_deriver)):
+             return qvd_deriver
+ 
+         error = ""
+@@ -107,7 +138,7 @@ class Store:
+     def add_path(self, path):
+         # pylint: disable=too-many-branches
+         """Add the closure of all derivations referenced by a store path."""
+-        if not p.exists(path):
++        if not p.exists(self._host_path(path)):
+             raise RuntimeError(
+                 f"path `{path}` does not exist - cannot load "
+                 "derivations referenced from it"
+@@ -137,7 +168,7 @@ class Store:
+         else:
+             deriver = self._find_deriver(path)
+             if self.requisites:
+-                for candidate in call(["nix-store", "-qR", deriver]).splitlines():
++                for candidate in self._call_nix_store(["-qR", deriver]).splitlines():
+                     self.update(candidate)
+             else:
+                 self.update(deriver)
+@@ -146,7 +177,7 @@ class Store:
+         if not drv_path or not drv_path.endswith(".drv"):
+             return
+         try:
+-            drv_obj = load(drv_path)
++            drv_obj = load(self._host_drv_path(drv_path))
+         except SkipDrv:
+             return
+         self.derivations.add(drv_obj)

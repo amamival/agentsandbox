@@ -16,6 +16,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     env, fs,
     io::{IsTerminal as _, Read as _, Write as _},
     os::fd::AsRawFd,
@@ -163,7 +164,48 @@ enum Command {
     /// Limitations:
     /// - Uses host nix binary (see doctor), substituter, trusted keys, etc.
     /// - Verifies/repairs store/system state; does not analyze malicious flake.nix or other executables.
+    #[command(verbatim_doc_comment)]
     Verify,
+    /// Run CVE scan against the guest store
+    ///
+    /// Extra arguments are passed to vulnix as-is.
+    /// See upstream <https://github.com/nix-community/vulnix> for how to reduce false positives.
+    #[command(
+        verbatim_doc_comment,
+        override_usage = "agentsandbox audit [OPTIONS] -- [VULNIX_OPTIONS] [PATHS...]
+
+Vulnix Options:
+  -S, --system                    Scan the current system.
+  -G, --gc-roots                  Scan all active GC roots (including old
+                                  ones).
+  -p, --profile PATH              Scan this profile (eg: ~/.nix-profile)
+  -f, --from-file FILENAME        Read derivations from file
+  -w, --whitelist TEXT            Load whitelist from file or URL (may be
+                                  given multiple times).
+  -W, --write-whitelist FILENAME  Write TOML whitelist containing current
+                                  matches.
+  -c, --cache-dir DIRECTORY       Cache directory to store parsed archive
+                                  data. Default: ~/.cache/vulnix
+  -r, --requisites / -R, --no-requisites
+                                  Yes: determine transitive closure. No:
+                                  examine just the passed derivations
+                                  (default: yes).
+  -C, --closure                   Examine the closure of an output path
+                                  (runtime dependencies). Implies --no-
+                                  requisites.
+  -m, --mirror TEXT               Mirror to fetch NVD archives from. Default:
+                                  https://github.com/fkie-cad/nvd-json-data-
+                                  feeds/releases/latest/download/.
+  -j, --json / --no-json          JSON vs. human readable output.
+  -s, --show-whitelisted          Shows whitelisted items as well
+  -D, --show-description          Show descriptions of vulnerabilities
+  -v, --verbose                   Increase output verbosity (up to 2 times).
+  -V, --version                   Print vulnix version and exit."
+    )]
+    Audit {
+        #[arg(trailing_var_arg = true, hide = true, default_values = ["-G"])]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -227,6 +269,7 @@ fn main() {
             Some(Command::Stats) => run_stats(&env).context("stats"),
             Some(Command::Wait { states }) => run_wait(&resolve_instance(&env, &resolve_flake_dir(&env)?)?, &states).context("wait"),
             Some(Command::Verify) => run_verify(&env).context("verify"),
+            Some(Command::Audit { args }) => run_audit(&env, &args).context("audit"),
             None | Some(_) => {
                 println!("Comming soon(tm)...");
                 Ok(())
@@ -1102,7 +1145,8 @@ fn run_doctor(env: &Env) -> anyhow::Result<()> {
     println!("CmdSshPath:\t\t\t{}", resolve_cmd_path("ssh"));
     println!("CmdVirtiofsdPath:\t\t{}", resolve_cmd_path("virtiofsd"));
     println!("CmdUnsharePath:\t\t\t{}", resolve_cmd_path("unshare"));
-    println!("CmdNixStoreForVerifyCmd:\t{}", resolve_cmd_path("nix-store"));
+    println!("CmdNixStorePathForVerifyCmd:\t{}", resolve_cmd_path("nix-store"));
+    println!("CmdVulnixPathForAuditCmd:\t{}", resolve_cmd_path("vulnix"));
 
     println!("ResolvedConfigRoot:\t\t{}", env.config_root.display());
     println!("ResolvedDataRoot:\t\t{}", env.data_root.display());
@@ -1218,10 +1262,10 @@ fn read_port_forwards_lookup(
     instance: &Instance,
     guest_port: Option<u16>,
     protocol: Option<&str>,
-) -> anyhow::Result<(Vec<(String, PortForward)>, Option<(String, u16)>)> {
-    let forwards: Vec<(String, PortForward)> =
+) -> anyhow::Result<(BTreeMap<String, PortForward>, Option<(String, u16)>)> {
+    let forwards: BTreeMap<String, PortForward> =
         serde_json::from_str(&fs::read_to_string(read_domain_profile(instance)?.join("port-forwards")).context("read port-forwards")?)
-            .context("parse port-forwards json")?;
+            .context("parse port-forwards json").unwrap_or(BTreeMap::from([("ssh".into(), PortForward { proto: "tcp".to_owned(), address: "127.0.0.1".to_owned(), dev: None, host_start: 2223, host_end: 2223, guest: 22 })]));
     match guest_port {
         Some(guest_port) => {
             for (_, f) in forwards {
@@ -1230,10 +1274,10 @@ fn read_port_forwards_lookup(
                 }
                 let count = f.host_end - f.host_start + 1;
                 if f.guest <= guest_port && guest_port <= f.guest + count - 1 {
-                    return Ok((Vec::new(), Some((f.address.clone(), f.host_start + (guest_port - f.guest)))));
+                    return Ok((BTreeMap::new(), Some((f.address.clone(), f.host_start + (guest_port - f.guest)))));
                 }
             }
-            Ok((Vec::new(), None))
+            Ok((BTreeMap::new(), None))
         }
         None => Ok((forwards, None)),
     }
@@ -1342,6 +1386,19 @@ fn virsh(args: &[&str]) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+fn run_audit(env: &Env, args: &[String]) -> anyhow::Result<()> {
+    let instance = resolve_instance(&env, &resolve_flake_dir(&env)?)?;
+    let status = process::Command::new("vulnix")
+        .args(["-g", &instance.sysroot.display().to_string()])
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("depends on host patched vulnix binary for now. run in `nix develop` of agentsandbox")?;
+    process::exit(status.code().unwrap_or(1))
 }
 
 #[cfg(test)]

@@ -309,6 +309,16 @@ $XDG_RUNTIME_DIR/agentsandbox/<instance-id>/
 - Policy file protection:
   - `allowed_hosts` and `mounts` inside guest-visible config path are always
     bind-mounted and remounted read-only.
+- Audit command contract (`agentsandbox audit`):
+  - Resolve active flake dir and instance with the same path as other instance-scoped commands.
+  - Execute host `vulnix` directly (no guest-side wrapper execution).
+  - Prepend fixed arguments `-g <instance-sysroot>` so scan scope is the instance store root.
+  - Forward all user audit arguments after the fixed prefix without launcher-side rewriting.
+  - Inherit stdin/stdout/stderr to preserve vulnix I/O behavior and output format.
+  - Terminate process with vulnix exit code; if no code is available (for example, signal),
+    normalize to exit code `1`.
+  - Runtime prerequisite is a patched host vulnix binary in launcher environment
+    (operationally: run inside this repository's `nix develop`).
 
 ## Guest system contract
 

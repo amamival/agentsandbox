@@ -67,7 +67,12 @@
         system.systemBuilderCommands =
           let
             kernelParams = lib.escapeXML (lib.concatStringsSep " " config.boot.kernelParams);
-            portForwardsFile = pkgs.writeText "port-forwards" (builtins.toJSON config.agentsandbox.portForwards);
+            portForwardsFile = pkgs.writeText "port-forwards" (builtins.toJSON (
+              lib.mapAttrs (_: f: f // {
+                host_start = f.host.start;
+                host_end = f.host.end;
+              }) config.agentsandbox.portForwards
+            ));
             portForwardsXml = lib.concatMapStrings
               (f: ''
                 <portForward proto='${f.proto}' address='${f.address}'${

@@ -19,4 +19,4 @@ jobs:
           components: rustfmt, clippy
 
       - name: Run cargo checks
-        run: cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo package --locked --no-verify
+        run: cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --all-targets --all-features && cargo package --locked --no-verify

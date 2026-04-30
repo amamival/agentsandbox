@@ -421,3 +421,199 @@ pkgs.testers.runNixOSTest {
     machine.succeed("[[ -z \"$(agentsandbox port 50052 tcp)\" ]]")
   '';
 }
+/*
+#[cfg(test)]
+mod tests {
+    use super::{APP_NAME, Cli, Instance, LOCAL_CONFIG_DIR, prepare, remove_dir_all_if_exists, resolve_env, resolve_flake_dir};
+    use super::{resolve_instance, run_destroy, run_init};
+    use sha2::{Digest, Sha256};
+    use std::{
+        env, fs,
+        os::unix::fs::PermissionsExt,
+        path::PathBuf,
+        sync::{Mutex, OnceLock},
+    };
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn env_from_input(workspace: PathBuf, home: PathBuf, global: bool, xdg: Option<(PathBuf, PathBuf, PathBuf, PathBuf)>) -> super::Env {
+        let (xdg_config_home, xdg_data_home, xdg_state_home, xdg_runtime_dir) = match xdg {
+            Some((config, data, state, runtime)) => (Some(config), Some(data), Some(state), Some(runtime)),
+            None => (None, None, None, None),
+        };
+        resolve_env(&Cli {
+            global,
+            hostname: "default".into(),
+            workspace,
+            home: Some(home),
+            xdg_config_home,
+            xdg_data_home,
+            xdg_state_home,
+            xdg_runtime_dir,
+            command: None,
+        })
+        .unwrap()
+    }
+
+    fn test_root(name: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let root = env::temp_dir().join(format!("{APP_NAME}-rs-{name}"));
+        let home = root.join("home");
+        let _ = fs::remove_dir_all(&root);
+        (root, home.clone(), home.join(".config").join(APP_NAME))
+    }
+
+    fn assert_dirs(dirs: &[&std::path::Path]) {
+        for dir in dirs {
+            fs::create_dir_all(dir).unwrap();
+        }
+    }
+
+    fn reset_instance_dirs(paths: &Instance) {
+        remove_dir_all_if_exists(&paths.data_dir).unwrap();
+        remove_dir_all_if_exists(&paths.state_dir).unwrap();
+        remove_dir_all_if_exists(&paths.runtime_dir).unwrap();
+        fs::create_dir_all(&paths.sysroot).unwrap();
+        fs::create_dir_all(&paths.persistent).unwrap();
+        fs::create_dir_all(&paths.logs_dir).unwrap();
+    }
+
+    #[test]
+    fn init_writes_expected_files_and_honors_force() {
+        let _guard = env_lock().lock().unwrap();
+        let (root, home, global) = test_root("init");
+        let workspace = root.join("workspace");
+        assert_dirs(&[&workspace, &home]);
+        let mounts = "# <rel-host-path><TAB><guest-name>\n.\tworkspace\n".to_string();
+        let (local_env, global_env) = (
+            env_from_input(workspace.clone(), home.clone(), false, None),
+            env_from_input(workspace.clone(), home.clone(), true, None),
+        );
+        run_init(&local_env, false).unwrap();
+        let local = workspace.join(LOCAL_CONFIG_DIR);
+        run_init(&global_env, false).unwrap();
+        for dir in [&local, &global] {
+            for file in ["flake.nix", "configuration.nix", "allowed_hosts", "agentsandbox/flake.nix"] {
+                assert!(dir.join(file).is_file());
+            }
+            assert_eq!(fs::read_to_string(dir.join("mounts")).unwrap(), mounts);
+        }
+        assert_eq!(
+            run_init(&local_env, false).unwrap_err().to_string(),
+            format!("{} already exists", local.display())
+        );
+        fs::write(global.join("allowed_hosts"), "stale\n").unwrap();
+        run_init(&global_env, true).unwrap();
+        assert_eq!(
+            fs::read_to_string(global.join("allowed_hosts")).unwrap(),
+            include_str!("../template/allowed_hosts")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolve_helpers() {
+        let _guard = env_lock().lock().unwrap();
+        let (root, home, global) = test_root("resolve");
+        let workspace_root = root.join("workspace");
+        let workspace = workspace_root.join("subdir");
+        let flake_dir = workspace_root.join(LOCAL_CONFIG_DIR);
+        assert_dirs(&[&home, &workspace]);
+        run_init(&env_from_input(workspace_root.clone(), home.clone(), false, None), false).unwrap();
+        assert_dirs(&[&global]);
+        fs::write(global.join("flake.nix"), "").unwrap();
+        let env = env_from_input(workspace.clone(), home.clone(), false, None);
+        assert_dirs(&[&env.data_root]);
+        assert_eq!(resolve_flake_dir(&env).unwrap(), flake_dir);
+        fs::write(flake_dir.join("machine-prefix"), "0123456789abcdef01234567").unwrap();
+        let machine_id = Sha256::digest(b"default").iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let existing = format!("renamed-default-0123456789abcdef01234567{}", &machine_id[..8]);
+        fs::create_dir_all(env.data_root.join(&existing)).unwrap();
+        assert_eq!(resolve_instance(&env, &flake_dir).unwrap().id, existing);
+        let other_flake_dir = root.join("other").join(LOCAL_CONFIG_DIR);
+        assert_dirs(&[&other_flake_dir, &root.join("data"), &root.join("state"), &root.join("runtime")]);
+        fs::write(other_flake_dir.join("machine-prefix"), "0123456789abcdef01234567").unwrap();
+        let mut other_env = env_from_input(
+            "/target".into(),
+            "/home".into(),
+            false,
+            Some(("/config".into(), "/data".into(), "/state".into(), "/runtime".into())),
+        );
+        other_env.hostname = "demo".into();
+        let paths = resolve_instance(&other_env, &other_flake_dir).unwrap();
+        let demo_machine_id = Sha256::digest(b"demo").iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        assert_eq!(paths.id, "other-demo-0123456789abcdef01234567".to_owned() + &demo_machine_id[..8]);
+        assert_eq!(paths.data_dir, PathBuf::from("/data").join(APP_NAME).join(&paths.id));
+        assert_eq!(paths.state_dir, PathBuf::from("/state").join(APP_NAME).join(&paths.id));
+        assert_eq!(paths.runtime_dir, PathBuf::from("/runtime").join(APP_NAME).join(&paths.id));
+        assert_eq!(paths.sysroot, paths.data_dir.join("sysroot"));
+        assert_eq!(paths.persistent, paths.data_dir.join("persistent"));
+        assert_eq!(paths.logs_dir, paths.state_dir.join("logs"));
+        prepare(&Instance {
+            id: "demo".into(),
+            is_global: false,
+            data_dir: root.join("data"),
+            state_dir: root.join("state"),
+            runtime_dir: root.join("runtime"),
+            sysroot: root.join("sysroot"),
+            persistent: root.join("persistent"),
+            logs_dir: root.join("logs"),
+        })
+        .unwrap();
+        fs::remove_file(flake_dir.join("flake.nix")).unwrap();
+        assert_eq!(resolve_flake_dir(&env_from_input(workspace.clone(), home.clone(), true, None)).unwrap(), global);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn destroy_respects_flag_combinations() {
+        let _guard = env_lock().lock().unwrap();
+        let (root, home, _global) = test_root("destroy");
+        let workspace = root.join("workspace");
+        assert_dirs(&[&home, &workspace]);
+        let original_path = env::var("PATH").unwrap_or_default();
+        let fake_bin = root.join("bin");
+        fs::create_dir_all(&fake_bin).unwrap();
+        let fake_virsh = fake_bin.join("virsh");
+        fs::write(&fake_virsh, "#!/bin/sh\nexit 1\n").unwrap();
+        let mut permissions = fs::metadata(&fake_virsh).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_virsh, permissions).unwrap();
+        unsafe { env::set_var("PATH", format!("{}:{}", fake_bin.display(), original_path)) };
+        run_init(&env_from_input(workspace.clone(), home.clone(), false, None), false).unwrap();
+        let env = env_from_input(workspace.clone(), home.clone(), false, None);
+        let flake_dir = workspace.join(LOCAL_CONFIG_DIR);
+        fs::write(flake_dir.join("machine-prefix"), "0123456789abcdef01234567").unwrap();
+        let paths = resolve_instance(&env, &flake_dir).unwrap();
+
+        for (system, data, expect_sysroot, expect_persistent, expect_data_dir) in [
+            (false, false, true, true, true),
+            (true, false, false, true, true),
+            (false, true, true, false, true),
+            (true, true, false, false, false),
+        ] {
+            reset_instance_dirs(&paths);
+
+            run_destroy(&env, system, data, false, false).unwrap();
+
+            assert_eq!(paths.sysroot.exists(), expect_sysroot);
+            assert_eq!(paths.persistent.exists(), expect_persistent);
+            assert_eq!(paths.data_dir.exists(), expect_data_dir);
+        }
+
+        reset_instance_dirs(&paths);
+        run_destroy(&env, false, false, true, false).unwrap();
+        assert!(!paths.state_dir.exists());
+        assert!(flake_dir.exists());
+
+        reset_instance_dirs(&paths);
+        run_destroy(&env, false, false, false, true).unwrap();
+        assert!(!flake_dir.exists());
+
+        unsafe { env::set_var("PATH", original_path) };
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+*/

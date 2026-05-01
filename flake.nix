@@ -47,8 +47,8 @@
           export NIX_STATE_DIR="$TMPDIR/nix-state"
           mkdir -p "$NIX_STATE_DIR/profiles"
           ${pkgs.nix}/bin/nix-instantiate --parse ${./test.nix} >/dev/null
-          ${pkgs.nix}/bin/nix-instantiate --parse ${./share/agentsandbox/template/flake.nix} >/dev/null
-          ${pkgs.nix}/bin/nix-instantiate --parse ${./share/agentsandbox/template/agentsandbox/flake.nix} >/dev/null
+          ${pkgs.nix}/bin/nix-instantiate --parse ${template/flake.nix} >/dev/null
+          ${pkgs.nix}/bin/nix-instantiate --parse ${template/agentsandbox/flake.nix} >/dev/null
           touch "$out"
         '';
       });

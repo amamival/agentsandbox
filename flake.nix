@@ -33,7 +33,7 @@
 
       devShells = eachSystem (system: pkgs: {
         default = pkgs.mkShell {
-          packages = with pkgs; [ rustup cargo clippy rust-analyzer util-linux libvirt virtiofsd openssh mitmproxy vulnix ];
+          packages = with pkgs; [ rustup cargo clippy rust-analyzer util-linux libvirt virtiofsd passt openssh mitmproxy vulnix ];
           # Avoid python namespace collisions between mitmproxy and vulnix wrappers.
           shellHook = ''
             unset PYTHONPATH

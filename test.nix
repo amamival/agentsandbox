@@ -422,24 +422,24 @@ pkgs.testers.runNixOSTest {
   '';
 }
 /*
-#[cfg(test)]
-mod tests {
-    use super::{APP_NAME, Cli, Instance, LOCAL_CONFIG_DIR, prepare, remove_dir_all_if_exists, resolve_env, resolve_flake_dir};
-    use super::{resolve_instance, run_destroy, run_init};
-    use sha2::{Digest, Sha256};
-    use std::{
+  #[cfg(test)]
+  mod tests {
+  use super::{APP_NAME, Cli, Instance, LOCAL_CONFIG_DIR, prepare, remove_dir_all_if_exists, resolve_env, resolve_flake_dir};
+  use super::{resolve_instance, run_destroy, run_init};
+  use sha2::{Digest, Sha256};
+  use std::{
         env, fs,
         os::unix::fs::PermissionsExt,
         path::PathBuf,
         sync::{Mutex, OnceLock},
-    };
+  };
 
-    fn env_lock() -> &'static Mutex<()> {
+  fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
-    }
+  }
 
-    fn env_from_input(workspace: PathBuf, home: PathBuf, global: bool, xdg: Option<(PathBuf, PathBuf, PathBuf, PathBuf)>) -> super::Env {
+  fn env_from_input(workspace: PathBuf, home: PathBuf, global: bool, xdg: Option<(PathBuf, PathBuf, PathBuf, PathBuf)>) -> super::Env {
         let (xdg_config_home, xdg_data_home, xdg_state_home, xdg_runtime_dir) = match xdg {
             Some((config, data, state, runtime)) => (Some(config), Some(data), Some(state), Some(runtime)),
             None => (None, None, None, None),
@@ -456,32 +456,32 @@ mod tests {
             command: None,
         })
         .unwrap()
-    }
+  }
 
-    fn test_root(name: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+  fn test_root(name: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
         let root = env::temp_dir().join(format!("{APP_NAME}-rs-{name}"));
         let home = root.join("home");
         let _ = fs::remove_dir_all(&root);
         (root, home.clone(), home.join(".config").join(APP_NAME))
-    }
+  }
 
-    fn assert_dirs(dirs: &[&std::path::Path]) {
+  fn assert_dirs(dirs: &[&std::path::Path]) {
         for dir in dirs {
             fs::create_dir_all(dir).unwrap();
         }
-    }
+  }
 
-    fn reset_instance_dirs(paths: &Instance) {
+  fn reset_instance_dirs(paths: &Instance) {
         remove_dir_all_if_exists(&paths.data_dir).unwrap();
         remove_dir_all_if_exists(&paths.state_dir).unwrap();
         remove_dir_all_if_exists(&paths.runtime_dir).unwrap();
         fs::create_dir_all(&paths.sysroot).unwrap();
         fs::create_dir_all(&paths.persistent).unwrap();
         fs::create_dir_all(&paths.logs_dir).unwrap();
-    }
+  }
 
-    #[test]
-    fn init_writes_expected_files_and_honors_force() {
+  #[test]
+  fn init_writes_expected_files_and_honors_force() {
         let _guard = env_lock().lock().unwrap();
         let (root, home, global) = test_root("init");
         let workspace = root.join("workspace");
@@ -511,10 +511,10 @@ mod tests {
             include_str!("../template/allowed_hosts")
         );
         fs::remove_dir_all(root).unwrap();
-    }
+  }
 
-    #[test]
-    fn resolve_helpers() {
+  #[test]
+  fn resolve_helpers() {
         let _guard = env_lock().lock().unwrap();
         let (root, home, global) = test_root("resolve");
         let workspace_root = root.join("workspace");
@@ -565,10 +565,10 @@ mod tests {
         fs::remove_file(flake_dir.join("flake.nix")).unwrap();
         assert_eq!(resolve_flake_dir(&env_from_input(workspace.clone(), home.clone(), true, None)).unwrap(), global);
         fs::remove_dir_all(root).unwrap();
-    }
+  }
 
-    #[test]
-    fn destroy_respects_flag_combinations() {
+  #[test]
+  fn destroy_respects_flag_combinations() {
         let _guard = env_lock().lock().unwrap();
         let (root, home, _global) = test_root("destroy");
         let workspace = root.join("workspace");
@@ -614,6 +614,6 @@ mod tests {
 
         unsafe { env::set_var("PATH", original_path) };
         fs::remove_dir_all(root).unwrap();
-    }
-}
+  }
+  }
 */

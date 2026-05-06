@@ -78,11 +78,17 @@ enum Command {
         /// Build the initial template-based system profile instead. Current configs are kept.
         #[arg(short = 'b', long)]
         bootstrap: bool,
+        /// Allow the build path to update `flake.lock`.
+        #[arg(long)]
+        write_lock: bool,
     },
     /// Rebuild and start a VM; if already running, build and switch
     Up {
         #[arg(short = 'd', long)]
         detach: bool,
+        /// Allow the build path to update `flake.lock`.
+        #[arg(long)]
+        write_lock: bool,
     },
     /// Tear down the VM gracefully
     Down,
@@ -257,8 +263,10 @@ fn main() {
             }
             Some(Command::Doctor) => run_doctor(&env).context("doctor"),
             Some(Command::Init { force }) => run_init(&env, force).context("init"),
-            Some(Command::Build { bootstrap }) => run_build_or_up(&env, bootstrap, false, false).context("build"),
-            Some(Command::Up { detach }) => run_build_or_up(&env, false, true, !detach).context("up"),
+            Some(Command::Build { bootstrap, write_lock }) => {
+                run_build_or_up(&env, bootstrap, false, false, write_lock).context("build")
+            }
+            Some(Command::Up { detach, write_lock }) => run_build_or_up(&env, false, true, !detach, write_lock).context("up"),
             Some(Command::Down) => run_virsh_action(&env, "shutdown").context("down"),
             Some(Command::Kill) => run_virsh_action(&env, "destroy").context("kill"),
             Some(Command::Pause) => run_virsh_action_all(&env, "suspend").context("pause"),
@@ -525,7 +533,7 @@ fn write_template_config(target: &Path, workspace: &Path, force: bool) -> anyhow
 }
 
 #[inline(never)]
-fn run_build_or_up(env: &Env, bootstrap: bool, is_up: bool, attach: bool) -> anyhow::Result<()> {
+fn run_build_or_up(env: &Env, bootstrap: bool, is_up: bool, attach: bool, mut write_lock: bool) -> anyhow::Result<()> {
     let is_switch = is_up;
     let flake_dir = resolve_flake_dir(env)?;
     let instance = resolve_instance(env, &flake_dir)?;
@@ -539,20 +547,10 @@ fn run_build_or_up(env: &Env, bootstrap: bool, is_up: bool, attach: bool) -> any
     if bootstrap || !instance.sysroot.join("nix/var/nix/profiles/system").is_symlink() {
         install_initial_nixos_profile(&env.workspace, &instance.sysroot, "default")?;
     }
+    // Provide a minimum writable flake.lock for the initial build.
     if !flake_dir.join("flake.lock").exists() {
-        let status = process::Command::new("nix")
-            .args(["flake", "lock", "--extra-experimental-features", "nix-command flakes"])
-            .arg(format!("path:{}", flake_dir.display()))
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .context("run host nix flake lock")?;
-        if !status.success() {
-            bail!(
-                "nix flake lock failed with status {}",
-                status.code().map_or("signal".to_owned(), |code| code.to_string())
-            );
-        }
+        fs::write(flake_dir.join("flake.lock"), r#"{"root":"","version":7}"#).context("write flake.lock")?;
+        write_lock = true;
     }
     let domstate = domstate(&instance.id)?;
     match domstate.as_str() {
@@ -1091,7 +1089,7 @@ fn apply_mounts(env: &Env, flake_dir: &Path, instance: &Instance, system_profile
     Ok(())
 }
 
-/// Get compatible uid/gid maps from host.
+/// Get compatible subuid/subgid maps from host.
 fn capture_host_idmap(path: &str, map_root: bool) -> anyhow::Result<String> {
     let output = process::Command::new("unshare")
         .args(["--map-auto", if map_root { "--map-root-user" } else { "--map-current-user" }, "cat", path])

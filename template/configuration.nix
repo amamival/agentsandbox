@@ -1,3 +1,5 @@
+# Editable user configuration file.
+# Most of these configs are not requirement.
 { config, lib, pkgs, pkgs-unstable, nixpkgs, ... }:
 let
   HostConf = {
@@ -13,6 +15,7 @@ let
     environment.persistence."/persistent" = {
       hideMounts = true;
       allowTrash = true;
+      # System directories and files to persist across reboot.
       directories = [
         "/etc/nixos"
         "/var/log"
@@ -28,7 +31,7 @@ let
   Networking = {
     networking.hostName = HostConf.hostName;
     networking.firewall.enable = false;
-    services.opensnitch.enable = false;
+    services.opensnitch.enable = false; # Host-side popup will be available later.
   };
 
   Shell = {
@@ -113,7 +116,7 @@ let
           Type = "oneshot";
           ExecStart = toString (pkgs.writeShellScript "ai-cli-update" ''
             NPM_CONFIG_PREFIX=~/.npm-global ${pkgs.nodejs}/bin/npm install -g \
-            @openai/codex@latest @anthropic-ai/claude-code@latest
+            @openai/codex@latest
           '');
         };
         Install.WantedBy = [ "default.target" ];

@@ -459,7 +459,18 @@ fn read_port_forwards_lookup(
 ) -> anyhow::Result<(BTreeMap<String, PortForward>, Option<(String, u16)>)> {
     let forwards: BTreeMap<String, PortForward> =
         serde_json::from_str(&fs::read_to_string(read_domain_profile(instance)?.join("port-forwards")).context("read port-forwards")?)
-            .context("parse port-forwards json").unwrap_or(BTreeMap::from([("ssh".into(), PortForward { proto: "tcp".to_owned(), address: "127.0.0.1".to_owned(), dev: None, host_start: 2223, host_end: 2223, guest: 22 })]));
+            .context("parse port-forwards json")
+            .unwrap_or(BTreeMap::from([(
+                "ssh".into(),
+                PortForward {
+                    proto: "tcp".to_owned(),
+                    address: "127.0.0.1".to_owned(),
+                    dev: None,
+                    host_start: 2223,
+                    host_end: 2223,
+                    guest: 22,
+                },
+            )]));
     match guest_port {
         Some(guest_port) => {
             for (_, f) in forwards {

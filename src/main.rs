@@ -139,7 +139,12 @@ enum Command {
         states: Vec<String>,
     },
     /// Mount a file or directory into a running VM, or show mounts entries
-    Mount { path: Option<String>, name: Option<String> },
+    Mount {
+        path: Option<String>,
+        name: Option<String>,
+        #[arg(long)]
+        read_only: bool,
+    },
     /// Unmount a file or directory from a running VM now and on future starts
     Unmount { path: String },
     /// Prints the public port for a port binding
@@ -265,8 +270,8 @@ fn main() {
             Some(Command::Logs { args }) => run_logs(&env, &args).context("logs"),
             Some(Command::Stats) => run_stats(&env).context("stats"),
             Some(Command::Wait { states }) => run_wait(&resolve_instance(&env, &resolve_flake_dir(&env)?)?, &states).context("wait"),
-            Some(Command::Mount { path, name }) => run_mount(&env, path, name, true).context("mount"),
-            Some(Command::Unmount { path }) => run_mount(&env, Some(path), None, false).context("unmount"),
+            Some(Command::Mount { path, name, read_only }) => run_mount(&env, path, name, true, read_only).context("mount"),
+            Some(Command::Unmount { path }) => run_mount(&env, Some(path), None, false, false).context("unmount"),
             Some(Command::Port { guest_port, protocol }) => run_port(&env, guest_port, protocol.as_deref()).context("port"),
             Some(Command::Verify) => run_verify(&env).context("verify"),
             Some(Command::Audit { args }) => run_audit(&env, &args).context("audit"),
@@ -511,7 +516,7 @@ fn write_template_config(target: &Path, workspace: &Path, force: bool) -> anyhow
         ("flake.nix", include_str!("../template/flake.nix").to_owned()),
         ("configuration.nix", include_str!("../template/configuration.nix").to_owned()),
         ("allowed_hosts", include_str!("../template/allowed_hosts").to_owned()),
-        ("mounts", format!("# <rel-host-path><TAB><guest-name>\n.\t{workspace_name}\n")),
+        ("mounts", format!("# <host-path><TAB><guest-name><TAB><mode>\n.\t{workspace_name}\trw\n")),
         ("agentsandbox/flake.nix", include_str!("../template/agentsandbox/flake.nix").to_owned()),
     ] {
         fs::write(target.join(name), contents).context("write template file")?;
@@ -1006,8 +1011,8 @@ fn apply_mounts(env: &Env, flake_dir: &Path, instance: &Instance, system_profile
             continue;
         }
         let mut parts = line.split('\t');
-        let (source, name) = match (parts.next(), parts.next(), parts.next()) {
-            (Some(source), Some(name), None) => (source, name),
+        let (source, name, mode) = match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (Some(source), Some(name), Some(mode @ ("rw" | "ro")), None) => (source, name, mode == "rw"),
             _ => bail!("invalid mounts entry: {line}"),
         };
         validate_mount_source_field(source)?;
@@ -1026,7 +1031,7 @@ fn apply_mounts(env: &Env, flake_dir: &Path, instance: &Instance, system_profile
         validate_mount_name_field(name)?;
         let target = workspace_dir.join(name);
         let is_dir = source_abs.is_dir();
-        parsed_mounts.push((source_abs, target, is_dir, true));
+        parsed_mounts.push((source_abs, target, is_dir, mode));
     }
     parsed_mounts.push((
         flake_dir.canonicalize().context("canonicalize config dir")?,
@@ -1257,7 +1262,7 @@ fn run_wait<S: AsRef<str>>(instance: &Instance, states: &[S]) -> anyhow::Result<
 }
 
 #[inline(never)]
-fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bool) -> anyhow::Result<()> {
+fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bool, read_only: bool) -> anyhow::Result<()> {
     let flake_dir = resolve_flake_dir(env)?;
     let instance = resolve_instance(env, &flake_dir)?;
     let mounts_path = flake_dir.join("mounts");
@@ -1311,7 +1316,8 @@ fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bo
         } else {
             contents.push_str(line);
             contents.push('\n');
-            if let (Some((new_source, new_name)), Some((source, name))) = (new_entry.as_ref(), line.split_once('\t')) {
+            let mut parts = line.split('\t');
+            if let (Some((new_source, new_name)), Some(source), Some(name)) = (new_entry.as_ref(), parts.next(), parts.next()) {
                 if new_source.as_os_str() == source {
                     bail!("mount path already exists: {source}");
                 }
@@ -1323,7 +1329,8 @@ fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bo
     }
     if let Some(new_entry) = new_entry {
         updated = true;
-        contents.push_str(&format!("{}\t{}\n", new_entry.0.display(), new_entry.1));
+        let mode = if read_only { "ro" } else { "rw" };
+        contents.push_str(&format!("{}\t{}\t{mode}\n", new_entry.0.display(), new_entry.1));
     }
     if !updated {
         eprintln!("unmount: no changes to apply");

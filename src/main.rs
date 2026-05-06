@@ -234,6 +234,7 @@ struct Env {
 struct Instance {
     id: String,
     is_global: bool,
+    flake_dir: PathBuf,
     data_dir: PathBuf,
     state_dir: PathBuf,
     runtime_dir: PathBuf,
@@ -263,9 +264,7 @@ fn main() {
             }
             Some(Command::Doctor) => run_doctor(&env).context("doctor"),
             Some(Command::Init { force }) => run_init(&env, force).context("init"),
-            Some(Command::Build { bootstrap, write_lock }) => {
-                run_build_or_up(&env, bootstrap, false, false, write_lock).context("build")
-            }
+            Some(Command::Build { bootstrap, write_lock }) => run_build_or_up(&env, bootstrap, false, false, write_lock).context("build"),
             Some(Command::Up { detach, write_lock }) => run_build_or_up(&env, false, true, !detach, write_lock).context("up"),
             Some(Command::Down) => run_virsh_action(&env, "shutdown").context("down"),
             Some(Command::Kill) => run_virsh_action(&env, "destroy").context("kill"),
@@ -277,7 +276,7 @@ fn main() {
             Some(Command::Exec { args }) => run_ssh(&env, &args, true, false).context("exec"),
             Some(Command::Logs { args }) => run_logs(&env, &args).context("logs"),
             Some(Command::Stats) => run_stats(&env).context("stats"),
-            Some(Command::Wait { states }) => run_wait(&resolve_instance(&env, &resolve_flake_dir(&env)?)?, &states).context("wait"),
+            Some(Command::Wait { states }) => run_wait(&resolve_instance(&env)?, &states).context("wait"),
             Some(Command::Mount { path, name, read_only }) => run_mount(&env, path, name, true, read_only).context("mount"),
             Some(Command::Unmount { path }) => run_mount(&env, Some(path), None, false, false).context("unmount"),
             Some(Command::Port { guest_port, protocol }) => run_port(&env, guest_port, protocol.as_deref()).context("port"),
@@ -350,14 +349,14 @@ fn run_doctor(env: &Env) -> anyhow::Result<()> {
             println!("FileMachinePrefixExists:\t{}", flake_dir.join("machine-prefix").is_file());
             println!("FileAllowedHostsExists:\t\t{}", flake_dir.join("allowed_hosts").is_file());
             println!("FileFlakeLockExists:\t\t{}", flake_dir.join("flake.lock").is_file());
-            match list_instance_ids(env, &flake_dir) {
+            match list_instance_ids(env) {
                 Err(err) => println!("ListInstanceIdsError:\t\t{err:#}"),
                 Ok(ids) => println!("InstanceIds:\n\t{}", if ids.is_empty() { "none".into() } else { ids.join("\n\t") }),
             }
         }
     }
 
-    let instance = flake_dir.ok().map(|flake_dir| resolve_instance(env, &flake_dir));
+    let instance = flake_dir.ok().map(|_| resolve_instance(env));
     match instance {
         None => println!("InstanceId:\t\t\tN/A"),
         Some(Err(err)) => println!("ResolveInstanceError:\t\t{err:#}"),
@@ -411,7 +410,8 @@ fn resolve_flake_dir(env: &Env) -> anyhow::Result<PathBuf> {
 }
 
 #[inline(never)]
-fn resolve_instance(env: &Env, flake_dir: &Path) -> anyhow::Result<Instance> {
+fn resolve_instance(env: &Env) -> anyhow::Result<Instance> {
+    let flake_dir = resolve_flake_dir(env)?;
     let prefix_file = flake_dir.join("machine-prefix");
     let mut prefix = match fs::read_to_string(&prefix_file) {
         Ok(prefix) => prefix.trim().to_owned(),
@@ -419,7 +419,7 @@ fn resolve_instance(env: &Env, flake_dir: &Path) -> anyhow::Result<Instance> {
         Err(err) => return Err(err).context("read machine-prefix"),
     };
     if prefix.is_empty() {
-        prefix = Sha256::digest(fs::canonicalize(flake_dir).context("canonicalize flake dir")?.as_os_str().as_encoded_bytes())
+        prefix = Sha256::digest(fs::canonicalize(&flake_dir).context("canonicalize flake dir")?.as_os_str().as_encoded_bytes())
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>()[..24]
@@ -457,6 +457,7 @@ fn resolve_instance(env: &Env, flake_dir: &Path) -> anyhow::Result<Instance> {
         runtime_dir: env.runtime_root.join(&id),
         id,
         is_global: flake_dir == env.config_root,
+        flake_dir,
         sysroot: data_dir.join("sysroot"),
         persistent: data_dir.join("persistent"),
         logs_dir: state_dir.join("logs"),
@@ -535,8 +536,7 @@ fn write_template_config(target: &Path, workspace: &Path, force: bool) -> anyhow
 #[inline(never)]
 fn run_build_or_up(env: &Env, bootstrap: bool, is_up: bool, attach: bool, mut write_lock: bool) -> anyhow::Result<()> {
     let is_switch = is_up;
-    let flake_dir = resolve_flake_dir(env)?;
-    let instance = resolve_instance(env, &flake_dir)?;
+    let instance = resolve_instance(env)?;
     // Prepare the minimal instance directories before sysroot build, virtiofsd, or log writers touch them.
     for dir in [&instance.sysroot, &instance.persistent, &instance.logs_dir, &instance.runtime_dir] {
         fs::create_dir_all(dir).context("prepare instance directories")?;
@@ -548,14 +548,14 @@ fn run_build_or_up(env: &Env, bootstrap: bool, is_up: bool, attach: bool, mut wr
         install_initial_nixos_profile(&env.workspace, &instance.sysroot, "default")?;
     }
     // Provide a minimum writable flake.lock for the initial build.
-    if !flake_dir.join("flake.lock").exists() {
-        fs::write(flake_dir.join("flake.lock"), r#"{"root":"","version":7}"#).context("write flake.lock")?;
+    if !instance.flake_dir.join("flake.lock").exists() {
+        fs::write(instance.flake_dir.join("flake.lock"), r#"{"root":"","version":7}"#).context("write flake.lock")?;
         write_lock = true;
     }
     let domstate = domstate(&instance.id)?;
     match domstate.as_str() {
         "down" | "shut off" | "crashed" => {
-            let domain_profile = start_vm(env, &flake_dir, &instance, true)?;
+            let domain_profile = start_vm(env, &instance, true)?;
             let flake = format!("/persistent/etc/nixos#{}", env.hostname);
             run_ssh(env, &["nixos-rebuild", "boot", "--flake", &flake], true, true)?;
             let new_profile = read_system_profile(&instance)?;
@@ -564,7 +564,7 @@ fn run_build_or_up(env: &Env, bootstrap: bool, is_up: bool, attach: bool, mut wr
                 virsh(&["destroy", &instance.id]).context("return to down")?;
             } else if fs::read(domain_profile.join("domain.xml.sh"))? != fs::read(new_profile.join("domain.xml.sh"))? {
                 virsh(&["destroy", &instance.id]).context("restart")?;
-                start_vm(env, &flake_dir, &instance, false).context("restart")?;
+                start_vm(env, &instance, false).context("restart")?;
             } else {
                 run_ssh(env, &["systemctl", "isolate", "multi-user.target"], true, true).context("starting")?;
             }
@@ -761,7 +761,8 @@ fn virsh(args: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn list_instance_ids(env: &Env, flake_dir: &Path) -> anyhow::Result<Vec<String>> {
+fn list_instance_ids(env: &Env) -> anyhow::Result<Vec<String>> {
+    let flake_dir = resolve_flake_dir(env)?;
     let prefix = fs::read_to_string(flake_dir.join("machine-prefix")).context("read machine-prefix")?;
     let prefix = prefix.trim();
     Ok(fs::read_dir(&env.data_root)?
@@ -852,7 +853,7 @@ where
     }
 }
 
-fn start_vm(env: &Env, flake_dir: &Path, instance: &Instance, is_build: bool) -> anyhow::Result<PathBuf> {
+fn start_vm(env: &Env, instance: &Instance, is_build: bool) -> anyhow::Result<PathBuf> {
     let system_profile = read_system_profile(instance)?;
     let pv_socket = instance.runtime_dir.join("pv.sock");
     let pid_path = instance.runtime_dir.join("agentsandbox.pid");
@@ -868,7 +869,7 @@ fn start_vm(env: &Env, flake_dir: &Path, instance: &Instance, is_build: bool) ->
             mount_bind_recursive(&instance.persistent, &instance.persistent).context("self bind persistent dir")?;
             let shared_rec = MountPropagationFlags::SHARED | MountPropagationFlags::REC;
             mount_change(&instance.persistent, shared_rec).context("set persistent mount shared+rec")?;
-            apply_mounts(env, flake_dir, instance, &system_profile).context("apply configured mounts")?;
+            apply_mounts(env, instance, &system_profile).context("apply configured mounts")?;
             fs::write(&pid_path, format!("{}\n", process::id())).context("write pid file")?;
 
             let mut mask = KernelSigSet::empty();
@@ -908,7 +909,7 @@ fn start_vm(env: &Env, flake_dir: &Path, instance: &Instance, is_build: bool) ->
                 };
                 match unsafe { kernel_sigtimedwait(&mask, Some(&timeout)) } {
                     Ok(_info) => {
-                        let reload_result = apply_mounts(env, flake_dir, instance, &system_profile).context("reload mounts");
+                        let reload_result = apply_mounts(env, instance, &system_profile).context("reload mounts");
                         if let Err(err) = reload_result {
                             eprintln!("apply_mounts: {err}");
                         }
@@ -983,8 +984,8 @@ fn start_vm(env: &Env, flake_dir: &Path, instance: &Instance, is_build: bool) ->
 }
 
 /// Apply mounts from mounts file to the guest system.
-fn apply_mounts(env: &Env, flake_dir: &Path, instance: &Instance, system_profile: &Path) -> anyhow::Result<()> {
-    let mounts_path = flake_dir.join("mounts");
+fn apply_mounts(env: &Env, instance: &Instance, system_profile: &Path) -> anyhow::Result<()> {
+    let mounts_path = instance.flake_dir.join("mounts");
     let workspace_dir = instance.persistent.join("workspace");
     let config_dir = instance.persistent.join("etc/nixos");
     let mut mounted = Vec::new();
@@ -1032,7 +1033,7 @@ fn apply_mounts(env: &Env, flake_dir: &Path, instance: &Instance, system_profile
         parsed_mounts.push((source_abs, target, is_dir, mode));
     }
     parsed_mounts.push((
-        flake_dir.canonicalize().context("canonicalize config dir")?,
+        instance.flake_dir.canonicalize().context("canonicalize config dir")?,
         instance.persistent.join("etc/nixos"),
         true,
         system_profile.join("mutable-sandbox-config").exists(),
@@ -1110,7 +1111,7 @@ fn validate_mount_name_field(value: &str) -> anyhow::Result<()> {
 }
 
 fn run_virsh_action(env: &Env, action: &str) -> anyhow::Result<()> {
-    let instance = resolve_instance(env, &resolve_flake_dir(env)?)?;
+    let instance = resolve_instance(env)?;
     virsh(&[action, &instance.id])?;
     match action {
         "shutdown" => run_wait(&instance, &["down", "shut off", "crashed"]),
@@ -1119,8 +1120,7 @@ fn run_virsh_action(env: &Env, action: &str) -> anyhow::Result<()> {
 }
 
 fn run_virsh_action_all(env: &Env, action: &str) -> anyhow::Result<()> {
-    let flake_dir = resolve_flake_dir(env)?;
-    for id in list_instance_ids(env, &flake_dir)? {
+    for id in list_instance_ids(env)? {
         virsh(&[action, &id])?;
     }
     Ok(())
@@ -1128,8 +1128,7 @@ fn run_virsh_action_all(env: &Env, action: &str) -> anyhow::Result<()> {
 
 #[inline(never)]
 fn run_destroy(env: &Env, system: bool, data: bool, logs: bool, conf: bool) -> anyhow::Result<()> {
-    let flake_dir = resolve_flake_dir(env)?;
-    let instance = resolve_instance(env, &flake_dir)?;
+    let instance = resolve_instance(env)?;
     let _ = virsh(&["destroy", &instance.id]);
     if instance.is_global && !env.is_global {
         bail!("destroy files for the non-project instance requires --global");
@@ -1147,7 +1146,7 @@ fn run_destroy(env: &Env, system: bool, data: bool, logs: bool, conf: bool) -> a
         remove_dir_all_if_exists(&instance.state_dir)?;
     }
     if conf {
-        remove_dir_all_if_exists(&flake_dir)?;
+        remove_dir_all_if_exists(&instance.flake_dir)?;
     }
     Ok(())
 }
@@ -1162,8 +1161,7 @@ fn remove_dir_all_if_exists(path: &Path) -> anyhow::Result<()> {
 
 #[inline(never)]
 fn run_ps(env: &Env) -> anyhow::Result<()> {
-    let flake_dir = resolve_flake_dir(env)?;
-    for id in list_instance_ids(env, &flake_dir)? {
+    for id in list_instance_ids(env)? {
         println!("{id}\t{}", domstate(&id)?);
     }
     Ok(())
@@ -1171,8 +1169,7 @@ fn run_ps(env: &Env) -> anyhow::Result<()> {
 
 #[inline(never)]
 fn run_ssh<S: AsRef<str>>(env: &Env, args: &[S], is_root: bool, inherit_tty: bool) -> anyhow::Result<()> {
-    let flake_dir = resolve_flake_dir(env)?;
-    let instance = resolve_instance(env, &flake_dir)?;
+    let instance = resolve_instance(env)?;
     run_wait(&instance, &["running"])?;
     let (address, ssh_port) = (read_port_forwards_lookup(&instance, Some(22), Some("tcp"))?.1)
         .ok_or_else(|| anyhow::anyhow!("ssh port forward for guest tcp/22 is not configured"))?;
@@ -1212,8 +1209,7 @@ fn run_logs<S: AsRef<str>>(env: &Env, args: &[S]) -> anyhow::Result<()> {
 
 #[inline(never)]
 fn run_stats(env: &Env) -> anyhow::Result<()> {
-    let flake_dir = resolve_flake_dir(env)?;
-    for id in list_instance_ids(env, &flake_dir)? {
+    for id in list_instance_ids(env)? {
         let output = process::Command::new("virsh")
             .args(["domstats", &id, "--raw", "--state", "--cpu-total", "--vcpu", "--balloon"])
             .output()
@@ -1261,9 +1257,8 @@ fn run_wait<S: AsRef<str>>(instance: &Instance, states: &[S]) -> anyhow::Result<
 
 #[inline(never)]
 fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bool, read_only: bool) -> anyhow::Result<()> {
-    let flake_dir = resolve_flake_dir(env)?;
-    let instance = resolve_instance(env, &flake_dir)?;
-    let mounts_path = flake_dir.join("mounts");
+    let instance = resolve_instance(env)?;
+    let mounts_path = instance.flake_dir.join("mounts");
 
     let to_base_rel = |path: &Path| -> anyhow::Result<(PathBuf, PathBuf)> {
         let base_abs = env.workspace.canonicalize()?;
@@ -1358,8 +1353,7 @@ fn validate_mount_source_field(value: &str) -> anyhow::Result<()> {
 
 #[inline(never)]
 fn run_port(env: &Env, guest_port: Option<u16>, protocol: Option<&str>) -> anyhow::Result<()> {
-    let flake_dir = resolve_flake_dir(env)?;
-    let instance = resolve_instance(env, &flake_dir)?;
+    let instance = resolve_instance(env)?;
     match read_port_forwards_lookup(&instance, guest_port, protocol)? {
         (_, Some((address, host_port))) => println!("{address}:{host_port}"),
         (forwards, _) => {
@@ -1375,7 +1369,7 @@ fn run_port(env: &Env, guest_port: Option<u16>, protocol: Option<&str>) -> anyho
 
 #[inline(never)]
 fn run_verify(env: &Env) -> anyhow::Result<()> {
-    let instance = resolve_instance(env, &resolve_flake_dir(env)?)?;
+    let instance = resolve_instance(env)?;
     // Tried to obtain signatures for untrusted paths, but not effective.
     // $ nix store copy-sigs -rvs https://cache.nixos.org /nix/var/nix/profiles/system
     let output = process::Command::new("nix-store")
@@ -1400,7 +1394,7 @@ fn run_verify(env: &Env) -> anyhow::Result<()> {
 }
 
 fn run_audit(env: &Env, args: &[String]) -> anyhow::Result<()> {
-    let instance = resolve_instance(&env, &resolve_flake_dir(&env)?)?;
+    let instance = resolve_instance(env)?;
     let status = process::Command::new("vulnix")
         .args(["-g", &instance.sysroot.display().to_string()])
         .args(args)

@@ -531,18 +531,19 @@ pkgs.testers.runNixOSTest {
         let machine_id = Sha256::digest(b"default").iter().map(|byte| format!("{byte:02x}")).collect::<String>();
         let existing = format!("renamed-default-0123456789abcdef01234567{}", &machine_id[..8]);
         fs::create_dir_all(env.data_root.join(&existing)).unwrap();
-        assert_eq!(resolve_instance(&env, &flake_dir).unwrap().id, existing);
+        assert_eq!(resolve_instance(&env).unwrap().id, existing);
         let other_flake_dir = root.join("other").join(LOCAL_CONFIG_DIR);
         assert_dirs(&[&other_flake_dir, &root.join("data"), &root.join("state"), &root.join("runtime")]);
+        fs::write(other_flake_dir.join("flake.nix"), "").unwrap();
         fs::write(other_flake_dir.join("machine-prefix"), "0123456789abcdef01234567").unwrap();
         let mut other_env = env_from_input(
-            "/target".into(),
+            root.join("other"),
             "/home".into(),
             false,
             Some(("/config".into(), "/data".into(), "/state".into(), "/runtime".into())),
         );
         other_env.hostname = "demo".into();
-        let paths = resolve_instance(&other_env, &other_flake_dir).unwrap();
+        let paths = resolve_instance(&other_env).unwrap();
         let demo_machine_id = Sha256::digest(b"demo").iter().map(|byte| format!("{byte:02x}")).collect::<String>();
         assert_eq!(paths.id, "other-demo-0123456789abcdef01234567".to_owned() + &demo_machine_id[..8]);
         assert_eq!(paths.data_dir, PathBuf::from("/data").join(APP_NAME).join(&paths.id));
@@ -554,6 +555,7 @@ pkgs.testers.runNixOSTest {
         prepare(&Instance {
             id: "demo".into(),
             is_global: false,
+            flake_dir: root.join("flake"),
             data_dir: root.join("data"),
             state_dir: root.join("state"),
             runtime_dir: root.join("runtime"),
@@ -586,7 +588,7 @@ pkgs.testers.runNixOSTest {
         let env = env_from_input(workspace.clone(), home.clone(), false, None);
         let flake_dir = workspace.join(LOCAL_CONFIG_DIR);
         fs::write(flake_dir.join("machine-prefix"), "0123456789abcdef01234567").unwrap();
-        let paths = resolve_instance(&env, &flake_dir).unwrap();
+        let paths = resolve_instance(&env).unwrap();
 
         for (system, data, expect_sysroot, expect_persistent, expect_data_dir) in [
             (false, false, true, true, true),

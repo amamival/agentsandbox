@@ -532,7 +532,7 @@ fn run_build_or_up(env: &Env, bootstrap: bool, is_up: bool, attach: bool) -> any
         fetch_nix_dockerhub(&instance.sysroot).context("fetch")?;
     }
     if bootstrap || !instance.sysroot.join("nix/var/nix/profiles/system").is_symlink() {
-        install_initial_nixos_profile(&env.workspace, &instance.sysroot, &env.hostname)?;
+        install_initial_nixos_profile(&env.workspace, &instance.sysroot, "default")?;
     }
     if !flake_dir.join("flake.lock").exists() {
         let status = process::Command::new("nix")

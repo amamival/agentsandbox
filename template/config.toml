@@ -116,8 +116,8 @@ mutableSystemProfile = false
 # Forward guest listening ports to the host.
 # If you use multiple hostnames, be careful not to collide on SSH ports in particular.
 # `proto` must be `tcp` or `udp`. `address`, `dev`, and `host` are host-side network settings.
-# `guest_end` defaults to `guest` itself. If set, `guest..guest_end` are
-# forwarded one-to-one to `host..` ports.
+# `host_end` defaults to `host` itself. If set, `guest..` are
+# forwarded one-to-one to `host..host_end` ports.
 ssh = { proto = "tcp", address = "127.0.0.1", dev = "lo", host = 2223, guest = 22 }
 
 

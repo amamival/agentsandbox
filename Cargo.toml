@@ -30,3 +30,4 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.11.0"
 tar = "0.4.44"
+toml_edit = { version = "0.25.11", features = ["serde"] }

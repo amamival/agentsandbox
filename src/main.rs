@@ -16,15 +16,17 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     io::{IsTerminal as _, Read as _, Write as _},
+    net::IpAddr,
     os::fd::AsRawFd,
     os::unix::net::{UnixListener, UnixStream},
     os::unix::{fs::symlink, process::CommandExt},
     path::{Path, PathBuf},
     process::{self, Stdio},
 };
+use toml_edit::{DocumentMut, Item, Table};
 
 const APP_NAME: &str = "agentsandbox";
 const LOCAL_CONFIG_DIR: &str = ".agentsandbox";
@@ -243,14 +245,59 @@ struct Instance {
     logs_dir: PathBuf,
 }
 
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Config {
+    pub vm: Vm,
+    pub protection: Protection,
+    pub mounts: BTreeMap<String, PolicyEntry<Mount>>,
+    pub allowed_hosts: BTreeMap<String, PolicyEntry<AllowedHost>>,
+    pub port_forwards: BTreeMap<String, PolicyEntry<PortForward>>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Vm {
+    pub vcpus: Option<u32>,
+    pub memory_mi_b: Option<u32>,
+    pub libvirt_domain_xml: Option<String>,
+    pub allow_domain_xml: Option<PolicyEntry<String>>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Protection {
+    pub mutable_nix_store: Option<bool>,
+    pub mutable_system_profile: Option<bool>,
+}
+
 #[derive(Deserialize)]
-struct PortForward {
-    proto: String,
-    address: String,
-    dev: Option<String>,
-    host_start: u16,
-    host_end: u16,
-    guest: u16,
+pub struct Mount {
+    pub source: String,
+    pub readonly: Option<bool>,
+}
+
+#[derive(Deserialize)]
+pub struct AllowedHost {
+    pub fetch_allowlist: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+pub struct PortForward {
+    pub proto: String,
+    pub address: IpAddr,
+    pub dev: Option<String>,
+    #[serde(alias = "host_start")]
+    pub host: u16,
+    pub host_end: Option<u16>,
+    pub guest: u16,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub enum PolicyEntry<T> {
+    Remove(bool),
+    Set(T),
 }
 
 fn main() {
@@ -377,7 +424,10 @@ fn run_doctor(env: &Env) -> anyhow::Result<()> {
                     } else {
                         forwards
                             .iter()
-                            .map(|(name, f)| format!("\t{name}\t{}\t{}:{}-{}\t{}", f.proto, f.address, f.host_start, f.host_end, f.guest))
+                            .map(|(name, f)| {
+                                let end = f.host_end.unwrap_or(f.host);
+                                format!("\t{name}\t{}\t{}:{}-{end}\t{}", f.proto, f.address, f.host, f.guest)
+                            })
                             .collect::<Vec<String>>()
                             .join("\n")
                     }
@@ -478,10 +528,10 @@ fn read_port_forwards_lookup(
                 "ssh".into(),
                 PortForward {
                     proto: "tcp".to_owned(),
-                    address: "127.0.0.1".to_owned(),
+                    address: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                     dev: None,
-                    host_start: 2223,
-                    host_end: 2223,
+                    host: 2223,
+                    host_end: Some(2223),
                     guest: 22,
                 },
             )]));
@@ -491,15 +541,75 @@ fn read_port_forwards_lookup(
                 if protocol.is_some_and(|proto| f.proto != proto) {
                     continue;
                 }
-                let count = f.host_end - f.host_start + 1;
+                let count = f.host_end.unwrap_or(f.host) - f.host + 1;
                 if f.guest <= guest_port && guest_port <= f.guest + count - 1 {
-                    return Ok((BTreeMap::new(), Some((f.address.clone(), f.host_start + (guest_port - f.guest)))));
+                    return Ok((BTreeMap::new(), Some((f.address.to_string(), f.host + (guest_port - f.guest)))));
                 }
             }
             Ok((BTreeMap::new(), None))
         }
         None => Ok((forwards, None)),
     }
+}
+
+pub fn parse_config(config_toml: &str, local_toml: Option<&str>, host: &str, warn_allowed_hosts: bool) -> anyhow::Result<Config> {
+    let config: DocumentMut = config_toml.parse().context("parse config.toml")?;
+    let local: DocumentMut = local_toml.unwrap_or("").parse().context("parse config.local.toml")?;
+    let has_domain_xml = |v: &Item| v.get("vm").and_then(|vm| vm.get("allowDomainXml")).is_some();
+    if has_domain_xml(config.as_item())
+        || config
+            .get("hosts")
+            .and_then(Item::as_table)
+            .into_iter()
+            .flat_map(|table| table.iter().map(|(_, item)| item))
+            .any(has_domain_xml)
+    {
+        bail!("allowDomainXml is only allowed in config.local.toml");
+    }
+    let config_host = config.get("hosts").and_then(|hosts| hosts.get(host));
+    let local_host = local.get("hosts").and_then(|hosts| hosts.get(host));
+
+    if warn_allowed_hosts && !local.is_empty() {
+        let names = |roots: [Option<&Item>; 2]| -> BTreeSet<String> {
+            roots
+                .into_iter()
+                .flatten()
+                .flat_map(|v| v.get("allowedHosts").and_then(Item::as_table).into_iter())
+                .flat_map(|table| table.iter().map(|(key, _)| key.to_owned()))
+                .collect()
+        };
+        for name in names([Some(config.as_item()), config_host]).difference(&names([Some(local.as_item()), local_host])) {
+            eprintln!("warning: config.toml allows allowedHosts.{name:?}; use config.local.toml enable = false to disable");
+        }
+    }
+
+    fn merge(dst: &mut Table, src: &Table) {
+        for (key, value) in src {
+            if key == "hosts" {
+                continue;
+            }
+            match (dst.get_mut(key), value) {
+                (Some(Item::Table(dst)), Item::Table(src)) => merge(dst, src),
+                _ => {
+                    dst.insert(key, value.clone());
+                }
+            }
+        }
+    }
+
+    let mut out = DocumentMut::new();
+    for src in [
+        Some(config.as_table()),
+        Some(local.as_table()),
+        config_host.and_then(Item::as_table),
+        local_host.and_then(Item::as_table),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        merge(out.as_table_mut(), src);
+    }
+    toml_edit::de::from_document(out).map_err(Into::into)
 }
 
 // Create the config dir and initial files for local/global init, or return a displayable error.
@@ -1358,7 +1468,7 @@ fn run_port(env: &Env, guest_port: Option<u16>, protocol: Option<&str>) -> anyho
         (_, Some((address, host_port))) => println!("{address}:{host_port}"),
         (forwards, _) => {
             for (name, f) in forwards {
-                for host_port in f.host_start..=f.host_end {
+                for host_port in f.host..=f.host_end.unwrap_or(f.host) {
                     println!("{name}\t{}\t{}:{host_port}\t{}", f.proto, f.address, f.dev.clone().unwrap_or_default());
                 }
             }

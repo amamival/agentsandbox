@@ -1,0 +1,18 @@
+# Private launcher policy.
+# CLI commands edit this file of hostname-specific sections.
+# This file has same structure and overrides config.toml.
+
+# A local section is an effective override for that hostname. If a CLI command
+# edits mounts, it should first expand the effective mounts into this section.
+
+[hosts.default.vm]
+# To allow `libvirtDomainXml`, set its SHA265 hash or use `true` in `local.toml`.
+# Use this only if you know what you are doing, since it can damage host devices or cause leaks.
+allowDomainXml = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+[hosts.default.mounts]
+"repo" = { source = ".", readonly = false }
+"scratch" = { source = "/tmp/agentsandbox-scratch", readonly = false }
+
+[hosts.default.allowedHosts]
+"example.com" = { enable = false } # To disable `config.toml` policy.

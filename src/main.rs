@@ -1036,7 +1036,7 @@ fn apply_mounts(env: &Env, instance: &Instance, system_profile: &Path) -> anyhow
         instance.flake_dir.canonicalize().context("canonicalize config dir")?,
         instance.persistent.join("etc/nixos"),
         true,
-        system_profile.join("mutable-sandbox-config").exists(),
+        true, //system_profile.join("mutable-sandbox-config").exists(),
     ));
     parsed_mounts.sort_by(|a, b| a.1.cmp(&b.1));
 

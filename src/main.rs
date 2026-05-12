@@ -30,6 +30,8 @@ use toml_edit::{DocumentMut, Item, Table};
 
 const APP_NAME: &str = "agentsandbox";
 const LOCAL_CONFIG_DIR: &str = ".agentsandbox";
+const CONFIG_TOML: &str = concat!(env!("CARGO_PKG_NAME"), ".toml");
+const CONFIG_LOCAL_TOML: &str = concat!(env!("CARGO_PKG_NAME"), ".local.toml");
 
 #[derive(Parser)]
 #[command(
@@ -41,6 +43,9 @@ struct Cli {
     /// Use only global config (`$XDG_CONFIG_HOME/agentsandbox`) and skip local upward search.
     #[arg(short = 'g', long, global = true)]
     global: bool,
+    /// Select project name. Combined with hostname to form the instance name.
+    #[arg(short = 'p', long, global = true, env = "AGENTSANDBOX_PROJECT_NAME")]
+    project_name: Option<String>,
     /// Select sandbox hostname (build target and instance identity input).
     #[arg(short = 'n', long, global = true, default_value = "default")]
     hostname: String,
@@ -118,6 +123,8 @@ enum Command {
         #[arg(short = 'c', long)]
         conf: bool,
     },
+    /// List all VMs stored
+    Ls,
     /// List VM statuses for all hostnames in the current config
     Ps,
     /// Run a command as a user in a running VM, or attach if omitted
@@ -224,6 +231,7 @@ Vulnix Options:
 #[derive(Debug, PartialEq, Eq)]
 struct Env {
     is_global: bool,
+    project_name: String,
     hostname: String,
     workspace: PathBuf,
     config_root: PathBuf,
@@ -318,6 +326,7 @@ fn main() {
             Some(Command::Pause) => run_virsh_action_all(&env, "suspend").context("pause"),
             Some(Command::Unpause) => run_virsh_action_all(&env, "resume").context("unpause"),
             Some(Command::Destroy { system, data, logs, conf }) => run_destroy(&env, system, data, logs, conf).context("destroy"),
+            Some(Command::Ls) => run_ls(&env).context("ls"),
             Some(Command::Ps) => run_ps(&env).context("ps"),
             Some(Command::Ssh { args }) => run_ssh(&env, &args, false, false).context("ssh"),
             Some(Command::Exec { args }) => run_ssh(&env, &args, true, false).context("exec"),
@@ -347,6 +356,13 @@ fn resolve_env(cli: &Cli) -> anyhow::Result<Env> {
     Ok(Env {
         is_global: cli.global,
         hostname: cli.hostname.clone(),
+        project_name: cli.project_name.clone().unwrap_or_else(|| {
+            if cli.global {
+                APP_NAME.to_owned()
+            } else {
+                cli.workspace.file_name().and_then(|name| name.to_str()).unwrap_or(APP_NAME).to_owned()
+            }
+        }),
         workspace: cli.workspace.clone(),
         config_root: cli.xdg_config_home.clone().unwrap_or_else(|| home.join(".config")).join(APP_NAME),
         data_root: cli.xdg_data_home.clone().unwrap_or_else(|| home.join(".local/share")).join(APP_NAME),
@@ -372,6 +388,7 @@ fn run_doctor(env: &Env) -> anyhow::Result<()> {
     println!("AppName:\t\t\t{}", APP_NAME);
     println!("Version:\t\t\t{}", env!("CARGO_PKG_VERSION"));
     println!("CmdVirshPath:\t\t\t{}", resolve_cmd_path("virsh"));
+    println!("CmdPasstPath:\t\t\t{}", resolve_cmd_path("passt"));
     println!("CmdSshPath:\t\t\t{}", resolve_cmd_path("ssh"));
     println!("CmdVirtiofsdPath:\t\t{}", resolve_cmd_path("virtiofsd"));
     println!("CmdUnsharePath:\t\t\t{}", resolve_cmd_path("unshare"));
@@ -385,6 +402,7 @@ fn run_doctor(env: &Env) -> anyhow::Result<()> {
     println!("WorkspaceArg:\t\t\t{}", env.workspace.display());
     println!("IsUserGlobalProject:\t\t{}", env.is_global);
     println!("InstanceHostnameArg:\t\t{}", env.hostname);
+    println!("ProjectNameArg:\t\t\t{}", env.project_name);
 
     let flake_dir = resolve_flake_dir(env);
     match &flake_dir {
@@ -393,7 +411,6 @@ fn run_doctor(env: &Env) -> anyhow::Result<()> {
             println!("ResolvedFlakeDir:\t\t{}", flake_dir.display());
             println!("FileFlakeNixExists:\t\t{}", flake_dir.join("flake.nix").is_file());
             println!("FileMountsExists:\t\t{}", flake_dir.join("mounts").is_file());
-            println!("FileMachinePrefixExists:\t{}", flake_dir.join("machine-prefix").is_file());
             println!("FileAllowedHostsExists:\t\t{}", flake_dir.join("allowed_hosts").is_file());
             println!("FileFlakeLockExists:\t\t{}", flake_dir.join("flake.lock").is_file());
             match list_instance_ids(env) {
@@ -444,69 +461,35 @@ fn resolve_flake_dir(env: &Env) -> anyhow::Result<PathBuf> {
     if !env.is_global {
         let mut dir = env.workspace.clone();
         loop {
-            if dir.join(format!("{LOCAL_CONFIG_DIR}/flake.nix")).is_file() {
+            if dir.join(LOCAL_CONFIG_DIR).is_dir() {
                 return Ok(dir.join(LOCAL_CONFIG_DIR));
+            }
+            if dir.join(CONFIG_TOML).is_file() || dir.join(CONFIG_LOCAL_TOML).is_file() {
+                return Ok(dir);
             }
             if !dir.pop() {
                 break;
             }
         }
     }
-    if env.config_root.join("flake.nix").is_file() {
-        Ok(env.config_root.clone())
+    let global_flake_dir = env.config_root.join(&env.project_name);
+    if global_flake_dir.join(CONFIG_TOML).is_file() {
+        Ok(global_flake_dir)
     } else {
-        bail!("{} not found. Try `agentsandbox init` to start in a new project.", env.config_root.display())
+        bail!("{} not found. Try `agentsandbox init` to start in a new project.", global_flake_dir.display())
     }
 }
 
 #[inline(never)]
 fn resolve_instance(env: &Env) -> anyhow::Result<Instance> {
     let flake_dir = resolve_flake_dir(env)?;
-    let prefix_file = flake_dir.join("machine-prefix");
-    let mut prefix = match fs::read_to_string(&prefix_file) {
-        Ok(prefix) => prefix.trim().to_owned(),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(err) => return Err(err).context("read machine-prefix"),
-    };
-    if prefix.is_empty() {
-        prefix = Sha256::digest(fs::canonicalize(&flake_dir).context("canonicalize flake dir")?.as_os_str().as_encoded_bytes())
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()[..24]
-            .to_owned();
-        fs::write(&prefix_file, &prefix).context("write machine-prefix")?;
-    }
-    let machine_id = format!(
-        "{prefix}{}",
-        Sha256::digest(env.hostname.as_bytes())
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-    );
-    let machine_id = &machine_id[..32];
-    let name = if flake_dir.ends_with(LOCAL_CONFIG_DIR) {
-        flake_dir
-            .parent()
-            .and_then(Path::file_name)
-            .and_then(|name| name.to_str())
-            .context("derive workspace name")?
-    } else {
-        APP_NAME
-    };
-    let id = fs::read_dir(&env.data_root)
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .find(|entry| entry.ends_with(machine_id))
-        .unwrap_or_else(|| format!("{name}-{}-{machine_id}", env.hostname));
+    let id = format!("{}[{}]", env.project_name, env.hostname);
     let data_dir = env.data_root.join(&id);
     let state_dir = env.state_root.join(&id);
     Ok(Instance {
         runtime_dir: env.runtime_root.join(&id),
         id,
-        is_global: flake_dir == env.config_root,
+        is_global: flake_dir == env.config_root.join(&env.project_name),
         flake_dir,
         sysroot: data_dir.join("sysroot"),
         persistent: data_dir.join("persistent"),
@@ -553,8 +536,8 @@ fn read_port_forwards_lookup(
 }
 
 pub fn parse_config(config_toml: &str, local_toml: Option<&str>, host: &str, warn_allowed_hosts: bool) -> anyhow::Result<Config> {
-    let config: DocumentMut = config_toml.parse().context("parse config.toml")?;
-    let local: DocumentMut = local_toml.unwrap_or("").parse().context("parse config.local.toml")?;
+    let config: DocumentMut = config_toml.parse().context(format!("parse {CONFIG_TOML}"))?;
+    let local: DocumentMut = local_toml.unwrap_or("").parse().context(format!("parse {CONFIG_LOCAL_TOML}"))?;
     let has_domain_xml = |v: &Item| v.get("vm").and_then(|vm| vm.get("allowDomainXml")).is_some();
     if has_domain_xml(config.as_item())
         || config
@@ -564,11 +547,12 @@ pub fn parse_config(config_toml: &str, local_toml: Option<&str>, host: &str, war
             .flat_map(|table| table.iter().map(|(_, item)| item))
             .any(has_domain_xml)
     {
-        bail!("allowDomainXml is only allowed in config.local.toml");
+        bail!("allowDomainXml is only allowed in {}", CONFIG_LOCAL_TOML);
     }
     let config_host = config.get("hosts").and_then(|hosts| hosts.get(host));
     let local_host = local.get("hosts").and_then(|hosts| hosts.get(host));
 
+    /* // TODO: add allow-domain option to accept new domains, then add an instruction to use it.
     if warn_allowed_hosts && !local.is_empty() {
         let names = |roots: [Option<&Item>; 2]| -> BTreeSet<String> {
             roots
@@ -579,9 +563,9 @@ pub fn parse_config(config_toml: &str, local_toml: Option<&str>, host: &str, war
                 .collect()
         };
         for name in names([Some(config.as_item()), config_host]).difference(&names([Some(local.as_item()), local_host])) {
-            eprintln!("warning: config.toml allows allowedHosts.{name:?}; use config.local.toml enable = false to disable");
+            eprintln!("warning: {CONFIG_TOML} allows allowedHosts.{name:?}; use {CONFIG_LOCAL_TOML} enable = false to disable");
         }
-    }
+    }*/
 
     fn merge(dst: &mut Table, src: &Table) {
         for (key, value) in src {
@@ -616,7 +600,7 @@ pub fn parse_config(config_toml: &str, local_toml: Option<&str>, host: &str, war
 #[inline(never)]
 fn run_init(env: &Env, force: bool) -> anyhow::Result<()> {
     let target = if env.is_global {
-        env.config_root.clone()
+        env.config_root.join(&env.project_name)
     } else {
         env.workspace.join(LOCAL_CONFIG_DIR)
     };
@@ -630,13 +614,16 @@ fn write_template_config(target: &Path, workspace: &Path, force: bool) -> anyhow
         bail!("{} already exists", target.display());
     }
     let workspace_name = workspace.file_name().and_then(|name| name.to_str()).context("derive workspace name")?;
-    fs::create_dir_all(target.join("agentsandbox")).context("create agentsandbox dir")?;
+    fs::create_dir_all(target.join(APP_NAME)).context("create agentsandbox dir")?;
+    let app_flake = format!("{APP_NAME}/flake.nix");
+    let config_template = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/template/", env!("CARGO_PKG_NAME"), ".toml"));
     for (name, contents) in [
+        (CONFIG_TOML, config_template.to_owned()),
         ("flake.nix", include_str!("../template/flake.nix").to_owned()),
         ("configuration.nix", include_str!("../template/configuration.nix").to_owned()),
         ("allowed_hosts", include_str!("../template/allowed_hosts").to_owned()),
         ("mounts", format!("# <host-path><TAB><guest-name><TAB><mode>\n.\t{workspace_name}\trw\n")),
-        ("agentsandbox/flake.nix", include_str!("../template/agentsandbox/flake.nix").to_owned()),
+        (app_flake.as_str(), include_str!("../template/agentsandbox/flake.nix").to_owned()),
     ] {
         fs::write(target.join(name), contents).context("write template file")?;
     }
@@ -872,12 +859,12 @@ fn virsh(args: &[&str]) -> anyhow::Result<()> {
 }
 
 fn list_instance_ids(env: &Env) -> anyhow::Result<Vec<String>> {
-    let flake_dir = resolve_flake_dir(env)?;
-    let prefix = fs::read_to_string(flake_dir.join("machine-prefix")).context("read machine-prefix")?;
-    let prefix = prefix.trim();
     Ok(fs::read_dir(&env.data_root)?
-        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
-        .filter(|id| id.get(id.len().saturating_sub(32)..id.len().saturating_sub(8)) == Some(prefix))
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            entry.file_type().ok()?.is_dir().then(|| entry.file_name().into_string().ok())?
+        })
+        .filter(|id| id.rsplit_once('[').map(|(name, _)| name) == Some(env.project_name.as_str()))
         .collect())
 }
 
@@ -1040,7 +1027,11 @@ fn start_vm(env: &Env, instance: &Instance, is_build: bool) -> anyhow::Result<Pa
     drop(child_sock);
     let mut ready = [0_u8; 1];
     parent_sock.read_exact(&mut ready).context("wait for virtiofs socket readiness notification")?;
-    let machine_id = &instance.id[instance.id.len() - 32..];
+    let machine_id = Sha256::digest(instance.id.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()[..32]
+        .to_owned();
     let domain_uuid = format!(
         "{}-{}-{}-{}-{}",
         &machine_id[..8],
@@ -1267,6 +1258,23 @@ fn remove_dir_all_if_exists(path: &Path) -> anyhow::Result<()> {
         fs::remove_dir_all(path)?;
     }
     Ok(())
+}
+
+#[inline(never)]
+fn run_ls(env: &Env) -> anyhow::Result<()> {
+    match fs::read_dir(&env.data_root) {
+        Ok(entries) => {
+            for id in entries.filter_map(|entry| {
+                let entry = entry.ok()?;
+                entry.file_type().ok()?.is_dir().then(|| entry.file_name().into_string().ok())?
+            }) {
+                println!("{id}");
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).context("read instance data root"),
+    }
 }
 
 #[inline(never)]

@@ -336,6 +336,8 @@ fn main() {
             Some(Command::Mount { path, name, read_only }) => run_mount(&env, path, name, true, read_only).context("mount"),
             Some(Command::Unmount { path }) => run_mount(&env, Some(path), None, false, false).context("unmount"),
             Some(Command::Port { guest_port, protocol }) => run_port(&env, guest_port, protocol.as_deref()).context("port"),
+            Some(Command::AllowDomain { domain }) => run_allow_domain(&env, &domain).context("allow-domain"),
+            Some(Command::UnallowDomain { domain }) => run_unallow_domain(&env, &domain).context("unallow-domain"),
             Some(Command::Verify) => run_verify(&env).context("verify"),
             Some(Command::Audit { args }) => run_audit(&env, &args).context("audit"),
             None | Some(_) => {
@@ -1377,6 +1379,8 @@ fn run_wait<S: AsRef<str>>(instance: &Instance, states: &[S]) -> anyhow::Result<
 fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bool, read_only: bool) -> anyhow::Result<()> {
     let instance = resolve_instance(env)?;
     let mounts_path = instance.flake_dir.join("mounts");
+    let config_toml_path = instance.flake_dir.join(CONFIG_TOML);
+    let config_local_toml_path = instance.flake_dir.join(CONFIG_LOCAL_TOML);
 
     let to_base_rel = |path: &Path| -> anyhow::Result<(PathBuf, PathBuf)> {
         let base_abs = env.workspace.canonicalize()?;
@@ -1438,7 +1442,7 @@ fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bo
             }
         }
     }
-    if let Some(new_entry) = new_entry {
+    if let Some(new_entry) = new_entry.as_ref() {
         updated = true;
         let mode = if read_only { "ro" } else { "rw" };
         contents.push_str(&format!("{}\t{}\t{mode}\n", new_entry.0.display(), new_entry.1));
@@ -1447,6 +1451,65 @@ fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bo
         eprintln!("unmount: no changes to apply");
         return Ok(());
     }
+
+    let config_toml_contents = fs::read_to_string(&config_toml_path).context(format!("read {CONFIG_TOML}"))?;
+    let config_local_toml_contents = fs::read_to_string(&config_local_toml_path).unwrap_or_default();
+
+    // The CLI still writes the historical mounts file because it is the live
+    // policy source for the current mount reload path.  The local TOML update
+    // exists to preserve the same user action in the structured config without
+    // changing the runtime reader in this task.
+    parse_config(&config_toml_contents, Some(&config_local_toml_contents), &env.hostname, false)
+        .context("validate current TOML config")?;
+
+    let mut config_local_toml: DocumentMut = config_local_toml_contents.parse().context(format!("parse {CONFIG_LOCAL_TOML}"))?;
+    if let Some((source, name)) = new_entry.as_ref() {
+        let source = source.display().to_string();
+
+        // The flat mounts file is still allowed to contain entries that local
+        // TOML does not know about.  That is the migration state this task is
+        // preserving.  The one case we must reject is a local TOML entry with
+        // the same guest name but a different host source, because accepting it
+        // would silently turn one target name into two conflicting policies.
+        let existing_source = config_local_toml
+            .get("hosts")
+            .and_then(|hosts| hosts.get(&env.hostname))
+            .and_then(|host| host.get("mounts"))
+            .and_then(|mounts| mounts.get(name))
+            .and_then(|mount| mount.get("source"))
+            .and_then(|source| source.as_str());
+        if existing_source.is_some_and(|existing_source| existing_source != source) {
+            bail!("{CONFIG_LOCAL_TOML}: hosts.{}.mounts.{name} already exists with a different source", env.hostname);
+        }
+
+        // Index assignment is intentionally used after parse_config validation.
+        // That keeps structural errors on the existing Config deserializer path,
+        // while still letting toml_edit create missing hosts/hostname/mounts
+        // tables and preserve unrelated comments and ordering.
+        let mut mount = toml_edit::InlineTable::new();
+        mount.insert("source", toml_edit::Value::from(source));
+        mount.insert("readonly", toml_edit::Value::from(read_only));
+        config_local_toml["hosts"][env.hostname.as_str()]["mounts"][name.as_str()] = toml_edit::value(mount);
+    }
+    if let Some(source) = kill_entry.as_ref() {
+        if let Some(mounts) = config_local_toml
+            .get_mut("hosts")
+            .and_then(|hosts| hosts.get_mut(&env.hostname))
+            .and_then(|host| host.get_mut("mounts"))
+            .and_then(Item::as_table_like_mut)
+        {
+            // Unmount is source-oriented in the existing CLI, while TOML is
+            // keyed by guest mount name.  We therefore search by the preserved
+            // source string rather than guessing the name from the path again.
+            let name = mounts.iter().find_map(|(name, mount)| {
+                (mount.get("source").and_then(|source| source.as_str()) == Some(source.as_str())).then(|| name.to_owned())
+            });
+            if let Some(name) = name {
+                mounts.remove(&name);
+            }
+        }
+    }
+    fs::write(&config_local_toml_path, config_local_toml.to_string()).context(format!("write {CONFIG_LOCAL_TOML}"))?;
     fs::write(&mounts_path, contents)?;
 
     let pid_path = instance.runtime_dir.join("agentsandbox.pid");
@@ -1459,6 +1522,156 @@ fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bo
         }
         eprintln!("mounts: reloading");
     }
+    Ok(())
+}
+
+fn parse_allowed_host_cli_argument(domain: &str) -> anyhow::Result<String> {
+    // This CLI edits allowlist keys, not URLs.  Accepting URLs, paths, ports,
+    // or root-dot spellings here would hide accidental input shape mistakes and
+    // make the persisted TOML differ from the form users should review by hand.
+    // Uppercase is the only tolerated non-storage spelling because DNS host
+    // labels are case-insensitive and the stored policy key should be stable.
+    if domain.is_empty()
+        || domain != domain.trim()
+        || domain.ends_with('.')
+        || domain.contains(['\t', '\n', ' ', '/', '?', '#', ':'])
+        || domain.contains("://")
+    {
+        bail!("invalid domain: use a host such as example.com or *.example.com");
+    }
+
+    let domain = domain.to_ascii_lowercase();
+    let host_without_wildcard = match domain.strip_prefix("*.") {
+        Some(host_without_wildcard) => host_without_wildcard,
+        None => {
+            if domain.contains('*') {
+                bail!("invalid domain: use a host such as example.com or *.example.com");
+            }
+            domain.as_str()
+        }
+    };
+
+    // Keep the accepted key syntax deliberately narrow.  The downstream policy
+    // file and TOML are host/glob allowlists; allowing empty labels or unusual
+    // characters would create entries that look intentional but are unlikely to
+    // match the user's domain intent.
+    if host_without_wildcard.is_empty()
+        || host_without_wildcard.contains('*')
+        || host_without_wildcard.split('.').any(|label| {
+            label.is_empty()
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label.chars().all(|char| char.is_ascii_alphanumeric() || char == '-')
+        })
+    {
+        bail!("invalid domain: use a host such as example.com or *.example.com");
+    }
+
+    Ok(domain)
+}
+
+#[inline(never)]
+fn run_allow_domain(env: &Env, domain: &str) -> anyhow::Result<()> {
+    let instance = resolve_instance(env)?;
+    let allowed_hosts_path = instance.flake_dir.join("allowed_hosts");
+    let config_toml_path = instance.flake_dir.join(CONFIG_TOML);
+    let config_local_toml_path = instance.flake_dir.join(CONFIG_LOCAL_TOML);
+
+    let normalized_domain = parse_allowed_host_cli_argument(domain)?;
+
+    let mut allowed_hosts_contents = String::new();
+    let mut already_allowed_in_plain_file = false;
+
+    // Preserve comments and unrelated lines in the historical allowlist file.
+    // Only exact duplicates of the normalized domain are collapsed, matching
+    // the current plain-file behavior instead of reinterpreting the file as
+    // TOML or as an effective merged policy.
+    for line in fs::read_to_string(&allowed_hosts_path)?.lines() {
+        if line == normalized_domain {
+            already_allowed_in_plain_file = true;
+        }
+        allowed_hosts_contents.push_str(line);
+        allowed_hosts_contents.push('\n');
+    }
+    if !already_allowed_in_plain_file {
+        allowed_hosts_contents.push_str(&normalized_domain);
+        allowed_hosts_contents.push('\n');
+    }
+
+    let config_toml_contents = fs::read_to_string(&config_toml_path).context(format!("read {CONFIG_TOML}"))?;
+    let config_local_toml_contents = fs::read_to_string(&config_local_toml_path).unwrap_or_default();
+
+    // The flat allowlist remains the current runtime source.  The TOML write is
+    // deliberately parallel state: it records the same allow action for config
+    // preservation, and it converts a previous local false override back into
+    // an allow entry because that is what this CLI command explicitly requests.
+    parse_config(&config_toml_contents, Some(&config_local_toml_contents), &env.hostname, false)
+        .context("validate current TOML config")?;
+
+    let mut config_local_toml: DocumentMut = config_local_toml_contents.parse().context(format!("parse {CONFIG_LOCAL_TOML}"))?;
+    config_local_toml["hosts"][env.hostname.as_str()]["allowedHosts"][normalized_domain.as_str()] =
+        toml_edit::value(toml_edit::InlineTable::new());
+    fs::write(&config_local_toml_path, config_local_toml.to_string()).context(format!("write {CONFIG_LOCAL_TOML}"))?;
+    fs::write(&allowed_hosts_path, allowed_hosts_contents)?;
+    Ok(())
+}
+
+#[inline(never)]
+fn run_unallow_domain(env: &Env, domain: &str) -> anyhow::Result<()> {
+    let instance = resolve_instance(env)?;
+    let allowed_hosts_path = instance.flake_dir.join("allowed_hosts");
+    let config_toml_path = instance.flake_dir.join(CONFIG_TOML);
+    let config_local_toml_path = instance.flake_dir.join(CONFIG_LOCAL_TOML);
+
+    let normalized_domain = parse_allowed_host_cli_argument(domain)?;
+
+    let mut allowed_hosts_contents = String::new();
+
+    // The runtime file has no negative entry syntax; removing the exact line is
+    // the whole operation there.  Any need to suppress a base TOML allow is
+    // handled below in agentsandbox.local.toml with an explicit false value.
+    for line in fs::read_to_string(&allowed_hosts_path)?.lines() {
+        if line != normalized_domain {
+            allowed_hosts_contents.push_str(line);
+            allowed_hosts_contents.push('\n');
+        }
+    }
+
+    let config_toml_contents = fs::read_to_string(&config_toml_path).context(format!("read {CONFIG_TOML}"))?;
+    let config_local_toml_contents = fs::read_to_string(&config_local_toml_path).unwrap_or_default();
+
+    // A delete in local TOML is not always enough: if the base config allows
+    // the same domain, removing the local key would expose the base allow again
+    // after Config merging.  In that case the CLI records false in local TOML,
+    // because the user's unallow action has to survive the base policy.
+    parse_config(&config_toml_contents, Some(&config_local_toml_contents), &env.hostname, false)
+        .context("validate current TOML config")?;
+
+    let config_toml: DocumentMut = config_toml_contents.parse().context(format!("parse {CONFIG_TOML}"))?;
+    let allowed_by_base_config = config_toml
+        .get("allowedHosts")
+        .and_then(|allowed_hosts| allowed_hosts.get(&normalized_domain))
+        .is_some()
+        || config_toml
+            .get("hosts")
+            .and_then(|hosts| hosts.get(&env.hostname))
+            .and_then(|host| host.get("allowedHosts"))
+            .and_then(|allowed_hosts| allowed_hosts.get(&normalized_domain))
+            .is_some();
+
+    let mut config_local_toml: DocumentMut = config_local_toml_contents.parse().context(format!("parse {CONFIG_LOCAL_TOML}"))?;
+    if allowed_by_base_config {
+        config_local_toml["hosts"][env.hostname.as_str()]["allowedHosts"][normalized_domain.as_str()] = toml_edit::value(false);
+    } else if let Some(allowed_hosts) = config_local_toml
+        .get_mut("hosts")
+        .and_then(|hosts| hosts.get_mut(&env.hostname))
+        .and_then(|host| host.get_mut("allowedHosts"))
+        .and_then(Item::as_table_like_mut)
+    {
+        allowed_hosts.remove(&normalized_domain);
+    }
+    fs::write(&config_local_toml_path, config_local_toml.to_string()).context(format!("write {CONFIG_LOCAL_TOML}"))?;
+    fs::write(&allowed_hosts_path, allowed_hosts_contents)?;
     Ok(())
 }
 

@@ -1459,8 +1459,7 @@ fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bo
     // policy source for the current mount reload path.  The local TOML update
     // exists to preserve the same user action in the structured config without
     // changing the runtime reader in this task.
-    parse_config(&config_toml_contents, Some(&config_local_toml_contents), &env.hostname, false)
-        .context("validate current TOML config")?;
+    parse_config(&config_toml_contents, Some(&config_local_toml_contents), &env.hostname, false).context("validate current TOML config")?;
 
     let mut config_local_toml: DocumentMut = config_local_toml_contents.parse().context(format!("parse {CONFIG_LOCAL_TOML}"))?;
     if let Some((source, name)) = new_entry.as_ref() {
@@ -1479,7 +1478,10 @@ fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bo
             .and_then(|mount| mount.get("source"))
             .and_then(|source| source.as_str());
         if existing_source.is_some_and(|existing_source| existing_source != source) {
-            bail!("{CONFIG_LOCAL_TOML}: hosts.{}.mounts.{name} already exists with a different source", env.hostname);
+            bail!(
+                "{CONFIG_LOCAL_TOML}: hosts.{}.mounts.{name} already exists with a different source",
+                env.hostname
+            );
         }
 
         // Index assignment is intentionally used after parse_config validation.
@@ -1501,9 +1503,9 @@ fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bo
             // Unmount is source-oriented in the existing CLI, while TOML is
             // keyed by guest mount name.  We therefore search by the preserved
             // source string rather than guessing the name from the path again.
-            let name = mounts.iter().find_map(|(name, mount)| {
-                (mount.get("source").and_then(|source| source.as_str()) == Some(source.as_str())).then(|| name.to_owned())
-            });
+            let name = mounts
+                .iter()
+                .find_map(|(name, mount)| (mount.get("source").and_then(|source| source.as_str()) == Some(source.as_str())).then(|| name.to_owned()));
             if let Some(name) = name {
                 mounts.remove(&name);
             }
@@ -1531,11 +1533,7 @@ fn parse_allowed_host_cli_argument(domain: &str) -> anyhow::Result<String> {
     // make the persisted TOML differ from the form users should review by hand.
     // Uppercase is the only tolerated non-storage spelling because DNS host
     // labels are case-insensitive and the stored policy key should be stable.
-    if domain.is_empty()
-        || domain != domain.trim()
-        || domain.ends_with('.')
-        || domain.contains(['\t', '\n', ' ', '/', '?', '#', ':'])
-        || domain.contains("://")
+    if domain.is_empty() || domain != domain.trim() || domain.ends_with('.') || domain.contains(['\t', '\n', ' ', '/', '?', '#', ':']) || domain.contains("://")
     {
         bail!("invalid domain: use a host such as example.com or *.example.com");
     }
@@ -1558,10 +1556,7 @@ fn parse_allowed_host_cli_argument(domain: &str) -> anyhow::Result<String> {
     if host_without_wildcard.is_empty()
         || host_without_wildcard.contains('*')
         || host_without_wildcard.split('.').any(|label| {
-            label.is_empty()
-                || label.starts_with('-')
-                || label.ends_with('-')
-                || !label.chars().all(|char| char.is_ascii_alphanumeric() || char == '-')
+            label.is_empty() || label.starts_with('-') || label.ends_with('-') || !label.chars().all(|char| char.is_ascii_alphanumeric() || char == '-')
         })
     {
         bail!("invalid domain: use a host such as example.com or *.example.com");
@@ -1605,12 +1600,10 @@ fn run_allow_domain(env: &Env, domain: &str) -> anyhow::Result<()> {
     // deliberately parallel state: it records the same allow action for config
     // preservation, and it converts a previous local false override back into
     // an allow entry because that is what this CLI command explicitly requests.
-    parse_config(&config_toml_contents, Some(&config_local_toml_contents), &env.hostname, false)
-        .context("validate current TOML config")?;
+    parse_config(&config_toml_contents, Some(&config_local_toml_contents), &env.hostname, false).context("validate current TOML config")?;
 
     let mut config_local_toml: DocumentMut = config_local_toml_contents.parse().context(format!("parse {CONFIG_LOCAL_TOML}"))?;
-    config_local_toml["hosts"][env.hostname.as_str()]["allowedHosts"][normalized_domain.as_str()] =
-        toml_edit::value(toml_edit::InlineTable::new());
+    config_local_toml["hosts"][env.hostname.as_str()]["allowedHosts"][normalized_domain.as_str()] = toml_edit::value(toml_edit::InlineTable::new());
     fs::write(&config_local_toml_path, config_local_toml.to_string()).context(format!("write {CONFIG_LOCAL_TOML}"))?;
     fs::write(&allowed_hosts_path, allowed_hosts_contents)?;
     Ok(())
@@ -1644,8 +1637,7 @@ fn run_unallow_domain(env: &Env, domain: &str) -> anyhow::Result<()> {
     // the same domain, removing the local key would expose the base allow again
     // after Config merging.  In that case the CLI records false in local TOML,
     // because the user's unallow action has to survive the base policy.
-    parse_config(&config_toml_contents, Some(&config_local_toml_contents), &env.hostname, false)
-        .context("validate current TOML config")?;
+    parse_config(&config_toml_contents, Some(&config_local_toml_contents), &env.hostname, false).context("validate current TOML config")?;
 
     let config_toml: DocumentMut = config_toml_contents.parse().context(format!("parse {CONFIG_TOML}"))?;
     let allowed_by_base_config = config_toml

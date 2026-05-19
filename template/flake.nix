@@ -6,11 +6,11 @@
     home-manager.inputs.nixpkgs.follows = "nixpkgs";
     agentsandbox.url = "path:./agentsandbox";
     agentsandbox.inputs.nixpkgs.follows = "nixpkgs";
-    opencode.url = "github:anomalyco/opencode/dev";
-    opencode.inputs.nixpkgs.follows = "nixpkgs-unstable";
+    #opencode.url = "github:anomalyco/opencode/dev";
+    #opencode.inputs.nixpkgs.follows = "nixpkgs-unstable";
   };
 
-  outputs = { self, nixpkgs, nixpkgs-unstable, home-manager, agentsandbox, opencode, ... }:
+  outputs = { self, nixpkgs, nixpkgs-unstable, home-manager, agentsandbox, ... }:
     let
       nixosWithOverlay = system: modules:
         nixpkgs.lib.nixosSystem {
@@ -28,16 +28,16 @@
     {
       packages = eachSystem (system: {
         # Extra packages available.
-        opencode-dev = opencode.packages.${system}.opencode.overrideAttrs (old: {
-          preBuild = (old.preBuild or "") + ''
-            substituteInPlace packages/opencode/src/cli/cmd/generate.ts \
-              --replace-fail 'const prettier = await import("prettier")' 'const prettier: any = { format: async (s: string) => s }' \
-              --replace-fail 'const babel = await import("prettier/plugins/babel")' 'const babel = {}' \
-              --replace-fail 'const estree = await import("prettier/plugins/estree")' 'const estree = {}'
-            substituteInPlace package.json \
-              --replace-fail '"packageManager": "bun@1.3.13"' '"packageManager": "bun@1.3.11"'
-          '';
-        });
+        # opencode-dev = opencode.packages.${system}.opencode.overrideAttrs (old: {
+        #   preBuild = (old.preBuild or "") + ''
+        #     substituteInPlace packages/opencode/src/cli/cmd/generate.ts \
+        #       --replace-fail 'const prettier = await import("prettier")' 'const prettier: any = { format: async (s: string) => s }' \
+        #       --replace-fail 'const babel = await import("prettier/plugins/babel")' 'const babel = {}' \
+        #       --replace-fail 'const estree = await import("prettier/plugins/estree")' 'const estree = {}'
+        #     substituteInPlace package.json \
+        #       --replace-fail '"packageManager": "bun@1.3.13"' '"packageManager": "bun@1.3.11"'
+        #   '';
+        # });
       });
       nixosConfigurations.default = nixosWithOverlay "x86_64-linux" [ ./configuration.nix ];
     };

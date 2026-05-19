@@ -130,7 +130,7 @@
                 <devices>
                   <filesystem type='mount'>
                     <driver type='virtiofs' queue='1024'/>
-                    <binary path='${pkgs.virtiofsd}/bin/virtiofsd' xattr='on'>
+                    <binary path='/nix/store/r9jiqr7h2s0ainvfi39c3aihgzry3dwg-virtiofsd-1.13.2/bin/virtiofsd' xattr='on'>
                       <!-- Omit <cache>; libvirt only accepts none/always, and virtiofsd default is auto. -->
                       <sandbox mode='namespace'/>
                       <!-- Rust virtiofsd 1.13.x does not advertise lock support to libvirt:

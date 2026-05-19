@@ -1,5 +1,6 @@
 use anyhow::{Context as _, bail};
 use clap::{Parser, Subcommand};
+use elementtree::{Element as XmlElement, WriteOptions};
 use flate2::read::GzDecoder;
 use pathdiff::diff_paths;
 use reqwest::{blocking::Client, header};
@@ -12,11 +13,11 @@ use rustix::{
     runtime::{Fork, How, KernelSigSet, Timespec, exit_group, kernel_fork, kernel_sigprocmask, kernel_sigtimedwait},
     thread::{UnshareFlags, unshare_unsafe},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     env, fs,
     io::{IsTerminal as _, Read as _, Write as _},
     net::IpAddr,
@@ -32,6 +33,7 @@ const APP_NAME: &str = env!("CARGO_PKG_NAME");
 const LOCAL_CONFIG_DIR: &str = concat!(".", env!("CARGO_PKG_NAME"));
 const CONFIG_TOML: &str = concat!(env!("CARGO_PKG_NAME"), ".toml");
 const CONFIG_LOCAL_TOML: &str = concat!(env!("CARGO_PKG_NAME"), ".local.toml");
+const DEFAULT_DOMAIN_XML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/template/domain.xml"));
 
 #[derive(Parser)]
 #[command(
@@ -290,7 +292,7 @@ pub struct AllowedHost {
     pub fetch_allowlist: Option<Vec<String>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub struct PortForward {
     pub proto: String,
     pub address: IpAddr,
@@ -507,11 +509,12 @@ fn read_port_forwards_lookup(
     guest_port: Option<u16>,
     protocol: Option<&str>,
 ) -> anyhow::Result<(BTreeMap<String, PortForward>, Option<(String, u16)>)> {
-    // FIXME: use toml.
-    let forwards: BTreeMap<String, PortForward> =
-        serde_json::from_str(&fs::read_to_string(read_domain_profile(instance)?.join("port-forwards")).context("read port-forwards")?)
-            .context("parse port-forwards json")
-            .unwrap_or(BTreeMap::from([(
+    let port_forwards_path = instance.runtime_dir.join("port-forwards");
+    let forwards: BTreeMap<String, PortForward> = fs::read_to_string(&port_forwards_path)
+        .ok()
+        .and_then(|contents| serde_json::from_str(&contents).ok())
+        .unwrap_or_else(|| {
+            BTreeMap::from([(
                 "ssh".into(),
                 PortForward {
                     proto: "tcp".to_owned(),
@@ -521,7 +524,8 @@ fn read_port_forwards_lookup(
                     host_end: Some(2223),
                     guest: 22,
                 },
-            )]));
+            )])
+        });
     match guest_port {
         Some(guest_port) => {
             for (_, f) in forwards {
@@ -539,7 +543,7 @@ fn read_port_forwards_lookup(
     }
 }
 
-pub fn parse_config(config_toml: &str, local_toml: Option<&str>, host: &str, warn_allowed_hosts: bool) -> anyhow::Result<Config> {
+pub fn parse_config(config_toml: &str, local_toml: Option<&str>, host: &str, _warn_allowed_hosts: bool) -> anyhow::Result<Config> {
     let config: DocumentMut = config_toml.parse().context(format!("parse {CONFIG_TOML}"))?;
     let local: DocumentMut = local_toml.unwrap_or("").parse().context(format!("parse {CONFIG_LOCAL_TOML}"))?;
     let has_domain_xml = |v: &Item| v.get("vm").and_then(|vm| vm.get("allowDomainXml")).is_some();
@@ -600,6 +604,195 @@ pub fn parse_config(config_toml: &str, local_toml: Option<&str>, host: &str, war
     toml_edit::de::from_document(out).map_err(Into::into)
 }
 
+fn render_domain_xml(
+    env: &Env,
+    instance: &Instance,
+    system_profile: &Path,
+    is_build: bool,
+) -> anyhow::Result<(String, BTreeMap<String, PortForward>)> {
+    fn find_or_append_mut<'a>(parent: &'a mut XmlElement, tag: &'a str) -> &'a mut XmlElement {
+        if parent.find(tag).is_none() {
+            parent.append_new_child(tag);
+        }
+        parent.find_mut(tag).unwrap()
+    }
+
+    let config_toml = fs::read_to_string(instance.flake_dir.join(CONFIG_TOML)).context(format!("read {CONFIG_TOML}"))?;
+    let local_toml = fs::read_to_string(instance.flake_dir.join(CONFIG_LOCAL_TOML)).unwrap_or_default();
+    let config = parse_config(&config_toml, Some(&local_toml), &env.hostname, true)?;
+
+    let base_xml = config.vm.libvirt_domain_xml.as_deref().unwrap_or(DEFAULT_DOMAIN_XML);
+    if config.vm.libvirt_domain_xml.is_some() {
+        let domain_xml_hash = format!(
+            "sha256:{}",
+            Sha256::digest(base_xml.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+        );
+        let domain_xml_allowed = match &config.vm.allow_domain_xml {
+            Some(PolicyEntry::Remove(true)) => true,
+            Some(PolicyEntry::Set(approved)) => approved == &domain_xml_hash,
+            _ => false,
+        };
+        if !domain_xml_allowed {
+            bail!(
+                "custom vm.libvirtDomainXml is not approved for this host.\n\
+                 To use the current XML, review it and record its hash in {CONFIG_LOCAL_TOML}:\n\n\
+                 [hosts.{}.vm]\n\
+                 allowDomainXml = {domain_xml_hash:?}",
+                env.hostname
+            );
+        }
+    }
+
+    let mut forwards = BTreeMap::new();
+    for (name, entry) in &config.port_forwards {
+        let PolicyEntry::Set(forward) = entry else {
+            continue;
+        };
+        if forward.proto != "tcp" && forward.proto != "udp" {
+            bail!("invalid portForwards.{name}.proto: expected tcp or udp");
+        }
+        let host_end = forward.host_end.unwrap_or(forward.host);
+        if host_end < forward.host {
+            bail!("invalid portForwards.{name}: host_end is before host");
+        }
+        let count = host_end - forward.host;
+        if forward.guest.checked_add(count).is_none() {
+            bail!("invalid portForwards.{name}: guest port range overflows u16");
+        }
+        forwards.insert(
+            name.clone(),
+            PortForward {
+                proto: forward.proto.clone(),
+                address: forward.address,
+                dev: forward.dev.clone(),
+                host: forward.host,
+                host_end: Some(host_end),
+                guest: forward.guest,
+            },
+        );
+    }
+    let memory_mib = config.vm.memory_mi_b.unwrap_or(8192);
+    let vcpus = config.vm.vcpus.unwrap_or(4);
+    let machine_id = Sha256::digest(instance.id.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()[..32]
+        .to_owned();
+    let domain_uuid = format!(
+        "{}-{}-{}-{}-{}",
+        &machine_id[..8],
+        &machine_id[8..12],
+        &machine_id[12..16],
+        &machine_id[16..20],
+        &machine_id[20..32]
+    );
+    let kernel_target = fs::read_link(system_profile.join("kernel")).context("read_link($profile/kernel)")?;
+    let initrd_target = fs::read_link(system_profile.join("initrd")).context("read_link($profile/initrd)")?;
+    let kernel = instance.sysroot.join(kernel_target.strip_prefix("/").context("get kernel image path")?);
+    let initrd = instance.sysroot.join(initrd_target.strip_prefix("/").context("get initrd image path")?);
+    let kernel_params = fs::read_to_string(system_profile.join("kernel-params")).context("read kernel-params")?;
+    let build_unit = if is_build { " systemd.unit=agentsandbox-build.target" } else { "" };
+    let cmdline = format!("{kernel_params} init=/nix/var/nix/profiles/system/init systemd.machine_id={machine_id}{build_unit}");
+
+    let mut domain = XmlElement::from_reader(base_xml.as_bytes()).context("parse domain xml")?;
+    if domain.tag().name() != "domain" {
+        bail!("vm.libvirtDomainXml root element must be <domain>");
+    }
+    domain.retain_children(|child| !matches!(child.tag().name(), "name" | "uuid" | "memory"));
+    domain.append_new_child("name").set_text(instance.id.clone());
+    domain.append_new_child("uuid").set_text(domain_uuid);
+    domain.append_new_child("memory").set_text((memory_mib * 1024).to_string());
+
+    let vcpu = find_or_append_mut(&mut domain, "vcpu");
+    vcpu.set_text(vcpus.to_string());
+
+    let os = find_or_append_mut(&mut domain, "os");
+    os.retain_children(|child| !matches!(child.tag().name(), "type" | "kernel" | "initrd" | "cmdline"));
+    os.append_new_child("type")
+        .set_text("hvm")
+        .set_attr("arch", "x86_64")
+        .set_attr("machine", "q35");
+    os.append_new_child("kernel").set_text(kernel.display().to_string());
+    os.append_new_child("initrd").set_text(initrd.display().to_string());
+    os.append_new_child("cmdline").set_text(cmdline);
+
+    let devices = find_or_append_mut(&mut domain, "devices");
+    devices.retain_children(|element| {
+        element.tag().name() != "interface"
+            && !(element.tag().name() == "filesystem"
+                && element
+                    .find("target")
+                    .and_then(|target| target.get_attr("dir"))
+                    .is_some_and(|dir| dir == "nix" || dir == "persistent"))
+    });
+
+    let nix_filesystem = devices.append_new_child("filesystem");
+    nix_filesystem.set_attr("type", "mount").append_new_child("driver").set_attr("type", "virtiofs");
+    // queue='1024' omitted; libvirt/QEMU default is sufficient unless profiling says otherwise.
+    let binary = nix_filesystem.append_new_child("binary");
+    binary.set_attr("xattr", "on");
+    binary.append_new_child("sandbox").set_attr("mode", "namespace");
+    binary.append_new_child("thread_pool").set_attr("size", "0");
+    nix_filesystem
+        .append_new_child("source")
+        .set_attr("dir", instance.sysroot.join("nix").display().to_string());
+    nix_filesystem.append_new_child("target").set_attr("dir", "nix");
+    let idmap = nix_filesystem.append_new_child("idmap");
+    for (element_name, map) in [
+        ("uid", capture_host_idmap("/proc/self/uid_map", true)?),
+        ("gid", capture_host_idmap("/proc/self/gid_map", true)?),
+    ] {
+        for line in map.lines() {
+            let mut fields = line.split_whitespace();
+            if let (Some(start), Some(target), Some(count)) = (fields.next(), fields.next(), fields.next()) {
+                idmap
+                    .append_new_child(element_name)
+                    .set_attr("start", start)
+                    .set_attr("target", target)
+                    .set_attr("count", count);
+            }
+        }
+    }
+
+    let persistent_filesystem = devices.append_new_child("filesystem");
+    persistent_filesystem
+        .set_attr("type", "mount")
+        .append_new_child("driver")
+        .set_attr("type", "virtiofs");
+    // queue='1024' omitted; see nix filesystem above.
+    persistent_filesystem
+        .append_new_child("source")
+        .set_attr("socket", instance.runtime_dir.join("pv.sock").display().to_string());
+    persistent_filesystem.append_new_child("target").set_attr("dir", "persistent");
+
+    let interface = devices.append_new_child("interface");
+    interface.set_attr("type", "user");
+    interface.append_new_child("backend").set_attr("type", "passt");
+    interface.append_new_child("model").set_attr("type", "virtio");
+    for forward in forwards.values() {
+        let host_end = forward.host_end.unwrap_or(forward.host);
+        let port_forward = interface.append_new_child("portForward");
+        port_forward
+            .set_attr("proto", forward.proto.clone())
+            .set_attr("address", forward.address.to_string());
+        if let Some(dev) = &forward.dev {
+            port_forward.set_attr("dev", dev.clone());
+        }
+        let range = port_forward.append_new_child("range");
+        range.set_attr("start", forward.host.to_string());
+        if host_end != forward.host {
+            range.set_attr("end", host_end.to_string());
+        }
+        range.set_attr("to", forward.guest.to_string());
+    }
+
+    let mut xml = Vec::new();
+    domain
+        .to_writer_with_options(&mut xml, WriteOptions::new().set_xml_prolog(None))
+        .context("serialize domain xml")?;
+    Ok((String::from_utf8(xml).context("domain xml is not utf-8")?, forwards))
+}
+
 // Create the config dir and initial files for local/global init, or return a displayable error.
 #[inline(never)]
 fn run_init(env: &Env, force: bool) -> anyhow::Result<()> {
@@ -657,27 +850,35 @@ fn run_build_or_up(env: &Env, bootstrap: bool, is_up: bool, attach: bool, mut wr
     let domstate = domstate(&instance.id)?;
     match domstate.as_str() {
         "down" | "shut off" | "crashed" => {
-            let domain_profile = start_vm(env, &instance, true)?;
+            start_vm(env, &instance, true)?;
             let flake = format!("/persistent/etc/nixos#{}", env.hostname);
             run_ssh(env, &["nixos-rebuild", "boot", "--flake", &flake], true, true)?;
             let new_profile = read_system_profile(&instance)?;
             println!("{}", new_profile.display());
             if !is_up {
                 virsh(&["destroy", &instance.id]).context("return to down")?;
-            } else if fs::read(domain_profile.join("domain.xml.sh"))? != fs::read(new_profile.join("domain.xml.sh"))? {
-                virsh(&["destroy", &instance.id]).context("restart")?;
-                start_vm(env, &instance, false).context("restart")?;
             } else {
-                run_ssh(env, &["systemctl", "isolate", "multi-user.target"], true, true).context("starting")?;
+                let domain_xml_path = instance.runtime_dir.join("domain.xml");
+                let old_xml = fs::read_to_string(&domain_xml_path).unwrap_or_default();
+                let (new_xml, forwards) = render_domain_xml(env, &instance, &new_profile, false)?;
+                if old_xml != new_xml {
+                    virsh(&["destroy", &instance.id]).context("restart")?;
+                    start_vm(env, &instance, false).context("restart")?;
+                } else {
+                    fs::write(&domain_xml_path, new_xml).context("write normalized runtime domain xml")?;
+                    fs::write(instance.runtime_dir.join("port-forwards"), serde_json::to_string_pretty(&forwards)?).context("write runtime port-forwards")?;
+                    run_ssh(env, &["systemctl", "isolate", "multi-user.target"], true, true).context("starting")?;
+                }
             }
         }
         "running" => {
-            let domain_profile = read_domain_profile(&instance)?;
             let flake = format!("/persistent/etc/nixos#{}", env.hostname);
             let switch_or_boot = if is_switch { "switch" } else { "boot" };
             run_ssh(env, &["nixos-rebuild", switch_or_boot, "--flake", &flake], true, true)?;
             let new_profile = read_system_profile(&instance)?;
-            if fs::read(domain_profile.join("domain.xml.sh"))? != fs::read(new_profile.join("domain.xml.sh"))? {
+            let old_xml = fs::read_to_string(instance.runtime_dir.join("domain.xml")).unwrap_or_default();
+            let (new_xml, _) = render_domain_xml(env, &instance, &new_profile, false)?;
+            if old_xml != new_xml {
                 eprintln!("build: domain definition changed; please restart the VM for the changes to take effect");
             }
             if attach {
@@ -846,6 +1047,13 @@ fn read_domain_profile(instance: &Instance) -> anyhow::Result<PathBuf> {
     fs::read_link(instance.runtime_dir.join("domain-profile")).context("read domain-profile symlink")
 }
 
+/// Run virsh against the session URI (qemu:///session).
+///
+/// Networking uses `<backend type='passt'/>`; libvirt looks up `passt` on the
+/// user-session libvirtd PATH, not the shell that launched agentsandbox. NixOS
+/// `systemd.services.libvirtd.path` does not apply here. If passt was installed
+/// or PATH changed after the session daemon started, restart it (or kill stale
+/// libvirt/qemu/passt children) so the daemon picks up the current PATH.
 #[inline(never)]
 fn virsh(args: &[&str]) -> anyhow::Result<()> {
     let status = process::Command::new("virsh")
@@ -1032,44 +1240,11 @@ fn start_vm(env: &Env, instance: &Instance, is_build: bool) -> anyhow::Result<Pa
     drop(child_sock);
     let mut ready = [0_u8; 1];
     parent_sock.read_exact(&mut ready).context("wait for virtiofs socket readiness notification")?;
-    let machine_id = Sha256::digest(instance.id.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>()[..32]
-        .to_owned();
-    let domain_uuid = format!(
-        "{}-{}-{}-{}-{}",
-        &machine_id[..8],
-        &machine_id[8..12],
-        &machine_id[12..16],
-        &machine_id[16..20],
-        &machine_id[20..32]
-    );
     let xml_path = instance.runtime_dir.join("domain.xml");
-    let output = process::Command::new(system_profile.join("domain.xml.sh"))
-        .env("NIX_DIR", instance.sysroot.join("nix"))
-        .env("UID_MAP", capture_host_idmap("/proc/self/uid_map", true).context("resolve UID_MAP")?)
-        .env("GID_MAP", capture_host_idmap("/proc/self/gid_map", true).context("resolve GID_MAP")?)
-        .env("INSTANCE_ID", &instance.id)
-        .env("DOMAIN_UUID", &domain_uuid)
-        .env("MACHINE_ID", machine_id)
-        .env("AGENTSANDBOX_BUILD", if is_build { "1" } else { "" })
-        .env(
-            "PERSISTENT_SOCKET_XML",
-            pv_socket
-                .display()
-                .to_string()
-                .replace('&', "&amp;")
-                .replace('\'', "&apos;")
-                .replace('<', "&lt;")
-                .replace('>', "&gt;"),
-        )
-        .output()
-        .context("run domain.xml.sh")?;
-    if !output.status.success() {
-        bail!("domain.xml.sh failed: {}", String::from_utf8_lossy(&output.stderr).trim());
-    }
-    fs::write(&xml_path, output.stdout).context("write generated domain xml")?;
+    let (domain_xml, forwards) = render_domain_xml(env, instance, &system_profile, is_build)?;
+    fs::write(&xml_path, domain_xml).context("write generated domain xml")?;
+    fs::write(instance.runtime_dir.join("port-forwards"), serde_json::to_string_pretty(&forwards)?).context("write runtime port-forwards")?;
+    // domain.xml references passt; create is handled by the user-session libvirtd above.
     let status = process::Command::new("virsh")
         .arg("create")
         .arg(&xml_path)

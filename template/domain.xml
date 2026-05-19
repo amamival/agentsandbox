@@ -1,0 +1,22 @@
+<domain type='kvm'>
+  <cpu mode='host-passthrough' migratable='off'/>
+  <memoryBacking>
+    <source type='memfd'/>
+    <access mode='shared'/>
+  </memoryBacking>
+  <features>
+    <acpi/>
+    <apic/>
+  </features>
+  <devices>
+    <serial type='pty'>
+      <target port='0'/>
+    </serial>
+    <console type='pty'>
+      <target type='serial' port='0'/>
+    </console>
+    <rng model='virtio'>
+      <backend model='random'>/dev/urandom</backend>
+    </rng>
+  </devices>
+</domain>

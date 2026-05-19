@@ -186,7 +186,7 @@
         boot.kernelPackages = pkgs.linuxPackages_latest;
         virtualisation.fileSystems."/" = { device = "none"; fsType = "tmpfs"; options = [ "mode=755" "nosuid" "nodev" "noexec" ]; };
         virtualisation.fileSystems."/nix" = { device = "nix"; fsType = "virtiofs"; options = [ "nosuid" "nodev" ]; };
-        virtualisation.fileSystems."/home" = { device = "none"; fsType = "tmpfs"; options = [ "mode=755" "nosuid" "nodev" ]; };
+        virtualisation.fileSystems."/home" = { device = "none"; fsType = "tmpfs"; options = [ "mode=755" "nosuid" "nodev" ]; neededForBoot=true; };
         boot.kernel.sysctl."vm.overcommit_memory" = lib.mkDefault "1"; # Stability in low memory situations.
         systemd.services.fuse-inval-wq = {
           description = "Seed fuse.inval_wq before virtiofs mounts to free cached fds on host";

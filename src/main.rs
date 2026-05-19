@@ -28,8 +28,8 @@ use std::{
 };
 use toml_edit::{DocumentMut, Item, Table};
 
-const APP_NAME: &str = "agentsandbox";
-const LOCAL_CONFIG_DIR: &str = ".agentsandbox";
+const APP_NAME: &str = env!("CARGO_PKG_NAME");
+const LOCAL_CONFIG_DIR: &str = concat!(".", env!("CARGO_PKG_NAME"));
 const CONFIG_TOML: &str = concat!(env!("CARGO_PKG_NAME"), ".toml");
 const CONFIG_LOCAL_TOML: &str = concat!(env!("CARGO_PKG_NAME"), ".local.toml");
 
@@ -466,7 +466,8 @@ fn resolve_flake_dir(env: &Env) -> anyhow::Result<PathBuf> {
             if dir.join(LOCAL_CONFIG_DIR).is_dir() {
                 return Ok(dir.join(LOCAL_CONFIG_DIR));
             }
-            if dir.join(CONFIG_TOML).is_file() || dir.join(CONFIG_LOCAL_TOML).is_file() {
+            if dir.file_name().and_then(|p| p.to_str()) != Some(LOCAL_CONFIG_DIR) && (dir.join(CONFIG_TOML).is_file() || dir.join(CONFIG_LOCAL_TOML).is_file())
+            {
                 return Ok(dir);
             }
             if !dir.pop() {
@@ -475,7 +476,7 @@ fn resolve_flake_dir(env: &Env) -> anyhow::Result<PathBuf> {
         }
     }
     let global_flake_dir = env.config_root.join(&env.project_name);
-    if global_flake_dir.join(CONFIG_TOML).is_file() {
+    if global_flake_dir.is_dir() {
         Ok(global_flake_dir)
     } else {
         bail!("{} not found. Try `agentsandbox init` to start in a new project.", global_flake_dir.display())
@@ -506,6 +507,7 @@ fn read_port_forwards_lookup(
     guest_port: Option<u16>,
     protocol: Option<&str>,
 ) -> anyhow::Result<(BTreeMap<String, PortForward>, Option<(String, u16)>)> {
+    // FIXME: use toml.
     let forwards: BTreeMap<String, PortForward> =
         serde_json::from_str(&fs::read_to_string(read_domain_profile(instance)?.join("port-forwards")).context("read port-forwards")?)
             .context("parse port-forwards json")
@@ -623,6 +625,7 @@ fn write_template_config(target: &Path, workspace: &Path, force: bool) -> anyhow
         (CONFIG_TOML, config_template.to_owned()),
         ("flake.nix", include_str!("../template/flake.nix").to_owned()),
         ("configuration.nix", include_str!("../template/configuration.nix").to_owned()),
+        // FIXME: to be removed after toml migration
         ("allowed_hosts", include_str!("../template/allowed_hosts").to_owned()),
         ("mounts", format!("# <host-path><TAB><guest-name><TAB><mode>\n.\t{workspace_name}\trw\n")),
         (app_flake.as_str(), include_str!("../template/agentsandbox/flake.nix").to_owned()),

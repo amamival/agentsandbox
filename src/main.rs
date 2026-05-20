@@ -953,13 +953,15 @@ fn install_initial_nixos_profile(workspace: &Path, sysroot: &Path, hostname: &st
             eprintln!("install: binding host /proc to sysroot/proc");
             mount_bind_recursive(oldroot.join("proc"), sysroot.join("proc"))?;
             // Bind host devices etc to new root's /dev.
-            for file in ["dev/null", "dev/zero", "dev/full", "dev/random", "dev/urandom", "dev/tty", "etc/resolv.conf"] {
+            for file in ["dev/null", "dev/zero", "dev/full", "dev/random", "dev/urandom", "dev/tty"] {
                 eprintln!("install: touching sysroot/{file} and binding host /{file}");
                 fs::write(sysroot.join(file), "")?;
                 mount_bind_recursive(oldroot.join(file), sysroot.join(file))?;
             }
-            eprintln!("install: remounting sysroot/etc/resolv.conf read-only");
-            mount_remount(sysroot.join("etc/resolv.conf"), MountFlags::BIND | MountFlags::RDONLY, c"")?;
+            eprintln!("install: touching and binding host /etc/resolv.conf read-only");
+            fs::write(sysroot.join("etc/resolv.conf"), "")?;
+            let flags = MountFlags::BIND | MountFlags::REC | MountFlags::RDONLY;
+            mount(oldroot.join("etc/resolv.conf"), sysroot.join("etc/resolv.conf"), "", flags, c"")?;
             eprintln!("install: creating symlinks for /dev/{{stdin,stdout,stderr,fd,core,ptmx}}");
             for (fd, file) in [(0, "dev/stdin"), (1, "dev/stdout"), (2, "dev/stderr")] {
                 symlink(format!("/proc/self/fd/{fd}"), sysroot.join(file))?;
@@ -986,6 +988,8 @@ fn install_initial_nixos_profile(workspace: &Path, sysroot: &Path, hostname: &st
                     .args(["--extra-experimental-features", "nix-command flakes"])
                     .args(["--option", "ssl-cert-file", "/etc/ssl/certs/ca-bundle.crt"])
                     .args(["--option", "max-jobs", "auto"])
+                    // User-namespace root maps to the host user; nixbld cannot write the sysroot store.
+                    .args(["--option", "build-users-group", ""])
                     .args(["--out-link", "/nix/var/nix/profiles/system"])
                     .exec()
                     .to_string()

@@ -604,12 +604,7 @@ pub fn parse_config(config_toml: &str, local_toml: Option<&str>, host: &str, _wa
     toml_edit::de::from_document(out).map_err(Into::into)
 }
 
-fn render_domain_xml(
-    env: &Env,
-    instance: &Instance,
-    system_profile: &Path,
-    is_build: bool,
-) -> anyhow::Result<(String, BTreeMap<String, PortForward>)> {
+fn render_domain_xml(env: &Env, instance: &Instance, system_profile: &Path, is_build: bool) -> anyhow::Result<(String, BTreeMap<String, PortForward>)> {
     fn find_or_append_mut<'a>(parent: &'a mut XmlElement, tag: &'a str) -> &'a mut XmlElement {
         if parent.find(tag).is_none() {
             parent.append_new_child(tag);

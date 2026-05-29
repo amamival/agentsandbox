@@ -284,6 +284,8 @@ pub struct Vm {
     pub memory_mi_b: Option<u32>,
     pub libvirt_domain_xml: Option<String>,
     pub allow_domain_xml: Option<PolicyEntry<String>>,
+    /// [unimpl] When true, guest should trust the host OS CA bundle.
+    pub use_host_certs: Option<bool>,
 }
 
 #[derive(Default, Deserialize)]
@@ -615,6 +617,20 @@ pub fn parse_config(config_toml: &str, local_toml: Option<&str>, host: &str, _wa
         merge(out.as_table_mut(), src);
     }
     toml_edit::de::from_document(out).map_err(Into::into)
+}
+
+/// Host CA bundle for [`Vm::use_host_certs`]: `SSL_CERT_FILE` then well-known distro paths (`nix-profile.sh.in` order). `is_file()` only.
+pub fn resolve_host_ca_bundle() -> Option<PathBuf> {
+    std::env::var_os("SSL_CERT_FILE")
+        .into_iter()
+        .chain([
+            "/etc/ssl/certs/ca-certificates.crt",
+            "/etc/ssl/ca-bundle.pem",
+            "/etc/ssl/certs/ca-bundle.crt",
+            "/etc/pki/tls/certs/ca-bundle.crt",
+        ].map(OsString::from))
+        .find(|path| Path::new(path).is_file())
+        .map(PathBuf::from)
 }
 
 fn render_domain_xml(env: &Env, instance: &Instance, system_profile: &Path, is_build: bool) -> anyhow::Result<(String, BTreeMap<String, PortForward>)> {

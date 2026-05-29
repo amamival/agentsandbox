@@ -133,19 +133,25 @@ enum Command {
     ///
     /// Resolves SSH host port from `port-forwards` using guest `tcp/22`.
     /// Fails when no matching mapping exists.
+    ///
+    /// Use `--` before arguments that conflict with global flags.
     Ssh {
-        #[arg(trailing_var_arg = true)]
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
     /// Run a command as root in a running VM, or attach if omitted
+    ///
+    /// Use `--` before arguments that conflict with global flags.
     Exec {
-        #[arg(trailing_var_arg = true)]
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
     /// Show logs from a running VM. Runs `journalctl` with `-en1000` by default
+    ///
+    /// Use `--` before arguments that conflict with global flags.
     Logs {
         #[arg(default_values = ["-en1000"])]
-        #[arg(trailing_var_arg = true)]
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
     /// Display statistics of CPU time, memory for VMs
@@ -225,7 +231,12 @@ Vulnix Options:
   -V, --version                   Print vulnix version and exit."
     )]
     Audit {
-        #[arg(trailing_var_arg = true, hide = true, default_values = ["-G"])]
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            hide = true,
+            default_values = ["-G"]
+        )]
         args: Vec<String>,
     },
 }

@@ -7,9 +7,9 @@ use reqwest::{blocking::Client, header};
 use rustix::{
     io::{Errno, FdFlags, fcntl_setfd, read, write},
     mount::{MountFlags, MountPropagationFlags, UnmountFlags},
-    mount::{mount, mount_bind, mount_bind_recursive, mount_change, mount_remount, unmount},
+    mount::{mount, mount_bind_recursive, mount_change, unmount},
     pipe::{PipeFlags, pipe_with},
-    process::{Pid, Signal, WaitOptions, chdir, getuid, kill_process, pivot_root, waitpid},
+    process::{Pid, Signal, WaitOptions, chdir, getgid, getuid, kill_process, pivot_root, setsid, waitpid},
     runtime::{Fork, How, KernelSigSet, Timespec, exit_group, kernel_fork, kernel_sigprocmask, kernel_sigtimedwait},
     thread::{UnshareFlags, unshare_unsafe},
 };
@@ -240,6 +240,7 @@ struct Env {
     data_root: PathBuf,
     state_root: PathBuf,
     runtime_root: PathBuf,
+    is_nested: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -376,6 +377,7 @@ fn resolve_env(cli: &Cli) -> anyhow::Result<Env> {
             .clone()
             .unwrap_or_else(|| if uid == 0 { "/run".into() } else { format!("/run/user/{uid}").into() })
             .join(APP_NAME),
+        is_nested: Path::new("/persistent").is_dir(), // FIXME: use findmnt to detect virtiofs backed /.
     })
 }
 
@@ -720,12 +722,22 @@ fn render_domain_xml(env: &Env, instance: &Instance, system_profile: &Path, is_b
                     .and_then(|target| target.get_attr("dir"))
                     .is_some_and(|dir| dir == "nix" || dir == "persistent"))
     });
+    // TODO: Remove this. Host must set up the emulator.
+    //if devices.find("emulator").is_none() {
+    //    devices.append_new_child("emulator").set_text(resolve_cmd_path("qemu-system-x86_64"));
+    //}
 
     let nix_filesystem = devices.append_new_child("filesystem");
     nix_filesystem.set_attr("type", "mount").append_new_child("driver").set_attr("type", "virtiofs");
     // queue='1024' omitted; libvirt/QEMU default is sufficient unless profiling says otherwise.
     let binary = nix_filesystem.append_new_child("binary");
+    // https://discourse.nixos.org/t/virt-manager-cannot-find-virtiofsd/26752
+    // TODO: Remove this. Host must set up the virtiofsd.
+    //binary.set_attr("path", resolve_cmd_path("virtiofsd"));
     binary.set_attr("xattr", "on");
+    // Omit <cache>; libvirt only accepts none/always, and virtiofsd default is auto.
+    // Rust virtiofsd 1.13.x does not advertise lock support to libvirt:
+    // https://virtio-fs.gitlab.io/virtiofsd/doc/virtiofsd/fuse/struct.FsOptions.html
     binary.append_new_child("sandbox").set_attr("mode", "namespace");
     binary.append_new_child("thread_pool").set_attr("size", "0");
     nix_filesystem
@@ -835,7 +847,7 @@ fn run_build_or_up(env: &Env, bootstrap: bool, is_up: bool, attach: bool, mut wr
         fetch_nix_dockerhub(&instance.sysroot).context("fetch")?;
     }
     if bootstrap || !instance.sysroot.join("nix/var/nix/profiles/system").is_symlink() {
-        install_initial_nixos_profile(&env.workspace, &instance.sysroot, "default")?;
+        install_initial_nixos_profile(&env.workspace, &instance.sysroot, "default", env.is_nested)?;
     }
     // Provide a minimum writable flake.lock for the initial build.
     if !instance.flake_dir.join("flake.lock").exists() {
@@ -924,7 +936,7 @@ fn fetch_nix_dockerhub(sysroot: &Path) -> anyhow::Result<()> {
 
 // The initial profile is assumed safe, so building it in a simple container is acceptable.
 #[inline(never)]
-fn install_initial_nixos_profile(workspace: &Path, sysroot: &Path, hostname: &str) -> anyhow::Result<()> {
+fn install_initial_nixos_profile(workspace: &Path, sysroot: &Path, hostname: &str, nested: bool) -> anyhow::Result<()> {
     let config_target = sysroot.join("etc/nixos");
     eprintln!("install: writing template config into {}", config_target.display());
     write_template_config(&config_target, workspace, true)?;
@@ -979,6 +991,28 @@ fn install_initial_nixos_profile(workspace: &Path, sysroot: &Path, hostname: &st
             unmount("/tmp", UnmountFlags::DETACH)?; // Unmount old root.
             eprintln!("install: cd to the brand new root / (sysroot)");
             chdir("/")?;
+            // Bootstrap may run in two topologies:
+            //
+            // - On the real host, this sysroot is normally on a local filesystem. The kernel
+            //   sees both the install user namespace and the backing inodes, so install-ns root
+            //   can use CAP_DAC_OVERRIDE for Nix's builder-owned scratch dirs.
+            // - In a nested AgentSandbox, this same sysroot lives under the outer guest's
+            //   /persistent, which is virtiofs backed by the outer host. At this point the inner
+            //   VM has not started yet; the virtiofs boundary involved here is the already-mounted
+            //   outer /persistent, not this invocation's future /persistent device.
+            //
+            // Nix creates /nix/var/nix/builds entries as 0700 and chowns them to nixbld users;
+            // nixbld1 is uid 30001 in the install namespace, observed as uid 62768 after the
+            // guest subuid map. Nix then creates .attr-* files from its still-root parent. The
+            // guest VFS check succeeds, but FUSE sends only the mapped fsuid/fsgid. Thus the
+            // outer virtiofsd sees uid 1000 creating in a nixbld-owned 0700 dir, not namespace
+            // root overriding DAC. Remapping uid 1000 would also change ordinary guest uid 1000
+            // writes on /persistent, so only Nix's transient build scratch is moved to tmpfs.
+            if nested {
+                println!("install: mounting tmpfs to /nix/var/nix/builds");
+                fs::create_dir_all("/nix/var/nix/builds")?;
+                mount("tmpfs", "/nix/var/nix/builds", "tmpfs", MountFlags::NODEV | MountFlags::NOSUID, c"mode=0755")?;
+            }
             // Err(process::Command::new("cat").args(["/proc/self/mountinfo"]).exec().to_string())
 
             eprintln!("install: execing nix build for hostname={hostname}");
@@ -988,8 +1022,6 @@ fn install_initial_nixos_profile(workspace: &Path, sysroot: &Path, hostname: &st
                     .args(["--extra-experimental-features", "nix-command flakes"])
                     .args(["--option", "ssl-cert-file", "/etc/ssl/certs/ca-bundle.crt"])
                     .args(["--option", "max-jobs", "auto"])
-                    // User-namespace root maps to the host user; nixbld cannot write the sysroot store.
-                    .args(["--option", "build-users-group", ""])
                     .args(["--out-link", "/nix/var/nix/profiles/system"])
                     .exec()
                     .to_string()
@@ -1163,6 +1195,7 @@ where
 }
 
 fn start_vm(env: &Env, instance: &Instance, is_build: bool) -> anyhow::Result<PathBuf> {
+    let nested = env.is_nested;
     let system_profile = read_system_profile(instance)?;
     let pv_socket = instance.runtime_dir.join("pv.sock");
     let pid_path = instance.runtime_dir.join("agentsandbox.pid");
@@ -1171,8 +1204,15 @@ fn start_vm(env: &Env, instance: &Instance, is_build: bool) -> anyhow::Result<Pa
     let _ = fs::remove_file(&pid_path);
     let _ = fs::remove_file(&domain_profile);
     let (mut parent_sock, mut child_sock) = UnixStream::pair().context("create supervisor socket pair")?;
+    // if nested {
+    let host_uid = getuid().as_raw().to_string();
+    let host_gid = getgid().as_raw().to_string();
+    // }
     let supervisor_pid = spawn_mapped_namespace(false, false, || -> anyhow::Result<()> {
         let result = (|| -> anyhow::Result<()> {
+            if nested {
+                setsid().context("detach virtiofs supervisor session")?;
+            }
             let downstream_rec = MountPropagationFlags::DOWNSTREAM | MountPropagationFlags::REC;
             mount_change("/", downstream_rec).context("set / mount propagation downstream+rec")?;
             mount_bind_recursive(&instance.persistent, &instance.persistent).context("self bind persistent dir")?;
@@ -1187,10 +1227,17 @@ fn start_vm(env: &Env, instance: &Instance, is_build: bool) -> anyhow::Result<Pa
 
             let listener = UnixListener::bind(&pv_socket).context("bind virtiofs socket")?;
             fcntl_setfd(&listener, FdFlags::empty()).context("keep virtiofs socket fd across exec")?;
-            let mut daemon = process::Command::new("virtiofsd")
+            let mut daemon_cmd = process::Command::new("virtiofsd");
+            daemon_cmd
                 .args(["--shared-dir", &instance.persistent.display().to_string()])
                 .args(["--fd", &listener.as_raw_fd().to_string()])
-                .args(["--sandbox", "namespace", "--cache", "auto", "--xattr", "--log-level", "error"])
+                .args(["--sandbox", "namespace", "--cache", "auto", "--xattr", "--log-level", "error"]);
+            if nested {
+                daemon_cmd
+                    .args(["--translate-uid", &format!("squash-guest:0:{host_uid}:1")])
+                    .args(["--translate-gid", &format!("squash-guest:0:{host_gid}:1")]);
+            }
+            let mut daemon = daemon_cmd
                 // Use the supervisor user namespace as the single idmap source.
                 .uid(0)
                 .gid(0)
@@ -1264,7 +1311,7 @@ fn start_vm(env: &Env, instance: &Instance, is_build: bool) -> anyhow::Result<Pa
 }
 
 /// Apply mounts from mounts file to the guest system.
-fn apply_mounts(env: &Env, instance: &Instance, system_profile: &Path) -> anyhow::Result<()> {
+fn apply_mounts(env: &Env, instance: &Instance, _system_profile: &Path) -> anyhow::Result<()> {
     let mounts_path = instance.flake_dir.join("mounts");
     let workspace_dir = instance.persistent.join("workspace");
     let config_dir = instance.persistent.join("etc/nixos");
@@ -1355,17 +1402,14 @@ fn apply_mounts(env: &Env, instance: &Instance, system_profile: &Path) -> anyhow
             if !target.exists() {
                 fs::write(&target, "").context("create target file")?;
             }
-            mount_bind(&source_abs, &target).context("bind-mount file")?;
-        }
-        if !writable {
-            mount_remount(&target, MountFlags::BIND | MountFlags::RDONLY, c"").context("remount file read-only")?;
+            let flags = if writable { MountFlags::BIND } else { MountFlags::BIND | MountFlags::RDONLY };
+            mount(&source_abs, &target, "", flags, c"").context("bind-mount file")?;
         }
     }
     // To mitigate the risk of writing to the policy files.
     for name in ["mounts", "allowed_hosts"] {
         let target = config_dir.join(name);
-        mount_bind(&target, &target).context("bind-mount policy file")?;
-        mount_remount(&target, MountFlags::BIND | MountFlags::RDONLY, c"").context("remount policy file read-only")?;
+        mount(&target, &target, "", MountFlags::BIND | MountFlags::RDONLY, c"").context("bind-mount policy file read-only")?;
     }
     Ok(())
 }

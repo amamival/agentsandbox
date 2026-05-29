@@ -130,7 +130,7 @@
                 <devices>
                   <filesystem type='mount'>
                     <driver type='virtiofs' queue='1024'/>
-                    <binary path='/nix/store/r9jiqr7h2s0ainvfi39c3aihgzry3dwg-virtiofsd-1.13.2/bin/virtiofsd' xattr='on'>
+                    <binary path='${pkgs.virtiofsd}/bin/virtiofsd' xattr='on'>
                       <!-- Omit <cache>; libvirt only accepts none/always, and virtiofsd default is auto. -->
                       <sandbox mode='namespace'/>
                       <!-- Rust virtiofsd 1.13.x does not advertise lock support to libvirt:
@@ -186,7 +186,7 @@
         boot.kernelPackages = pkgs.linuxPackages_latest;
         virtualisation.fileSystems."/" = { device = "none"; fsType = "tmpfs"; options = [ "mode=755" "nosuid" "nodev" "noexec" ]; };
         virtualisation.fileSystems."/nix" = { device = "nix"; fsType = "virtiofs"; options = [ "nosuid" "nodev" ]; };
-        virtualisation.fileSystems."/home" = { device = "none"; fsType = "tmpfs"; options = [ "mode=755" "nosuid" "nodev" ]; neededForBoot=true; };
+        virtualisation.fileSystems."/home" = { device = "none"; fsType = "tmpfs"; options = [ "mode=755" "nosuid" "nodev" ]; neededForBoot = true; };
         boot.kernel.sysctl."vm.overcommit_memory" = lib.mkDefault "1"; # Stability in low memory situations.
         systemd.services.fuse-inval-wq = {
           description = "Seed fuse.inval_wq before virtiofs mounts to free cached fds on host";

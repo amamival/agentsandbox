@@ -86,6 +86,13 @@ let
       settings.PermitRootLogin = "yes";
     };
   };
+  Service.Libvirt = {
+    virtualisation.libvirtd = {
+      enable = true;
+      qemu.package = pkgs.qemu_kvm;
+      qemu.vhostUserPackages = with pkgs; [ virtiofsd ];
+    };
+  };
   Services = builtins.attrValues Service;
 
   Users = {
@@ -133,6 +140,7 @@ let
           ".cargo"
           ".claude"
           ".codex"
+          ".config/agentsandbox"
           ".config/Claude"
           ".config/github-copilot"
           ".config/mise"
@@ -141,9 +149,11 @@ let
           ".config/opencode"
           ".config/tmux/plugins"
           ".local/bin"
+          ".local/share/agentsandbox"
           ".local/share/claude"
           ".local/share/fish"
           ".local/share/mise"
+          ".local/state/agentsandbox"
           ".local/state/mise"
           ".npm-global"
           ".pnpm-store"

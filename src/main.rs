@@ -623,12 +623,15 @@ pub fn parse_config(config_toml: &str, local_toml: Option<&str>, host: &str, _wa
 pub fn resolve_host_ca_bundle() -> Option<PathBuf> {
     std::env::var_os("SSL_CERT_FILE")
         .into_iter()
-        .chain([
-            "/etc/ssl/certs/ca-certificates.crt",
-            "/etc/ssl/ca-bundle.pem",
-            "/etc/ssl/certs/ca-bundle.crt",
-            "/etc/pki/tls/certs/ca-bundle.crt",
-        ].map(OsString::from))
+        .chain(
+            [
+                "/etc/ssl/certs/ca-certificates.crt",
+                "/etc/ssl/ca-bundle.pem",
+                "/etc/ssl/certs/ca-bundle.crt",
+                "/etc/pki/tls/certs/ca-bundle.crt",
+            ]
+            .map(OsString::from),
+        )
         .find(|path| Path::new(path).is_file())
         .map(PathBuf::from)
 }

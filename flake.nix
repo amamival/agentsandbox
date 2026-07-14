@@ -9,18 +9,20 @@
     impermanence.url = "github:nix-community/impermanence";
     impermanence.inputs.nixpkgs.follows = "nixpkgs";
     impermanence.inputs.home-manager.follows = "home-manager";
+    vulnix_.url = "github:nix-community/vulnix/1.12.4";
   };
-  outputs = { self, nixpkgs, ... }:
+  outputs = { self, nixpkgs, vulnix_, ... }:
     let
       eachSystem = f:
         nixpkgs.lib.genAttrs [ "x86_64-linux" ]
           (system: f system (import nixpkgs { inherit system; }));
-      vulnix = self.packages.x86_64-linux.vulnix;
     in
     {
-      packages = eachSystem (_: pkgs: {
-        default = pkgs.callPackage ./package.nix { };
-        vulnix = pkgs.vulnix.overrideAttrs (_: { patches = [ ./vulnix-1.12.1-storedir.patch ]; });
+      packages = eachSystem (system: pkgs: {
+        default = pkgs.callPackage ./package.nix { inherit (self.packages.${system}) vulnix; };
+        vulnix = vulnix_.packages.${system}.vulnix.overrideAttrs (old: {
+          patches = (old.patches or [ ]) ++ [ ./vulnix-1.12.4-storedir.patch ];
+        });
       });
 
       apps = eachSystem (system: _: {

@@ -1,16 +1,16 @@
 # Editable user configuration file.
 # Most of these configs are not requirement.
-{ config, lib, pkgs, pkgs-unstable, nixpkgs, ... }:
+{ config, lib, pkgs, pkgs-unstable, nixpkgs, claudeNixos, ... }:
 let
   HostConf = {
     hostName = "agentsandbox";
     wheelUser = "vscode";
   };
 
-  Boot.QEMU = {
-    virtualisation.cores = lib.mkDefault 4;
-    virtualisation.memorySize = lib.mkDefault 8192;
-  };
+  #Boot.QEMU = {
+  #  virtualisation.cores = lib.mkDefault 4;
+  #  virtualisation.memorySize = lib.mkDefault 8192;
+  #};
   Boot.Impermanence = {
     environment.persistence."/persistent" = {
       hideMounts = true;
@@ -58,6 +58,8 @@ let
       wget
       yq
       # opencode-dev
+      # hermes-agent
+      # openhack
     ];
     environment.shellAliases = {
       ll = "ls -l";
@@ -110,7 +112,8 @@ let
 
     home-manager.users.${HostConf.wheelUser} = { pkgs, ... }: {
       programs.bash.enable = true;
-      programs.bash.profileExtra = "export NPM_CONFIG_PREFIX=~/.npm-global PATH=$PATH:~/.npm-global/bin";
+      programs.bash.profileExtra = "export NPM_CONFIG_PREFIX=~/.npm-global PATH=$PATH:~/.npm-global/bin:~/.local/bin";
+      home.packages = [ claudeNixos ];
       programs.direnv = {
         enable = true;
         nix-direnv.enable = true;
@@ -124,6 +127,7 @@ let
           ExecStart = toString (pkgs.writeShellScript "ai-cli-update" ''
             NPM_CONFIG_PREFIX=~/.npm-global ${pkgs.nodejs}/bin/npm install -g \
             @openai/codex@latest
+            ${claudeNixos}/bin/update_claude_fixed
           '');
         };
         Install.WantedBy = [ "default.target" ];
@@ -194,7 +198,7 @@ let
     nix.settings.max-jobs = "auto";
     nix.settings.system-features = [ "nixos-test" ];
     nix.settings.trusted-users = [ HostConf.wheelUser ];
-    system.stateVersion = "25.11";
+    system.stateVersion = "26.05";
   };
 in
 {

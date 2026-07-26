@@ -1,8 +1,8 @@
 {
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
-    home-manager.url = "github:nix-community/home-manager/release-25.11";
+    home-manager.url = "github:nix-community/home-manager/release-26.05";
     home-manager.inputs.nixpkgs.follows = "nixpkgs";
     agentsandbox.url = "path:./agentsandbox";
     agentsandbox.inputs.nixpkgs.follows = "nixpkgs";
@@ -22,11 +22,13 @@
           ];
           specialArgs.pkgs-unstable = import nixpkgs-unstable { inherit system; config.allowUnfree = true; };
           specialArgs.nixpkgs = nixpkgs;
+          specialArgs.claudeNixos = self.packages.${system}.claude-nixos;
         };
       eachSystem = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" ];
     in
     {
       packages = eachSystem (system: {
+        claude-nixos = agentsandbox.packages.${system}.claude-nixos;
         # Extra packages available.
         # opencode-dev = opencode.packages.${system}.opencode.overrideAttrs (old: {
         #   preBuild = (old.preBuild or "") + ''

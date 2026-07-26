@@ -1,7 +1,6 @@
-{ lib, rustPlatform, makeWrapper, libvirt, openssh, util-linux, passt, virtiofsd, vulnix }:
+{ lib, rustPlatform, makeWrapper, openssh, util-linux, libvirt, virtiofsd, vulnix }:
 let
   cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
-  vulnix_ = vulnix.overrideAttrs (_: { patches = [ ./vulnix-1.12.1-storedir.patch ]; });
 in
 rustPlatform.buildRustPackage rec {
   pname = cargoToml.package.name;
@@ -13,9 +12,10 @@ rustPlatform.buildRustPackage rec {
   cargoLock.lockFile = ./Cargo.lock;
   nativeBuildInputs = [ makeWrapper ];
   postInstall = "install -D man/agentsandbox.1 $out/share/man/man1/agentsandbox.1";
+  # We expect that libvirtd and qemu are configured on host. See template/configuration.nix
   postFixup = ''
     wrapProgram "$out/bin/${pname}" \
-      --prefix PATH : ${lib.makeBinPath [ libvirt openssh util-linux passt virtiofsd vulnix_ ]}
+      --prefix PATH : ${lib.makeBinPath [ openssh util-linux libvirt virtiofsd vulnix ]}
   '';
   meta = {
     description = cargoToml.package.description;

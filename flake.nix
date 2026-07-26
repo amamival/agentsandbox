@@ -1,10 +1,10 @@
 {
   description = "A secure, efficient, reproducible NixOS Linux VM for self-improving agentic workflows";
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     /* the following inputs are used in test.nix */
     nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
-    home-manager.url = "github:nix-community/home-manager/release-25.11";
+    home-manager.url = "github:nix-community/home-manager/release-26.05";
     home-manager.inputs.nixpkgs.follows = "nixpkgs";
     impermanence.url = "github:nix-community/impermanence";
     impermanence.inputs.nixpkgs.follows = "nixpkgs";
@@ -35,7 +35,7 @@
 
       devShells = eachSystem (system: pkgs: {
         default = pkgs.mkShell {
-          packages = with pkgs; [ cargo clippy rust-analyzer util-linux libvirt virtiofsd passt openssh mitmproxy vulnix ];
+          packages = with pkgs; [ cargo rustc clippy rustfmt rust-analyzer util-linux libvirt virtiofsd passt openssh mitmproxy vulnix ];
           # Avoid python namespace collisions between mitmproxy and vulnix wrappers.
           shellHook = ''
             unset PYTHONPATH

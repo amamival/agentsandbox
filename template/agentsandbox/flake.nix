@@ -2,13 +2,17 @@
 # THIS FILE IS PART OF UNSTABLE RELEASE OF THE RUNTIME.
 {
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     impermanence.url = "github:nix-community/impermanence";
     impermanence.inputs.nixpkgs.follows = ""; # Only used in tests.
     impermanence.inputs.home-manager.follows = "";
   };
 
   outputs = { self, nixpkgs, impermanence, ... }: {
+    packages = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" ] (system: {
+      claude-nixos = import ./claude-nixos.nix { pkgs = nixpkgs.legacyPackages.${system}; };
+    });
+
     nixosModules.default = { config, lib, pkgs, ... }: {
       imports = [
         "${nixpkgs.outPath}/nixos/modules/virtualisation/qemu-vm.nix"
@@ -187,6 +191,14 @@
         virtualisation.fileSystems."/" = { device = "none"; fsType = "tmpfs"; options = [ "mode=755" "nosuid" "nodev" "noexec" ]; };
         virtualisation.fileSystems."/nix" = { device = "nix"; fsType = "virtiofs"; options = [ "nosuid" "nodev" ]; };
         virtualisation.fileSystems."/home" = { device = "none"; fsType = "tmpfs"; options = [ "mode=755" "nosuid" "nodev" ]; neededForBoot = true; };
+        systemd.mounts = [{
+          what = "tmpfs";
+          where = "/nix/var/nix/builds";
+          type = "tmpfs";
+          options = "mode=755,nosuid,nodev";
+          wantedBy = [ "local-fs.target" ];
+          unitConfig.ConditionKernelCommandLine = "agentsandbox.nested";
+        }];
         boot.kernel.sysctl."vm.overcommit_memory" = lib.mkDefault "1"; # Stability in low memory situations.
         systemd.services.fuse-inval-wq = {
           description = "Seed fuse.inval_wq before virtiofs mounts to free cached fds on host";

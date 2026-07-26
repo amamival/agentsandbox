@@ -5,9 +5,10 @@ use flate2::read::GzDecoder;
 use pathdiff::diff_paths;
 use reqwest::{blocking::Client, header};
 use rustix::{
+    fs::CWD,
     io::{Errno, FdFlags, fcntl_setfd, read, write},
-    mount::{MountFlags, MountPropagationFlags, UnmountFlags},
-    mount::{mount, mount_bind_recursive, mount_change, unmount},
+    mount::{MountFlags, MountPropagationFlags, MoveMountFlags, OpenTreeFlags, UnmountFlags},
+    mount::{mount, mount_bind_recursive, mount_change, move_mount, open_tree, unmount},
     pipe::{PipeFlags, pipe_with},
     process::{Pid, Signal, WaitOptions, chdir, getgid, getuid, kill_process, pivot_root, setsid, waitpid},
     runtime::{Fork, How, KernelSigSet, Timespec, exit_group, kernel_fork, kernel_sigprocmask, kernel_sigtimedwait},
@@ -18,22 +19,28 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     io::{IsTerminal as _, Read as _, Write as _},
     net::IpAddr,
     os::fd::AsRawFd,
     os::unix::net::{UnixListener, UnixStream},
-    os::unix::{fs::symlink, process::CommandExt},
-    path::{Path, PathBuf},
+    os::unix::{fs::MetadataExt, fs::symlink, process::CommandExt},
+    path::{Component, Path, PathBuf},
     process::{self, Stdio},
 };
-use toml_edit::{DocumentMut, Item, Table};
+use toml_edit::{DocumentMut, Item, TableLike};
 
 const APP_NAME: &str = env!("CARGO_PKG_NAME");
 const LOCAL_CONFIG_DIR: &str = concat!(".", env!("CARGO_PKG_NAME"));
 const CONFIG_TOML: &str = concat!(env!("CARGO_PKG_NAME"), ".toml");
 const CONFIG_LOCAL_TOML: &str = concat!(env!("CARGO_PKG_NAME"), ".local.toml");
 const DEFAULT_DOMAIN_XML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/template/domain.xml"));
+
+fn read_optional(path: &Path) -> std::io::Result<String> {
+    fs::read_to_string(path).or_else(|err| (err.kind() == std::io::ErrorKind::NotFound).then(String::new).ok_or(err))
+}
 
 #[derive(Parser)]
 #[command(
@@ -429,8 +436,8 @@ fn run_doctor(env: &Env) -> anyhow::Result<()> {
         Ok(flake_dir) => {
             println!("ResolvedFlakeDir:\t\t{}", flake_dir.display());
             println!("FileFlakeNixExists:\t\t{}", flake_dir.join("flake.nix").is_file());
-            println!("FileMountsExists:\t\t{}", flake_dir.join("mounts").is_file());
-            println!("FileAllowedHostsExists:\t\t{}", flake_dir.join("allowed_hosts").is_file());
+            println!("FileConfigTomlExists:\t\t{}", flake_dir.join(CONFIG_TOML).is_file());
+            println!("FileLocalConfigTomlExists:\t{}", flake_dir.join(CONFIG_LOCAL_TOML).is_file());
             println!("FileFlakeLockExists:\t\t{}", flake_dir.join("flake.lock").is_file());
             match list_instance_ids(env) {
                 Err(err) => println!("ListInstanceIdsError:\t\t{err:#}"),
@@ -519,11 +526,9 @@ fn resolve_instance(env: &Env) -> anyhow::Result<Instance> {
     })
 }
 
-fn read_port_forwards_lookup(
-    instance: &Instance,
-    guest_port: Option<u16>,
-    protocol: Option<&str>,
-) -> anyhow::Result<(BTreeMap<String, PortForward>, Option<(String, u16)>)> {
+type PortLookup = (BTreeMap<String, PortForward>, Option<(String, u16)>);
+
+fn read_port_forwards_lookup(instance: &Instance, guest_port: Option<u16>, protocol: Option<&str>) -> anyhow::Result<PortLookup> {
     let port_forwards_path = instance.runtime_dir.join("port-forwards");
     let forwards: BTreeMap<String, PortForward> = fs::read_to_string(&port_forwards_path)
         .ok()
@@ -548,7 +553,7 @@ fn read_port_forwards_lookup(
                     continue;
                 }
                 let count = f.host_end.unwrap_or(f.host) - f.host + 1;
-                if f.guest <= guest_port && guest_port <= f.guest + count - 1 {
+                if f.guest <= guest_port && guest_port < f.guest + count {
                     return Ok((BTreeMap::new(), Some((f.address.to_string(), f.host + (guest_port - f.guest)))));
                 }
             }
@@ -590,13 +595,13 @@ pub fn parse_config(config_toml: &str, local_toml: Option<&str>, host: &str, _wa
         }
     }*/
 
-    fn merge(dst: &mut Table, src: &Table) {
-        for (key, value) in src {
+    fn merge(dst: &mut dyn TableLike, src: &dyn TableLike) {
+        for (key, value) in src.iter() {
             if key == "hosts" {
                 continue;
             }
-            match (dst.get_mut(key), value) {
-                (Some(Item::Table(dst)), Item::Table(src)) => merge(dst, src),
+            match (dst.get_mut(key).and_then(Item::as_table_like_mut), value.as_table_like()) {
+                (Some(dst), Some(src)) => merge(dst, src),
                 _ => {
                     dst.insert(key, value.clone());
                 }
@@ -606,10 +611,10 @@ pub fn parse_config(config_toml: &str, local_toml: Option<&str>, host: &str, _wa
 
     let mut out = DocumentMut::new();
     for src in [
-        Some(config.as_table()),
-        Some(local.as_table()),
-        config_host.and_then(Item::as_table),
-        local_host.and_then(Item::as_table),
+        Some(config.as_table() as &dyn TableLike),
+        Some(local.as_table() as &dyn TableLike),
+        config_host.and_then(Item::as_table_like),
+        local_host.and_then(Item::as_table_like),
     ]
     .into_iter()
     .flatten()
@@ -645,7 +650,7 @@ fn render_domain_xml(env: &Env, instance: &Instance, system_profile: &Path, is_b
     }
 
     let config_toml = fs::read_to_string(instance.flake_dir.join(CONFIG_TOML)).context(format!("read {CONFIG_TOML}"))?;
-    let local_toml = fs::read_to_string(instance.flake_dir.join(CONFIG_LOCAL_TOML)).unwrap_or_default();
+    let local_toml = read_optional(&instance.flake_dir.join(CONFIG_LOCAL_TOML)).context(format!("read {CONFIG_LOCAL_TOML}"))?;
     let config = parse_config(&config_toml, Some(&local_toml), &env.hostname, true)?;
 
     let base_xml = config.vm.libvirt_domain_xml.as_deref().unwrap_or(DEFAULT_DOMAIN_XML);
@@ -719,7 +724,8 @@ fn render_domain_xml(env: &Env, instance: &Instance, system_profile: &Path, is_b
     let initrd = instance.sysroot.join(initrd_target.strip_prefix("/").context("get initrd image path")?);
     let kernel_params = fs::read_to_string(system_profile.join("kernel-params")).context("read kernel-params")?;
     let build_unit = if is_build { " systemd.unit=agentsandbox-build.target" } else { "" };
-    let cmdline = format!("{kernel_params} init=/nix/var/nix/profiles/system/init systemd.machine_id={machine_id}{build_unit}");
+    let nested = if env.is_nested { " agentsandbox.nested" } else { "" };
+    let cmdline = format!("{kernel_params} init=/nix/var/nix/profiles/system/init systemd.machine_id={machine_id}{build_unit}{nested}");
 
     let mut domain = XmlElement::from_reader(base_xml.as_bytes()).context("parse domain xml")?;
     if domain.tag().name() != "domain" {
@@ -850,15 +856,19 @@ fn write_template_config(target: &Path, workspace: &Path, force: bool) -> anyhow
     let workspace_name = workspace.file_name().and_then(|name| name.to_str()).context("derive workspace name")?;
     fs::create_dir_all(target.join(APP_NAME)).context("create agentsandbox dir")?;
     let app_flake = format!("{APP_NAME}/flake.nix");
+    let app_claude_nixos = format!("{APP_NAME}/claude-nixos.nix");
     let config_template = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/template/", env!("CARGO_PKG_NAME"), ".toml"));
+    let mut config: DocumentMut = config_template.parse().context(format!("parse template {CONFIG_TOML}"))?;
+    let mut workspace_mount = toml_edit::InlineTable::new();
+    workspace_mount.insert("source", toml_edit::Value::from("."));
+    workspace_mount.insert("readonly", toml_edit::Value::from(false));
+    config["mounts"][workspace_name] = toml_edit::value(workspace_mount);
     for (name, contents) in [
-        (CONFIG_TOML, config_template.to_owned()),
+        (CONFIG_TOML, config.to_string()),
         ("flake.nix", include_str!("../template/flake.nix").to_owned()),
         ("configuration.nix", include_str!("../template/configuration.nix").to_owned()),
-        // FIXME: to be removed after toml migration
-        ("allowed_hosts", include_str!("../template/allowed_hosts").to_owned()),
-        ("mounts", format!("# <host-path><TAB><guest-name><TAB><mode>\n.\t{workspace_name}\trw\n")),
         (app_flake.as_str(), include_str!("../template/agentsandbox/flake.nix").to_owned()),
+        (app_claude_nixos.as_str(), include_str!("../template/agentsandbox/claude-nixos.nix").to_owned()),
     ] {
         fs::write(target.join(name), contents).context("write template file")?;
     }
@@ -884,12 +894,19 @@ fn run_build_or_up(env: &Env, bootstrap: bool, is_up: bool, attach: bool, mut wr
         fs::write(instance.flake_dir.join("flake.lock"), r#"{"root":"","version":7}"#).context("write flake.lock")?;
         write_lock = true;
     }
+    let flake = format!("/persistent/etc/nixos#{}", env.hostname);
+    let rebuild = |action| {
+        let args = ["nixos-rebuild", action, "--flake", flake.as_str()]
+            .into_iter()
+            .chain((!write_lock).then_some("--no-write-lock-file"))
+            .collect::<Vec<_>>();
+        run_ssh(env, &args, true, true)
+    };
     let domstate = domstate(&instance.id)?;
     match domstate.as_str() {
         "down" | "shut off" | "crashed" => {
             start_vm(env, &instance, true)?;
-            let flake = format!("/persistent/etc/nixos#{}", env.hostname);
-            run_ssh(env, &["nixos-rebuild", "boot", "--flake", &flake], true, true)?;
+            rebuild("boot")?;
             let new_profile = read_system_profile(&instance)?;
             println!("{}", new_profile.display());
             if !is_up {
@@ -909,9 +926,8 @@ fn run_build_or_up(env: &Env, bootstrap: bool, is_up: bool, attach: bool, mut wr
             }
         }
         "running" => {
-            let flake = format!("/persistent/etc/nixos#{}", env.hostname);
             let switch_or_boot = if is_switch { "switch" } else { "boot" };
-            run_ssh(env, &["nixos-rebuild", switch_or_boot, "--flake", &flake], true, true)?;
+            rebuild(switch_or_boot)?;
             let new_profile = read_system_profile(&instance)?;
             let old_xml = fs::read_to_string(instance.runtime_dir.join("domain.xml")).unwrap_or_default();
             let (new_xml, _) = render_domain_xml(env, &instance, &new_profile, false)?;
@@ -1103,11 +1119,6 @@ fn read_system_profile(instance: &Instance) -> anyhow::Result<PathBuf> {
     bail!("system profile symlink chain is too deep")
 }
 
-/// Read the NixOS profile which the domain is created with.
-fn read_domain_profile(instance: &Instance) -> anyhow::Result<PathBuf> {
-    fs::read_link(instance.runtime_dir.join("domain-profile")).context("read domain-profile symlink")
-}
-
 /// Run virsh against the session URI (qemu:///session).
 ///
 /// Networking uses `<backend type='passt'/>`; libvirt looks up `passt` on the
@@ -1167,7 +1178,7 @@ where
             })() {
                 Ok(()) => 0,
                 Err(err) => {
-                    eprintln!("{err}");
+                    eprintln!("{err:#}");
                     1
                 }
             };
@@ -1340,9 +1351,8 @@ fn start_vm(env: &Env, instance: &Instance, is_build: bool) -> anyhow::Result<Pa
     Ok(system_profile)
 }
 
-/// Apply mounts from mounts file to the guest system.
+/// Apply mounts from the merged TOML config to the guest system.
 fn apply_mounts(env: &Env, instance: &Instance, _system_profile: &Path) -> anyhow::Result<()> {
-    let mounts_path = instance.flake_dir.join("mounts");
     let workspace_dir = instance.persistent.join("workspace");
     let config_dir = instance.persistent.join("etc/nixos");
     let mut mounted = Vec::new();
@@ -1360,40 +1370,36 @@ fn apply_mounts(env: &Env, instance: &Instance, _system_profile: &Path) -> anyho
     }
     mounted.sort();
 
-    // Collect and validate all mounts from mounts file.
+    let config_toml = fs::read_to_string(instance.flake_dir.join(CONFIG_TOML)).context(format!("read {CONFIG_TOML}"))?;
+    let local_toml = read_optional(&instance.flake_dir.join(CONFIG_LOCAL_TOML)).context(format!("read {CONFIG_LOCAL_TOML}"))?;
+    let config = parse_config(&config_toml, Some(&local_toml), &env.hostname, false)?;
+
+    // Collect and validate all enabled mounts from the effective config.
     let mut parsed_mounts = Vec::new();
-    for line in fs::read_to_string(&mounts_path).context("read mounts file")?.lines() {
-        if line.is_empty() || line.starts_with('#') {
+    for (name, entry) in config.mounts {
+        let PolicyEntry::Set(mount_config) = entry else {
             continue;
-        }
-        let mut parts = line.split('\t');
-        let (source, name, mode) = match (parts.next(), parts.next(), parts.next(), parts.next()) {
-            (Some(source), Some(name), Some(mode @ ("rw" | "ro")), None) => (source, name, mode == "rw"),
-            _ => bail!("invalid mounts entry: {line}"),
         };
-        validate_mount_source_field(source)?;
-        let source_abs = if Path::new(source).is_absolute() {
-            PathBuf::from(source)
+        validate_mount_source_field(&mount_config.source)?;
+        let source_abs = if Path::new(&mount_config.source).is_absolute() {
+            PathBuf::from(&mount_config.source)
         } else {
-            env.workspace.join(source)
+            env.workspace.join(&mount_config.source)
         };
         let source_abs = source_abs.canonicalize().context("canonicalize mount source")?;
-        if !source_abs.exists() {
-            bail!("mount source does not exist: {}", source_abs.display());
-        }
         if !source_abs.is_dir() && !source_abs.is_file() {
             bail!("mount source is neither file nor directory: {}", source_abs.display());
         }
-        validate_mount_name_field(name)?;
-        let target = workspace_dir.join(name);
+        validate_mount_name_field(&name)?;
+        let target = workspace_dir.join(&name);
         let is_dir = source_abs.is_dir();
-        parsed_mounts.push((source_abs, target, is_dir, mode));
+        parsed_mounts.push((source_abs, target, is_dir, !mount_config.readonly.unwrap_or(false)));
     }
     parsed_mounts.push((
         instance.flake_dir.canonicalize().context("canonicalize config dir")?,
-        instance.persistent.join("etc/nixos"),
+        config_dir.clone(),
         true,
-        true, //system_profile.join("mutable-sandbox-config").exists(),
+        true,
     ));
     parsed_mounts.sort_by(|a, b| a.1.cmp(&b.1));
 
@@ -1420,11 +1426,10 @@ fn apply_mounts(env: &Env, instance: &Instance, _system_profile: &Path) -> anyho
         }
     }
 
-    // Mount all mounts from mounts file.
+    // Mount all configured mounts.
     for (source_abs, target, is_dir, writable) in parsed_mounts {
         if is_dir {
             fs::create_dir_all(&target).context("create target dir")?;
-            mount_bind_recursive(&source_abs, &target).context("bind-mount dir")?;
         } else {
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent).context("create target parent dir")?;
@@ -1432,16 +1437,49 @@ fn apply_mounts(env: &Env, instance: &Instance, _system_profile: &Path) -> anyho
             if !target.exists() {
                 fs::write(&target, "").context("create target file")?;
             }
-            let flags = if writable { MountFlags::BIND } else { MountFlags::BIND | MountFlags::RDONLY };
-            mount(&source_abs, &target, "", flags, c"").context("bind-mount file")?;
+        }
+        if !writable {
+            mount_readonly(&source_abs, &target, is_dir)?;
+        } else if is_dir {
+            mount_bind_recursive(&source_abs, &target).context("bind-mount dir")?;
+        } else {
+            mount(&source_abs, &target, "", MountFlags::BIND, c"").context("bind-mount file")?;
         }
     }
-    // To mitigate the risk of writing to the policy files.
-    for name in ["mounts", "allowed_hosts"] {
-        let target = config_dir.join(name);
-        mount(&target, &target, "", MountFlags::BIND | MountFlags::RDONLY, c"").context("bind-mount policy file read-only")?;
+    let mut dirs = vec![workspace_dir, config_dir];
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(&dir).with_context(|| format!("scan {}", dir.display()))? {
+            let entry = entry.context("read config search entry")?;
+            if entry.file_type()?.is_dir() {
+                dirs.push(entry.path());
+            } else if entry.file_name() == CONFIG_TOML || entry.file_name() == CONFIG_LOCAL_TOML {
+                let path = entry.path();
+                if entry.metadata()?.nlink() != 1 {
+                    bail!("refuse hard-linked config: {}", path.display());
+                }
+                mount_readonly(&path, &path, false)?;
+            }
+        }
     }
     Ok(())
+}
+
+fn mount_readonly(source: &Path, target: &Path, recursive: bool) -> anyhow::Result<()> {
+    let flags =
+        OpenTreeFlags::OPEN_TREE_CLONE | OpenTreeFlags::OPEN_TREE_CLOEXEC | if recursive { OpenTreeFlags::AT_RECURSIVE } else { OpenTreeFlags::empty() };
+    let tree = open_tree(CWD, source, flags).context("clone mount read-only")?;
+    let attr = libc::mount_attr {
+        attr_set: libc::MOUNT_ATTR_RDONLY,
+        attr_clr: 0,
+        propagation: 0,
+        userns_fd: 0,
+    };
+    let flags = libc::AT_EMPTY_PATH | if recursive { libc::AT_RECURSIVE } else { 0 };
+    let result = unsafe { libc::syscall(libc::SYS_mount_setattr, tree.as_raw_fd(), c"".as_ptr(), flags, &attr, size_of_val(&attr)) };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error()).context("mount read-only");
+    }
+    move_mount(&tree, c"", CWD, target, MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH).context("attach mount read-only")
 }
 
 /// Get compatible subuid/subgid maps from host.
@@ -1458,8 +1496,8 @@ fn capture_host_idmap(path: &str, map_root: bool) -> anyhow::Result<String> {
 }
 
 fn validate_mount_name_field(value: &str) -> anyhow::Result<()> {
-    if value.is_empty() || matches!(value, "." | "..") || value.contains(['\t', '\n']) || value.contains("../") {
-        bail!("invalid mount name: contains control separator characters or empty");
+    if value.is_empty() || !Path::new(value).components().all(|part| matches!(part, Component::Normal(_))) || value.contains(['\t', '\n']) {
+        bail!("invalid mount name: expected a relative path without special components");
     }
     Ok(())
 }
@@ -1629,9 +1667,11 @@ fn run_wait<S: AsRef<str>>(instance: &Instance, states: &[S]) -> anyhow::Result<
 #[inline(never)]
 fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bool, read_only: bool) -> anyhow::Result<()> {
     let instance = resolve_instance(env)?;
-    let mounts_path = instance.flake_dir.join("mounts");
     let config_toml_path = instance.flake_dir.join(CONFIG_TOML);
     let config_local_toml_path = instance.flake_dir.join(CONFIG_LOCAL_TOML);
+    let config_toml_contents = fs::read_to_string(&config_toml_path).context(format!("read {CONFIG_TOML}"))?;
+    let config_local_toml_contents = read_optional(&config_local_toml_path).context(format!("read {CONFIG_LOCAL_TOML}"))?;
+    let config = parse_config(&config_toml_contents, Some(&config_local_toml_contents), &env.hostname, false).context("validate current TOML config")?;
 
     let to_base_rel = |path: &Path| -> anyhow::Result<(PathBuf, PathBuf)> {
         let base_abs = env.workspace.canonicalize()?;
@@ -1668,102 +1708,66 @@ fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bo
         }
         // list mounts.
         (_, _) => {
-            println!("{}", fs::read_to_string(&mounts_path)?);
+            for (name, entry) in config.mounts {
+                if let PolicyEntry::Set(mount) = entry {
+                    println!("{}\t{name}\t{}", mount.source, if mount.readonly.unwrap_or(false) { "ro" } else { "rw" });
+                }
+            }
             return Ok(());
         }
     };
 
-    let kill_matcher = format!("{}\t", kill_entry.as_deref().unwrap_or(""));
-    let mut contents = String::new();
-    let mut updated = false;
-    for line in fs::read_to_string(&mounts_path)?.lines() {
-        if line.starts_with(&kill_matcher) {
-            updated = true;
-        } else {
-            contents.push_str(line);
-            contents.push('\n');
-            let mut parts = line.split('\t');
-            if let (Some((new_source, new_name)), Some(source), Some(name)) = (new_entry.as_ref(), parts.next(), parts.next()) {
-                if new_source.as_os_str() == source {
-                    bail!("mount path already exists: {source}");
+    if let Some((new_source, new_name)) = new_entry.as_ref() {
+        let new_source = new_source.display().to_string();
+        for (name, entry) in &config.mounts {
+            if let PolicyEntry::Set(mount) = entry {
+                if mount.source == new_source {
+                    bail!("mount path already exists: {new_source}");
                 }
-                if new_name == name {
+                if name == new_name {
                     bail!("mount name already exists: {name}");
                 }
             }
         }
     }
-    if let Some(new_entry) = new_entry.as_ref() {
-        updated = true;
-        let mode = if read_only { "ro" } else { "rw" };
-        contents.push_str(&format!("{}\t{}\t{mode}\n", new_entry.0.display(), new_entry.1));
-    }
-    if !updated {
-        eprintln!("unmount: no changes to apply");
-        return Ok(());
-    }
-
-    let config_toml_contents = fs::read_to_string(&config_toml_path).context(format!("read {CONFIG_TOML}"))?;
-    let config_local_toml_contents = fs::read_to_string(&config_local_toml_path).unwrap_or_default();
-
-    // The CLI still writes the historical mounts file because it is the live
-    // policy source for the current mount reload path.  The local TOML update
-    // exists to preserve the same user action in the structured config without
-    // changing the runtime reader in this task.
-    parse_config(&config_toml_contents, Some(&config_local_toml_contents), &env.hostname, false).context("validate current TOML config")?;
 
     let mut config_local_toml: DocumentMut = config_local_toml_contents.parse().context(format!("parse {CONFIG_LOCAL_TOML}"))?;
     if let Some((source, name)) = new_entry.as_ref() {
         let source = source.display().to_string();
-
-        // The flat mounts file is still allowed to contain entries that local
-        // TOML does not know about.  That is the migration state this task is
-        // preserving.  The one case we must reject is a local TOML entry with
-        // the same guest name but a different host source, because accepting it
-        // would silently turn one target name into two conflicting policies.
-        let existing_source = config_local_toml
-            .get("hosts")
-            .and_then(|hosts| hosts.get(&env.hostname))
-            .and_then(|host| host.get("mounts"))
-            .and_then(|mounts| mounts.get(name))
-            .and_then(|mount| mount.get("source"))
-            .and_then(|source| source.as_str());
-        if existing_source.is_some_and(|existing_source| existing_source != source) {
-            bail!(
-                "{CONFIG_LOCAL_TOML}: hosts.{}.mounts.{name} already exists with a different source",
-                env.hostname
-            );
-        }
-
-        // Index assignment is intentionally used after parse_config validation.
-        // That keeps structural errors on the existing Config deserializer path,
-        // while still letting toml_edit create missing hosts/hostname/mounts
-        // tables and preserve unrelated comments and ordering.
         let mut mount = toml_edit::InlineTable::new();
         mount.insert("source", toml_edit::Value::from(source));
         mount.insert("readonly", toml_edit::Value::from(read_only));
         config_local_toml["hosts"][env.hostname.as_str()]["mounts"][name.as_str()] = toml_edit::value(mount);
     }
     if let Some(source) = kill_entry.as_ref() {
-        if let Some(mounts) = config_local_toml
-            .get_mut("hosts")
-            .and_then(|hosts| hosts.get_mut(&env.hostname))
-            .and_then(|host| host.get_mut("mounts"))
-            .and_then(Item::as_table_like_mut)
-        {
-            // Unmount is source-oriented in the existing CLI, while TOML is
-            // keyed by guest mount name.  We therefore search by the preserved
-            // source string rather than guessing the name from the path again.
-            let name = mounts
-                .iter()
-                .find_map(|(name, mount)| (mount.get("source").and_then(|source| source.as_str()) == Some(source.as_str())).then(|| name.to_owned()));
-            if let Some(name) = name {
+        let names = config
+            .mounts
+            .iter()
+            .filter_map(|(name, entry)| match entry {
+                PolicyEntry::Set(mount) if mount.source == *source => Some(name.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            eprintln!("unmount: no changes to apply");
+            return Ok(());
+        }
+        for name in names {
+            if let Some(mounts) = config_local_toml
+                .get_mut("hosts")
+                .and_then(|hosts| hosts.get_mut(&env.hostname))
+                .and_then(|host| host.get_mut("mounts"))
+                .and_then(Item::as_table_like_mut)
+            {
                 mounts.remove(&name);
+            }
+            let without_override = parse_config(&config_toml_contents, Some(&config_local_toml.to_string()), &env.hostname, false)?;
+            if matches!(without_override.mounts.get(&name), Some(PolicyEntry::Set(_))) {
+                config_local_toml["hosts"][env.hostname.as_str()]["mounts"][name.as_str()] = toml_edit::value(false);
             }
         }
     }
     fs::write(&config_local_toml_path, config_local_toml.to_string()).context(format!("write {CONFIG_LOCAL_TOML}"))?;
-    fs::write(&mounts_path, contents)?;
 
     let pid_path = instance.runtime_dir.join("agentsandbox.pid");
     if let Ok(pid) = fs::read_to_string(&pid_path) {
@@ -1819,93 +1823,35 @@ fn parse_allowed_host_cli_argument(domain: &str) -> anyhow::Result<String> {
 #[inline(never)]
 fn run_allow_domain(env: &Env, domain: &str) -> anyhow::Result<()> {
     let instance = resolve_instance(env)?;
-    let allowed_hosts_path = instance.flake_dir.join("allowed_hosts");
     let config_toml_path = instance.flake_dir.join(CONFIG_TOML);
     let config_local_toml_path = instance.flake_dir.join(CONFIG_LOCAL_TOML);
-
     let normalized_domain = parse_allowed_host_cli_argument(domain)?;
-
-    let mut allowed_hosts_contents = String::new();
-    let mut already_allowed_in_plain_file = false;
-
-    // Preserve comments and unrelated lines in the historical allowlist file.
-    // Only exact duplicates of the normalized domain are collapsed, matching
-    // the current plain-file behavior instead of reinterpreting the file as
-    // TOML or as an effective merged policy.
-    for line in fs::read_to_string(&allowed_hosts_path)?.lines() {
-        if line == normalized_domain {
-            already_allowed_in_plain_file = true;
-        }
-        allowed_hosts_contents.push_str(line);
-        allowed_hosts_contents.push('\n');
-    }
-    if !already_allowed_in_plain_file {
-        allowed_hosts_contents.push_str(&normalized_domain);
-        allowed_hosts_contents.push('\n');
-    }
-
     let config_toml_contents = fs::read_to_string(&config_toml_path).context(format!("read {CONFIG_TOML}"))?;
-    let config_local_toml_contents = fs::read_to_string(&config_local_toml_path).unwrap_or_default();
-
-    // The flat allowlist remains the current runtime source.  The TOML write is
-    // deliberately parallel state: it records the same allow action for config
-    // preservation, and it converts a previous local false override back into
-    // an allow entry because that is what this CLI command explicitly requests.
+    let config_local_toml_contents = read_optional(&config_local_toml_path).context(format!("read {CONFIG_LOCAL_TOML}"))?;
     parse_config(&config_toml_contents, Some(&config_local_toml_contents), &env.hostname, false).context("validate current TOML config")?;
 
     let mut config_local_toml: DocumentMut = config_local_toml_contents.parse().context(format!("parse {CONFIG_LOCAL_TOML}"))?;
     config_local_toml["hosts"][env.hostname.as_str()]["allowedHosts"][normalized_domain.as_str()] = toml_edit::value(toml_edit::InlineTable::new());
     fs::write(&config_local_toml_path, config_local_toml.to_string()).context(format!("write {CONFIG_LOCAL_TOML}"))?;
-    fs::write(&allowed_hosts_path, allowed_hosts_contents)?;
     Ok(())
 }
 
 #[inline(never)]
 fn run_unallow_domain(env: &Env, domain: &str) -> anyhow::Result<()> {
     let instance = resolve_instance(env)?;
-    let allowed_hosts_path = instance.flake_dir.join("allowed_hosts");
     let config_toml_path = instance.flake_dir.join(CONFIG_TOML);
     let config_local_toml_path = instance.flake_dir.join(CONFIG_LOCAL_TOML);
-
     let normalized_domain = parse_allowed_host_cli_argument(domain)?;
-
-    let mut allowed_hosts_contents = String::new();
-
-    // The runtime file has no negative entry syntax; removing the exact line is
-    // the whole operation there.  Any need to suppress a base TOML allow is
-    // handled below in agentsandbox.local.toml with an explicit false value.
-    for line in fs::read_to_string(&allowed_hosts_path)?.lines() {
-        if line != normalized_domain {
-            allowed_hosts_contents.push_str(line);
-            allowed_hosts_contents.push('\n');
-        }
+    let config_toml_contents = fs::read_to_string(&config_toml_path).context(format!("read {CONFIG_TOML}"))?;
+    let config_local_toml_contents = read_optional(&config_local_toml_path).context(format!("read {CONFIG_LOCAL_TOML}"))?;
+    let config = parse_config(&config_toml_contents, Some(&config_local_toml_contents), &env.hostname, false).context("validate current TOML config")?;
+    if !matches!(config.allowed_hosts.get(&normalized_domain), Some(PolicyEntry::Set(_))) {
+        eprintln!("unallow-domain: no changes to apply");
+        return Ok(());
     }
 
-    let config_toml_contents = fs::read_to_string(&config_toml_path).context(format!("read {CONFIG_TOML}"))?;
-    let config_local_toml_contents = fs::read_to_string(&config_local_toml_path).unwrap_or_default();
-
-    // A delete in local TOML is not always enough: if the base config allows
-    // the same domain, removing the local key would expose the base allow again
-    // after Config merging.  In that case the CLI records false in local TOML,
-    // because the user's unallow action has to survive the base policy.
-    parse_config(&config_toml_contents, Some(&config_local_toml_contents), &env.hostname, false).context("validate current TOML config")?;
-
-    let config_toml: DocumentMut = config_toml_contents.parse().context(format!("parse {CONFIG_TOML}"))?;
-    let allowed_by_base_config = config_toml
-        .get("allowedHosts")
-        .and_then(|allowed_hosts| allowed_hosts.get(&normalized_domain))
-        .is_some()
-        || config_toml
-            .get("hosts")
-            .and_then(|hosts| hosts.get(&env.hostname))
-            .and_then(|host| host.get("allowedHosts"))
-            .and_then(|allowed_hosts| allowed_hosts.get(&normalized_domain))
-            .is_some();
-
     let mut config_local_toml: DocumentMut = config_local_toml_contents.parse().context(format!("parse {CONFIG_LOCAL_TOML}"))?;
-    if allowed_by_base_config {
-        config_local_toml["hosts"][env.hostname.as_str()]["allowedHosts"][normalized_domain.as_str()] = toml_edit::value(false);
-    } else if let Some(allowed_hosts) = config_local_toml
+    if let Some(allowed_hosts) = config_local_toml
         .get_mut("hosts")
         .and_then(|hosts| hosts.get_mut(&env.hostname))
         .and_then(|host| host.get_mut("allowedHosts"))
@@ -1913,8 +1859,11 @@ fn run_unallow_domain(env: &Env, domain: &str) -> anyhow::Result<()> {
     {
         allowed_hosts.remove(&normalized_domain);
     }
+    let without_override = parse_config(&config_toml_contents, Some(&config_local_toml.to_string()), &env.hostname, false)?;
+    if matches!(without_override.allowed_hosts.get(&normalized_domain), Some(PolicyEntry::Set(_))) {
+        config_local_toml["hosts"][env.hostname.as_str()]["allowedHosts"][normalized_domain.as_str()] = toml_edit::value(false);
+    }
     fs::write(&config_local_toml_path, config_local_toml.to_string()).context(format!("write {CONFIG_LOCAL_TOML}"))?;
-    fs::write(&allowed_hosts_path, allowed_hosts_contents)?;
     Ok(())
 }
 

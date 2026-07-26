@@ -7,6 +7,11 @@ vcpus = 4
 # Maximum memory the guest may use. Page-reporting keeps actual usage close to internal process demand.
 memoryMiB = 8192
 
+# Trust the host OS CA bundle in the guest (e.g. corporate MITM proxy roots on non-NixOS hosts).
+# Host must already include your corporate root in its system trust store.
+# Not applied at build/up time yet; only parsed and discoverable for now.
+# useHostCerts = false
+
 # Optional libvirt domain XML template. Paste your working domain XML.
 # Use this when adding GPU, USB, evdev devices, pulseaudio sockets, or similar settings.
 # The guest configuration is derived from this template after editing.

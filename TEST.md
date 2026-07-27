@@ -23,9 +23,10 @@ This file defines a end-to-end scenario sequence that exercises every subcommand
   - Create a new empty directory and `cd` into it
   - Confirm that no `.agentsandbox/` directory exists yet
   - Run `agentsandbox init`
-  - Verify that `.agentsandbox/{flake.nix,configuration.nix,allowed_hosts,mounts}` were created
+  - Verify that `.agentsandbox/{flake.nix,configuration.nix,agentsandbox.toml}` and
+    `.agentsandbox/agentsandbox/{flake.nix,claude-nixos.nix}` were created
   - Run `agentsandbox doctor` and verify that `ResolvedFlakeDir` is the local `.agentsandbox/` directory
-  - Run `agentsandbox doctor` and verify that `InstanceId` (starts with `<dirname>-`),
+  - Run `agentsandbox doctor` and verify that `InstanceId` is `<dirname>[default]`,
     `Instance{Data,State,Runtime}Dir` appear in the output
   - Run `agentsandbox init` again and verify that the message "init: $PWD/.agentsandbox already exists" is printed
   - Run `agentsandbox init -f` and verify that the message "init: wrote template files to $PWD/.agentsandbox" is printed
@@ -38,17 +39,17 @@ This file defines a end-to-end scenario sequence that exercises every subcommand
   - Create a new empty directory and `cd` into it
   - Confirm that no `.agentsandbox/` directory exists yet
   - Run `agentsandbox init --global`
-  - Verify that `$XDG_CONFIG_HOME/agentsandbox/{flake.nix,configuration.nix,allowed_hosts,mounts}`
-    were created (`$XDG_CONFIG_HOME` is typically `~/.config/`)
-  - Run `agentsandbox doctor` (note that without `-g` flag) and verify that `ResolvedFlakeDir` is the
-    global `$XDG_CONFIG_HOME/agentsandbox/` directory
-  - Run `agentsandbox doctor` and verify that `InstanceId` (starts with `agentsandbox-`), and
+  - Verify that `$XDG_CONFIG_HOME/agentsandbox/agentsandbox/{flake.nix,configuration.nix,agentsandbox.toml}`
+    was created (`$XDG_CONFIG_HOME` is typically `~/.config/`)
+  - Run `agentsandbox --global doctor` and verify that `ResolvedFlakeDir` is the
+    global `$XDG_CONFIG_HOME/agentsandbox/agentsandbox/` directory
+  - Run `agentsandbox --global doctor` and verify that `InstanceId` is `agentsandbox[default]`, and
     `Instance{Data,State,Runtime}Dir` appear in the output
-  - Run `agentsandbox init --global` again and verify that the message "init: $XDG_CONFIG_HOME/agentsandbox already exists" is printed
-  - Run `agentsandbox init --global -f` and verify that the message "init: wrote template files to $XDG_CONFIG_HOME/agentsandbox" is printed
+  - Run `agentsandbox init --global` again and verify that the message "init: $XDG_CONFIG_HOME/agentsandbox/agentsandbox already exists" is printed
+  - Run `agentsandbox init --global -f` and verify that the message "init: wrote template files to $XDG_CONFIG_HOME/agentsandbox/agentsandbox" is printed
     and timestamps of the files are updated
-  - `cd` to a different directory without `.agentsandbox/` and verify that `agentsandbox doctor` reports *same* `ResolvedFlakeDir` as before
-  - Run ` agentsandbox destroy -gc` and verify that the global `$XDG_CONFIG_HOME/agentsandbox/` directory is removed
+  - `cd` to a different directory without `.agentsandbox/` and verify that `agentsandbox --global doctor` reports *same* `ResolvedFlakeDir` as before
+  - Run `agentsandbox --global destroy -c` and verify that the global project directory is removed
 
 3. Build the initial guest system
   - Create a new empty directory and `cd` into it
@@ -64,16 +65,17 @@ Connection timed out during banner exchange
 Connection timed out during banner exchange
 Connection timed out during banner exchange
 building the system configuration...
-Done. The new configuration is /nix/store/kapg52qccy514hm0rqwaaxj8xcghvk7z-nixos-system-agentsandbox-25.11.20260429.755f5aa
-/home/user/.local/share/agentsandbox/test-default-3dfcf2a48071b66ed848db7937a8eec1/sysroot/nix/store/kapg52qccy514hm0rqwaaxj8xcghvk7z-nixos-system-agentsandbox-25.11.20260429.755f5aa
-Domain 'test-default-3dfcf2a48071b66ed848db7937a8eec1' destroyed
+Done. The new configuration is /nix/store/<hash>-nixos-system-agentsandbox-26.05.<revision>
+/home/user/.local/share/agentsandbox/test[default]/sysroot/nix/store/<hash>-nixos-system-agentsandbox-26.05.<revision>
+Domain 'test[default]' destroyed
 ```
 
 4. Start the VM
   - Run `agentsandbox up` and be patient as it takes a little while
-  - Verify that the VM starts, four virtiofs processes start
+  - Verify that the VM starts and the `/nix` and `/persistent` virtiofs exports are active
 
 5. Validate runtime lifecycle controls
+  - Run `agentsandbox ls` and verify that the current instance is listed
   - Run `agentsandbox ps` and verify that the VM is running
   - Run `agentsandbox ssh` and verify that a shell opens inside the guest as a regular user
   - Run `agentsandbox exec` and verify that a shell opens inside the guest as root user
@@ -92,8 +94,8 @@ Domain 'test-default-3dfcf2a48071b66ed848db7937a8eec1' destroyed
 
 6. Validate dynamic mounts
   - Run `agentsandbox down` if the VM is running
-  - Run `agentsandbox mount` and verify that the output contains the header line
-    `# <rel-host-path><TAB><guest-name>` and a default workspace line `.\t` plus the workspace directory name
+  - Run `agentsandbox mount` and verify that the output contains a default workspace row
+    `.<TAB><workspace-name><TAB>rw`
     (the final path component of the project directory)
   - Create two host directories, for example `alpha/` and `beta/` with `mkdir -p alpha beta; touch alpha/A beta/B`
   - Run `agentsandbox mount ./alpha` while the VM is down
@@ -102,9 +104,9 @@ Domain 'test-default-3dfcf2a48071b66ed848db7937a8eec1' destroyed
   - Verify that the initial workspace mount is visible in the guest under the workspace basename.
   - Run `agentsandbox mount ./beta sandbox-beta` while the VM is running
   - Run `agentsandbox ssh l /persistent/workspace` and verify that the guest sees the `beta` directory
-  - Verify that `.agentsandbox/mounts` contains `alpha<TAB>alpha` and `beta<TAB>sandbox-beta`
+  - Verify that `.agentsandbox/agentsandbox.local.toml` contains the `alpha` and `sandbox-beta` mount entries
   - Run `agentsandbox unmount ./alpha`
-  - Verify that the `alpha` entry is removed from `mounts` and the guest sees the `alpha` directory is removed
+  - Verify that the `alpha` entry is removed from the effective TOML config and the guest no longer sees it
   - Run `agentsandbox unmount .` and verify that current workspace is unmounted in the guest
   - Run `cd alpha; agentsandbox -w .. mount .` and verify that the guest sees the current workspace is mounted as before
     (think `-w` as chroot-like relative path).
@@ -149,13 +151,11 @@ Domain 'test-default-3dfcf2a48071b66ed848db7937a8eec1' destroyed
 
 12. Validate allowlist entries
   - Run `agentsandbox allow-domain Example.COM`.
-  - Run `agentsandbox allow-domain https://example.com/path`.
-  - Run `agentsandbox allow-domain 'https://*.Example.COM.:8443/path'`.
-  - Verify that `allowed_hosts` contains one normalized `example.com` entry and one `*.example.com` entry.
-  - Run `agentsandbox unallow-domain https://EXAMPLE.com.:443/path`.
-  - Verify that the exact `example.com` line is removed.
-  - Here, deny-by-default means that removing every active `allowed_hosts` entry must still block
-    unmatched hosts rather than falling back to allow-all.
+  - Verify that `.agentsandbox/agentsandbox.local.toml` contains the normalized `example.com` key.
+  - Verify that `agentsandbox allow-domain https://example.com/path` fails as invalid input.
+  - Run `agentsandbox unallow-domain example.com`.
+  - Verify that the effective TOML policy no longer enables `example.com`.
+  - This validates persistence only; v0.2 does not enforce the domain policy on network traffic.
 
 13. Validate proxy log handling
   - Append a request record to `logs/requests.jsonl`.
@@ -167,7 +167,7 @@ Domain 'test-default-3dfcf2a48071b66ed848db7937a8eec1' destroyed
 
 - Every subcommand listed in `agentsandbox --help` is executed at least once in this sequence
 - The sequence covers local config, global config resolution, guest build, VM lifecycle control,
-  dynamic mount management, logs, stats, port forwarding, allowlist editing, proxy log tailing, and cleanup
+  dynamic mount management, logs, stats, port forwarding, domain-policy editing, proxy log tailing, and cleanup
 - The sequence must pass without manual edits between steps other than the explicit host directories and
   files created for the scenario
 - Please add a star on GitHub repository if you found this project useful

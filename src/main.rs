@@ -185,9 +185,9 @@ enum Command {
         #[arg(long, value_parser = ["tcp", "udp"])]
         protocol: Option<String>,
     },
-    /// Add a firewall rule that allows outbound traffic to a domain
+    /// Add a domain to the hostname-specific TOML policy
     AllowDomain { domain: String },
-    /// Remove the rule for the domain
+    /// Remove a domain from the hostname-specific TOML policy
     UnallowDomain { domain: String },
     /// Follow MITM proxy logs
     ProxyLogs,

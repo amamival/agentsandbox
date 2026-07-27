@@ -12,13 +12,13 @@ This repo boots a NixOS-based system sandbox on a local Linux host.
 
 It gives you a real booted NixOS userland with `systemd`, persistence, and SSH access.
 
-This is a good fit for packaging, service work, NixOS modules, and NixOS learning in general. You can iterate on a real [`configuration.nix`](configuration.nix), rebuild, and observe how services, users, SSH, packages, and persistent state behave together without sacrificing security and privacy.
+This is a good fit for packaging, service work, NixOS modules, and NixOS learning in general. You can iterate on a real [`configuration.nix`](template/configuration.nix), rebuild, and observe how services, users, SSH, packages, and persistent state behave together without sacrificing security and privacy.
 
 This is not yet a polished runtime. It remains an experimental launcher under heavy development.
 
 The target host platform is recent `amd64` Linux in general, not just NixOS. If this does not run on a reasonably current Linux machine, that should be treated as a bug rather than an unsupported edge case.
 
-The entrypoint is [`agentsandbox`](agentsandbox), which handles sysroot bootstrap, system build, libvirt startup, attach, and mounts.
+The `agentsandbox` command handles sysroot bootstrap, system builds, libvirt startup, attach, and mounts.
 
 ## Installation
 
@@ -28,10 +28,12 @@ The entrypoint is [`agentsandbox`](agentsandbox), which handles sysroot bootstra
 
 ## Using
 
-Linux host (x86_64/amd64) with KVM support is required.
+Linux host (x86_64/amd64) with KVM, libvirt session QEMU, passt, and virtiofsd is required.
 
 - `agentsandbox`
   If the VM is running, attach to it; otherwise, rebuild and start it.
+- `agentsandbox <command>`
+  Run a command against the selected project and hostname.
 
 The subcommands are similar to those of **Docker Compose**.
 ```
@@ -48,6 +50,7 @@ Commands:
   pause           Pause running VMs for all hostnames in the current config
   unpause         Unpause VMs for all hostnames in the current config
   destroy         Kill and delete guest files selected by flags (none by default)
+  ls              List all VMs stored
   ps              List VM statuses for all hostnames in the current config
   ssh             Run a command as a user in a running VM, or attach if omitted
   exec            Run a command as root in a running VM, or attach if omitted
@@ -57,18 +60,20 @@ Commands:
   mount           Mount a file or directory into a running VM, or show mounts entries
   unmount         Unmount a file or directory from a running VM now and on future starts
   port            Prints the public port for a port binding
-  allow-domain    Add a firewall rule that allows outbound traffic to a domain
-  unallow-domain  Remove the rule for the domain
+  allow-domain    Add a domain to the hostname-specific TOML policy
+  unallow-domain  Remove a domain from the hostname-specific TOML policy
   proxy-logs      Follow MITM proxy logs
   verify          Verify and repair build
+  audit           Run CVE scan against the guest store
   help            Print this message or the help of the given subcommand(s)
 
 Options:
-  -g, --global                 Use only global config (`$XDG_CONFIG_HOME/agentsandbox`) and skip local upward search
-  -n, --hostname <HOSTNAME>    Select sandbox hostname (build target and instance identity input) [default: default]
-  -w, --workspace <WORKSPACE>  Resolve the active workspace and config as if running from this directory
-  -h, --help                   Print help
-  -V, --version                Print version
+  -g, --global                       Use only global config (`$XDG_CONFIG_HOME/agentsandbox`) and skip local upward search
+  -p, --project-name <PROJECT_NAME>  Select project name. Combined with hostname to form the instance name
+  -n, --hostname <HOSTNAME>          Select sandbox hostname (build target and instance identity input) [default: default]
+  -w, --workspace <WORKSPACE>        Resolve the active workspace and config as if running from this directory
+  -h, --help                         Print help
+  -V, --version                      Print version
 ```
 
 ## Quick Start
@@ -89,10 +94,25 @@ For global (project-less) usage, initialize once with:
 agentsandbox --global init
 ```
 
+## Configuration
+
+`init` writes `.agentsandbox/agentsandbox.toml`. An optional
+`.agentsandbox/agentsandbox.local.toml` overrides it. Within each file, base
+values are merged with `[hosts.<hostname>]` values. CLI `mount`,
+`unmount`, `allow-domain`, and `unallow-domain` edits are kept in the local
+file.
+
+Relative mount sources are resolved from `--workspace`. Use `--read-only` with
+`mount` for a read-only guest mount. `build` and `up` preserve `flake.lock` by
+default; pass `--write-lock` to allow an update.
+
+The domain policy is stored in TOML but is not enforced in v0.2. MITM proxy,
+allowlist enforcement, and proxy logs remain unimplemented.
+
 ## Development
 
-Nix users can run `nix develop` then `cargo run <subcommand> <options>`.\
-Otherwise, install dependencies (`cargo`, `libvirt`, `virtiofsd`, `mitmproxy`, `openssh`, `util-linux`).
+Run development commands through `nix develop`, for example
+`nix develop -c cargo run -- <subcommand> <options>`.
 Use `doctor` subcommand to verify host setup.
 
 ## License

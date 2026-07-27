@@ -94,7 +94,7 @@ mutableSystemProfile = false
 # "repo" = { source = ".", readonly = false }
 
 [allowedHosts]
-# Allowlist of connectable domains.
+# Domain policy reserved for the future proxy. v0.2 stores edits but does not enforce it.
 # "*" = {} # Disable host restrictions.
 "cache.nixos.org" = {} # No subdomain matching.
 "*.pool.ntp.org" = {}  # Match the domain and its subdomains.

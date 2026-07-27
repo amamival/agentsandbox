@@ -12,13 +12,13 @@ This repo boots a NixOS-based system sandbox on a local Linux host.
 
 It gives you a real booted NixOS userland with `systemd`, persistence, and SSH access.
 
-This is a good fit for packaging, service work, NixOS modules, and NixOS learning in general. You can iterate on a real [`configuration.nix`](configuration.nix), rebuild, and observe how services, users, SSH, packages, and persistent state behave together without sacrificing security and privacy.
+This is a good fit for packaging, service work, NixOS modules, and NixOS learning in general. You can iterate on a real [`configuration.nix`](template/configuration.nix), rebuild, and observe how services, users, SSH, packages, and persistent state behave together without sacrificing security and privacy.
 
 This is not yet a polished runtime. It remains an experimental launcher under heavy development.
 
 The target host platform is recent `amd64` Linux in general, not just NixOS. If this does not run on a reasonably current Linux machine, that should be treated as a bug rather than an unsupported edge case.
 
-The entrypoint is [`agentsandbox`](agentsandbox), which handles sysroot bootstrap, system build, libvirt startup, attach, and mounts.
+The `agentsandbox` command handles sysroot bootstrap, system builds, libvirt startup, attach, and mounts.
 
 ## Installation
 
@@ -50,6 +50,7 @@ Commands:
   pause           Pause running VMs for all hostnames in the current config
   unpause         Unpause VMs for all hostnames in the current config
   destroy         Kill and delete guest files selected by flags (none by default)
+  ls              List all VMs stored
   ps              List VM statuses for all hostnames in the current config
   ssh             Run a command as a user in a running VM, or attach if omitted
   exec            Run a command as root in a running VM, or attach if omitted
@@ -59,18 +60,20 @@ Commands:
   mount           Mount a file or directory into a running VM, or show mounts entries
   unmount         Unmount a file or directory from a running VM now and on future starts
   port            Prints the public port for a port binding
-  allow-domain    Add a firewall rule that allows outbound traffic to a domain
-  unallow-domain  Remove the rule for the domain
+  allow-domain    Add a domain to the hostname-specific TOML policy
+  unallow-domain  Remove a domain from the hostname-specific TOML policy
   proxy-logs      Follow MITM proxy logs
   verify          Verify and repair build
+  audit           Run CVE scan against the guest store
   help            Print this message or the help of the given subcommand(s)
 
 Options:
-  -g, --global                 Use only global config (`$XDG_CONFIG_HOME/agentsandbox`) and skip local upward search
-  -n, --hostname <HOSTNAME>    Select sandbox hostname (build target and instance identity input) [default: default]
-  -w, --workspace <WORKSPACE>  Resolve the active workspace and config as if running from this directory
-  -h, --help                   Print help
-  -V, --version                Print version
+  -g, --global                       Use only global config (`$XDG_CONFIG_HOME/agentsandbox`) and skip local upward search
+  -p, --project-name <PROJECT_NAME>  Select project name. Combined with hostname to form the instance name
+  -n, --hostname <HOSTNAME>          Select sandbox hostname (build target and instance identity input) [default: default]
+  -w, --workspace <WORKSPACE>        Resolve the active workspace and config as if running from this directory
+  -h, --help                         Print help
+  -V, --version                      Print version
 ```
 
 ## Quick Start
@@ -93,8 +96,8 @@ agentsandbox --global init
 
 ## Development
 
-Nix users can run `nix develop` then `cargo run <subcommand> <options>`.\
-Otherwise, install dependencies (`cargo`, `libvirt`, `virtiofsd`, `mitmproxy`, `openssh`, `util-linux`).
+Run development commands through `nix develop`, for example
+`nix develop -c cargo run -- <subcommand> <options>`.
 Use `doctor` subcommand to verify host setup.
 
 ## License
@@ -125,85 +128,66 @@ In our experiments, *gVisor* could not run *SystemD* as PID 1 because it lacks t
   the host `/nix`.
 - Host-side state lives only under `XDG_CONFIG_HOME`, `XDG_DATA_HOME`,
   `XDG_STATE_HOME`, and `XDG_RUNTIME_DIR`. `XDG_CACHE_HOME` is not used.
-- Instance identity is `machine-id` (32 hex chars): `machine-prefix` (24 hex,
-  persisted in `<active-config>/machine-prefix` on first resolve) + `hostname-hash`
-  (sha256 of hostname, first 8 hex). `machine-id` is the guest machine-id
-  source and the libvirt UUID source.
-- `instance-id` is the dir/domain-name form `<dirname>-<hostname>-<machine-id>`
-  (display prefix + match key). Lookup matches by `*-<machine-id>` so workspace
-  rename/move stays transparent; the libvirt domain name reuses `instance-id`.
-- Local scope (`<workspace>/.agentsandbox/machine-prefix`): worktree sharing vs.
-  isolation is controlled by git tracking of the prefix (tracked = shared,
-  untracked = each worktree regenerates on first use).
-- Global scope (`$XDG_CONFIG_HOME/agentsandbox/machine-prefix`): single instance
-  per hostname shared across all workspaces using the global config.
+- `instance-id` and libvirt domain name are `<project-name>[<hostname>]`.
+  `project-name` defaults to the workspace basename locally and `agentsandbox`
+  globally. The guest machine-id and libvirt UUID are derived from this ID.
 - No extra `current-system` link or host-state metadata JSON is kept.
 - Place `sysroot/` next to `persistent/`.
-- `allowed_hosts` and `mounts` are plain-text files and are always copied from
-  the template. An empty `allowed_hosts` file remains deny-by-default.
+- Launcher policy is read from `agentsandbox.toml` and optional
+  `agentsandbox.local.toml`. The local file and hostname sections override base
+  policy.
 - Generic HTTP filter DSL, `filter-default`, `block-domain`, HTTP ask mode,
   `proxy filter generate`, and CIDR cache are not part of the design.
 - `.git/config` is not inherited, so `.git/config` sanitization is also not part
   of the design.
-- `mutableSandboxConfig` is a bool and is used to protect `.agentsandbox` inside
-  the workspace.
 - The initial workspace mount appears in the guest as
-  `/persistent/workspace/<dirname>`. It is stored in the same dynamic `mounts`
-  file as directories added later with `mount`.
+  `/persistent/workspace/<dirname>`. It is stored in the TOML `mounts` table
+  with directories added later through `mount`.
 - Dynamic mounts are materialized under `/persistent/workspace` in a private
   host mount namespace and are exported through the single `/persistent`
   virtiofs share.
-- OpenSnitch is optional, and its endpoint is provided by the selected
-  `nixosConfiguration`. If the connection to the host is lost, treat it as a
-  security breach and let the watchdog destroy the VM.
-- Logs live under `logs/`. Active log files are uncompressed, and rotated
-  archives use zstd compression. Runtime sockets and pid files live under
-  `XDG_RUNTIME_DIR`.
-- Generate the libvirt domain XML as a path in the Nix store and start the
-  transient domain with `virsh create`.
+- Runtime sockets and pid files live under `XDG_RUNTIME_DIR`.
+- Generate libvirt domain XML in Rust and start the transient domain with
+  `virsh create`.
 - Apply the port-forward set when the domain is created. Reflect changes by
   recreating the transient domain.
 
 ## Configuration resolution
 
-- The local config search target is the first `.agentsandbox/flake.nix` found
+- The local config search target is the first `.agentsandbox/` directory or
+  directory containing `agentsandbox.toml` or `agentsandbox.local.toml` found
   while walking upward from the workspace.
-- If no local config is found, use `$XDG_CONFIG_HOME/agentsandbox/flake.nix`.
+- If no local config is found, use
+  `$XDG_CONFIG_HOME/agentsandbox/<project-name>`.
 - `agentsandbox init` creates `.agentsandbox/` in the current directory and
-  copies `{flake.nix,configuration.nix,allowed_hosts,mounts}` into it.
-- `agentsandbox init --global` copies
-  `{flake.nix,configuration.nix,allowed_hosts,mounts}` to
-  `$XDG_CONFIG_HOME/agentsandbox/`.
+  writes the Nix files, `agentsandbox.toml`, and runtime module files.
+- `agentsandbox init --global` writes the same files to
+  `$XDG_CONFIG_HOME/agentsandbox/<project-name>`.
 - The active config dir is treated as unique across the launcher and is used as
-  the edit target for `allowed_hosts` and `mounts`, the flake build target, and
-  the target for `mutableSandboxConfig` checks.
+  the TOML edit target and flake build target.
 
 ## Flake contract
 
 - The active config dir is either local `.agentsandbox` or
-  `$XDG_CONFIG_HOME/agentsandbox`.
+  `$XDG_CONFIG_HOME/agentsandbox/<project-name>`.
 - `nixosConfigurations.<hostname>` is the guest build contract.
 - The launcher uses
   `nixosConfigurations.<hostname>.config.system.build.toplevel` as the build
   output and boot source.
-- Runtime configuration values are read from the selected host under
-  `nixosConfigurations` and consumed directly by the launcher.
-- The launcher builds the dynamic mount set from the active config dir's
-  `mounts` file. It includes the initial workspace mount and any additional
-  mounts added through `mount`.
-- The OpenSnitch endpoint lives at
-  `services.opensnitch.settings.Server.Address` in the selected host config.
+- Runtime settings are merged from `agentsandbox.toml`,
+  `agentsandbox.local.toml`, and their selected `[hosts.<hostname>]` sections.
+- The launcher builds the dynamic mount set from the merged `mounts` table.
 
 ## Instance layout
 
 - Split host state per instance as follows.
 
 ```text
-$XDG_CONFIG_HOME/agentsandbox/
+$XDG_CONFIG_HOME/agentsandbox/<project-name>/
   flake.nix
   configuration.nix
-  allowed_hosts
-  mounts
+  agentsandbox.toml
+  agentsandbox.local.toml  # optional
 
 $XDG_DATA_HOME/agentsandbox/<instance-id>/
   sysroot/
@@ -224,7 +208,7 @@ $XDG_RUNTIME_DIR/agentsandbox/<instance-id>/
 - `sysroot/` contains an instance-specific Nix root and the source of guest boot
   artifacts.
 - `persistent/` is exported to the guest as `/persistent`.
-- `mounts` stores the dynamic mount set for the active config, including the
+- The merged TOML `mounts` table stores the dynamic mount set, including the
   initial workspace mount.
 - `logs/` stores the active log files and their rotated archives.
 - The runtime dir contains instance-scoped sockets, pid files, and helper state
@@ -235,7 +219,7 @@ $XDG_RUNTIME_DIR/agentsandbox/<instance-id>/
 ## Build flow
 
 - The launcher resolves active config dir (`.agentsandbox` upward search, else
-  `$XDG_CONFIG_HOME/agentsandbox`) and selected `hostname`.
+  `$XDG_CONFIG_HOME/agentsandbox/<project-name>`) and selected `hostname`.
 - The launcher resolves `instance-id` and instance paths under XDG roots.
 - The launcher creates instance directories:
   - data: `sysroot/`, `persistent/`
@@ -252,27 +236,26 @@ $XDG_RUNTIME_DIR/agentsandbox/<instance-id>/
 - VM startup path:
   1. start mount supervisor in mapped namespace
   2. apply dynamic mounts to exported `/persistent`
-  3. start `virtiofsd` on runtime socket
-  4. render domain XML by executing `<system-profile>/domain.xml.sh`
-  5. write XML to `<runtime-dir>/domain.xml`
-  6. `virsh create <runtime-dir>/domain.xml`
+  3. render domain XML in Rust from TOML and runtime paths
+  4. write XML and port-forward state under `<runtime-dir>`
+  5. `virsh create <runtime-dir>/domain.xml`
 - After boot path is available, run guest-side rebuild over SSH:
   `nixos-rebuild boot|switch --flake /persistent/etc/nixos#<hostname>`.
 - Guest-centered rebuild is the security boundary: flake evaluation/build for
   the operational system runs inside the guest path rather than host runtime.
-- If `domain.xml.sh` output differs from the runtime `domain-profile`, domain
-  changes are applied by destroy+recreate semantics.
+- If newly rendered domain XML differs from the runtime XML, domain changes are
+  applied by destroy+recreate semantics.
 - On `up` for a running VM, guest rebuild uses `nixos-rebuild switch`; on
   `build` (non-up), guest rebuild uses `nixos-rebuild boot`.
-- After guest rebuild on a running VM, the launcher compares
-  `domain-profile/domain.xml.sh` and `new-system-profile/domain.xml.sh`.
+- After guest rebuild on a running VM, the launcher renders and compares the
+  old and new domain XML.
   - If unchanged, the launcher keeps the current transient domain and runs
     `systemctl isolate multi-user.target` inside the guest.
   - If changed, the launcher applies restart semantics by recreating the
     transient domain.
 - Security design intent: this split minimizes unnecessary domain recreation
   (smaller control-plane disruption) while ensuring virtualization-boundary
-  changes from `domain.xml.sh` are never partially applied.
+  changes are never partially applied.
 - Threat model intent: guest-side flake execution is assumed potentially
   adversarial; host-side behavior therefore limits itself to deterministic,
   narrow actions (profile comparison, domain recreate-or-continue decision)
@@ -280,35 +263,19 @@ $XDG_RUNTIME_DIR/agentsandbox/<instance-id>/
 
 ## Runtime contracts (implementation-level)
 
-- Domain profile contract:
-  - Runtime symlink: `<runtime-dir>/domain-profile -> <system-profile>`
-  - SSH/port resolution and other runtime reads must use this profile.
-- Domain XML input contract (`domain.xml.sh` environment):
-  - `NIX_DIR`: `<sysroot>/nix`
-  - `UID_MAP`, `GID_MAP`: host-compatible idmap strings
-  - `INSTANCE_ID`: resolved instance id
-  - `DOMAIN_UUID`: UUID derived from `machine-id`
-  - `MACHINE_ID`: 32-hex machine id
-  - `AGENTSANDBOX_BUILD`: `"1"` on build path, empty otherwise
-  - `PERSISTENT_SOCKET_XML`: escaped virtiofs socket path fragment
 - SSH port resolution contract:
-  - Read `<domain-profile>/port-forwards`
-  - Parse rows: `<name>\t<proto>\t<host-start>\t<host-end>\t<guest>`
+  - Read runtime JSON from `<runtime-dir>/port-forwards`.
   - Select `proto=tcp` row covering guest port 22 and compute host port by
     range offset.
-- Mounts file contract:
-  - File: `<active-config>/mounts`
-  - Row format: `<host-path>\t<guest-name>`
+- Mount contract:
+  - Read the effective TOML `mounts` table.
   - Relative host paths are resolved from `workspace`.
-  - `mount`/`unmount` edits this file; runtime reload is signaled by `HUP` to
-    supervisor pid.
-- Mutable sandbox config contract:
-  - `mutableSandboxConfig` is represented by marker file
-    `<system-profile>/mutable-sandbox-config`.
-  - If marker is absent, config mount is remounted read-only.
+  - `mount`/`unmount` edits `agentsandbox.local.toml`; runtime reload is
+    signaled by `HUP` to the supervisor pid.
 - Policy file protection:
-  - `allowed_hosts` and `mounts` inside guest-visible config path are always
-    bind-mounted and remounted read-only.
+  - Every recursively discovered `agentsandbox.toml` and
+    `agentsandbox.local.toml` in guest-visible workspace/config trees is
+    mounted read-only. Hard-linked policy files are rejected.
 - Audit command contract (`agentsandbox audit`):
   - Resolve active flake dir and instance with the same path as other instance-scoped commands.
   - Execute host `vulnix` directly (no guest-side wrapper execution).
@@ -332,7 +299,7 @@ $XDG_RUNTIME_DIR/agentsandbox/<instance-id>/
 - Additional mount entries managed by `mount` and `unmount` appear at
   `/persistent/workspace/<guest-name>`.
 - The guest `machine-id` is set via `systemd.machine_id=` on the kernel command
-  line, using the instance `machine-id` value (no host-side file).
+  line from a hash of the instance ID.
 - The guest home-manager profile keeps shell and tool integration inside the
   guest, as in `v1_bwrap`.
 - The guest persistent home uses `/persistent/home/vscode`.
@@ -343,53 +310,40 @@ $XDG_RUNTIME_DIR/agentsandbox/<instance-id>/
 
 - The startup workspace root is the directory containing `.agentsandbox` when
   local config exists, and the startup `cwd` for project-less execution.
-- The active config dir contains a plain-text `mounts` file next to
-  `allowed_hosts`.
-- Each line of `mounts` represents one entry as `<host-path><TAB><guest-name>`.
-- The launcher ensures that `mounts` contains an entry for the startup
-  workspace root, and the guest-visible name of that entry is the basename of
-  the startup workspace root.
-- `mount` adds entries to `mounts`, and `unmount` removes them.
+- The effective TOML `mounts` table maps guest-relative names to host sources
+  and a `readonly` flag.
+- `init` adds the startup workspace mount under its basename.
+- `mount` and `unmount` persist hostname-specific overrides in
+  `agentsandbox.local.toml`.
 - The launcher starts a helper in a private host mount namespace and builds a
   synthetic tree under the exported `persistent/workspace` root.
-- For instances with `mutableSandboxConfig = false`, the startup workspace
-  entry is materialized with `.agentsandbox` read-only inside that synthetic
-  tree.
-- For instances with `mutableSandboxConfig = true`, the startup workspace entry
-  is materialized without that protection.
+- TOML policy files in the startup workspace are over-mounted read-only.
 - Additional mount entries are materialized as bind mounts under
   `persistent/workspace/<guest-name>` in the same namespace.
 - The single `virtiofsd` instance for `/persistent` exports that synthetic tree
   to the guest.
-- `mount` and `unmount` update both the `mounts` file and the helper namespace
-  state for the running instance.
+- `mount` and `unmount` update TOML and reload the helper namespace for a
+  running instance.
 - The active config dir for the build is always reachable from the launcher.
 
 ## Network and proxy
 
 - VM networking uses libvirt user networking with `passt`.
-- `portForwards` is represented as an array of `{ proto, host, guest }` for
-  host-to-guest publication only.
+- `portForwards` is a TOML table of named host-to-guest publications.
 - Apply all `portForwards` from the selected host config when the domain is
   created.
 - `port` prints the public host endpoint for a guest port binding.
 - `port` accepts an optional `guest_port` argument to resolve guest-to-host
   port mapping.
 - `port` accepts an optional `--protocol <tcp|udp>` filter.
-- If `--protocol` is omitted, `port` tries `tcp` first and then `udp`.
-- If `guest_port` is omitted, `port` returns all published bindings, one per
-  line, as `<ipv4addr>:<port>/<proto>`.
+- If `guest_port` is omitted, `port` returns all published bindings as
+  `<name><TAB><proto><TAB><address>:<port><TAB><device>`.
 - The `ssh` subcommand uses the `tcp` forward where `guest_port = 22`.
-- Gateway restriction is enforced with a guest-side firewall, and host-gateway
-  paths are concentrated on the proxy port and the OpenSnitch forward port.
-- `allowed_hosts` uses the plain-text file in the active config dir.
-- `allow-domain` appends normalized host/glob entries after deduplication.
-- `unallow-domain` removes exact-match lines.
-- Allowlist decisions use normalized hosts as keys.
-- Even if vendor-specific live expansion is added in the future, the allowlist
-  file itself remains plain-text host/glob.
+- `allowedHosts` is stored in TOML. `allow-domain` and `unallow-domain` edit
+  hostname-specific local overrides.
+- v0.2 does not enforce `allowedHosts` on network traffic.
 
-## Proxy pipeline
+## Future proxy pipeline (not implemented in v0.2)
 
 - The proxy runs on the host side and receives the VM's HTTP/S egress.
 - The request pipeline flows in the following order.
@@ -408,7 +362,7 @@ $XDG_RUNTIME_DIR/agentsandbox/<instance-id>/
 - Optional remote receivers are `syslog`, `syslog-remote`, `otlp-http`, and
   `otlp-grpc`.
 
-## OpenSnitch
+## Future OpenSnitch integration (not implemented in v0.2)
 
 - OpenSnitch exists as an optional feature.
 - The selected `nixosConfiguration` contains
@@ -422,7 +376,7 @@ $XDG_RUNTIME_DIR/agentsandbox/<instance-id>/
 - For instances that use OpenSnitch, the baseline is `DefaultAction = "deny"`
   and `InterceptUnknown = true`.
 
-## Logging
+## Future proxy logging (not implemented in v0.2)
 
 - State logs are collected under `logs/`.
 - The active request log file is `logs/requests.jsonl`.
@@ -458,8 +412,8 @@ $XDG_RUNTIME_DIR/agentsandbox/<instance-id>/
 - `kill`
   - `virsh destroy`.
 - `pause` / `unpause`
-  - Apply `virsh suspend` / `virsh resume` to all instance ids sharing current
-    machine-prefix scope.
+  - Apply `virsh suspend` / `virsh resume` to all stored instances for the
+    selected project.
 - `destroy` (alias: `destory`)
   - Always attempts `virsh destroy` first.
   - `--system`: remove `sysroot/` (mapped namespace path)

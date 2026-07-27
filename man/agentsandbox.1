@@ -1,4 +1,4 @@
-.TH AGENTSANDBOX 1 "2026-04-29" "agentsandbox" "User Commands"
+.TH AGENTSANDBOX 1 "2026-07-26" "agentsandbox" "User Commands"
 .SH NAME
 agentsandbox \- manage a local NixOS VM sandbox
 .SH SYNOPSIS
@@ -18,7 +18,7 @@ Host OS
 Linux.
 .TP
 Required host commands
-\fBvirsh\fR, \fBssh\fR, \fBvirtiofsd\fR, \fBunshare\fR.
+\fBvirsh\fR, \fBssh\fR, \fBvirtiofsd\fR, \fBpasst\fR, \fBunshare\fR.
 .TP
 Additional for \fBverify\fR
 Host \fBnix-store\fR.
@@ -26,8 +26,13 @@ Host \fBnix-store\fR.
 .TP
 .B -g, --global
 Resolve and operate on the global config
-(\fB$XDG_CONFIG_HOME/agentsandbox\fR) only.
-Skips local upward search for \fB.agentsandbox/flake.nix\fR.
+(\fB$XDG_CONFIG_HOME/agentsandbox/<project-name>\fR) only.
+Skips local upward search.
+.TP
+.BI "-p, --project-name " PROJECT
+Select the project name. The instance name is \fIPROJECT[HOSTNAME]\fR.
+Defaults to the workspace basename for local use and \fBagentsandbox\fR with
+\fB--global\fR.
 .TP
 .BI "-n, --hostname " HOSTNAME
 Select sandbox hostname.
@@ -41,8 +46,9 @@ Resolve local config as if invoked from \fIPATH\fR.
 Default: current directory.
 .SH CONFIG RESOLUTION
 Without \fB--global\fR, the tool searches upward from \fB--workspace\fR for
-\fB.agentsandbox/flake.nix\fR. If not found, it falls back to global config.
-With \fB--global\fR, only global config is used.
+\fB.agentsandbox/\fR or a directory containing \fBagentsandbox.toml\fR or
+\fBagentsandbox.local.toml\fR. If not found, it falls back to the selected
+global project. With \fB--global\fR, only that global project is used.
 .SH COMMANDS
 .SS version
 Print program version.
@@ -70,6 +76,10 @@ Build guest system profile. If guest is down, starts VM temporarily, runs
 .TP
 .B -b, --bootstrap
 Reinstall initial template-based profile before build.
+.TP
+.B --write-lock
+Allow the build to update \fBflake.lock\fR. A missing lock file is writable
+for its initial creation.
 .RE
 .SS up
 Build and start VM. If already running, runs rebuild in-place; if domain XML
@@ -80,6 +90,9 @@ changed, VM restart is required (command reports this).
 .TP
 .B -d, --detach
 Do not attach to guest after rebuild/start.
+.TP
+.B --write-lock
+Allow the build to update \fBflake.lock\fR.
 .RE
 .SS down
 Request graceful shutdown, then wait for stop state.
@@ -123,6 +136,10 @@ Resume paused VMs for all hostnames in the resolved config.
 List VM states for all hostnames in the resolved config.
 .TP
 .B agentsandbox ps
+.SS ls
+List all instance directories stored under the data root.
+.TP
+.B agentsandbox ls
 .SS ssh
 Run command as guest user \fBvscode\fR, or attach shell if no args.
 .TP
@@ -155,15 +172,33 @@ Default states: \fBdown\fR, \fBshut off\fR, \fBcrashed\fR.
 State matching uses raw \fBvirsh domstate\fR text (plus synthetic
 \fBdown\fR when domain is absent).
 .SS mount
-Add/update mount entry, or print \fBmounts\fR file if no args.
+Add a mount to hostname-specific \fBagentsandbox.local.toml\fR, or print the
+effective mount set if no path is given.
 .TP
 .BI "agentsandbox mount " [path] [name]
 .br
 \fIpath\fR may be file or directory.
+.br
+Use \fB--read-only\fR to expose it read-only in the guest.
 .SS unmount
 Remove mount entry for \fIpath\fR.
 .TP
 .BI "agentsandbox unmount " path
+.SS port
+Print all active port forwards, or resolve a guest port to its host endpoint.
+.TP
+.BI "agentsandbox port " [guest-port]
+.br
+Use \fB--protocol tcp|udp\fR to restrict lookup.
+.SS allow-domain
+Add a normalized domain key to the selected hostname section in
+\fBagentsandbox.local.toml\fR.
+.TP
+.BI "agentsandbox allow-domain " domain
+.SS unallow-domain
+Remove or disable a normalized domain key in the selected hostname section.
+.TP
+.BI "agentsandbox unallow-domain " domain
 .SS verify
 Run store/system repair checks.
 .TP
@@ -174,32 +209,26 @@ store root.
 .br
 2) If guest is running, runs guest
 \fBnixos-rebuild build --repair --flake /persistent/etc/nixos#<hostname>\fR.
+.SS audit
+Run the patched host \fBvulnix\fR against the instance sysroot. Arguments after
+\fB--\fR are passed to vulnix.
+.TP
+.BI "agentsandbox audit -- " [vulnix-options]
 .SH KNOWN LIMITATIONS
 .TP
-Undispatched commands in CLI
-\fBport\fR, \fBallow-domain\fR, \fBunallow-domain\fR, \fBproxy-logs\fR.
+Domain policy
+\fBallow-domain\fR and \fBunallow-domain\fR persist TOML policy only. Network
+allowlist enforcement, MITM proxying, and proxy logs are not implemented in v0.2.
 .TP
 SSH attach prerequisites
 \fBssh\fR/\fBexec\fR require guest \fBtcp/22\fR to be covered by resolved
 \fBport-forwards\fR data.
-.TP
-Host nix dependency
-When \fBflake.lock\fR is missing, \fBbuild\fR/\fBup\fR call host \fBnix flake lock\fR.
 .TP
 Verify running-state requirement
 \fBverify\fR fails after store verification if guest is not running.
 .SH NOT IMPLEMENTED
 These commands are visible in CLI help but currently fall through to a generic
 placeholder path:
-.TP
-.B port
-Port mapping query.
-.TP
-.B allow-domain
-Outbound domain allow rule add.
-.TP
-.B unallow-domain
-Outbound domain allow rule remove.
 .TP
 .B proxy-logs
 MITM proxy log follow.
@@ -216,17 +245,14 @@ Base paths for config/data/state/runtime roots.
 \fI<workspace>/.agentsandbox/\fR
 Local config directory created by \fBinit\fR.
 .TP
-\fI$XDG_CONFIG_HOME/agentsandbox/\fR
-Global config directory.
+\fI$XDG_CONFIG_HOME/agentsandbox/<project-name>/\fR
+Global project config directory.
 .TP
-\fI<config>/mounts\fR
-Mount entry source of truth.
+\fI<config>/agentsandbox.toml\fR
+Base launcher configuration.
 .TP
-\fI<config>/allowed_hosts\fR
-Outbound policy input file.
-.TP
-\fI<config>/machine-prefix\fR
-Instance identity prefix seed.
+\fI<config>/agentsandbox.local.toml\fR
+Optional local and CLI-written overrides.
 .SH EXIT STATUS
 .TP
 0

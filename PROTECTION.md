@@ -17,7 +17,8 @@ The current implementation mixes several mutation paths:
 - The guest can run `nixos-rebuild`, `switch-to-configuration`, or a toplevel `activate` script.
 - The active configuration is mounted at runtime.
 - Libvirt domain XML is generated from the NixOS system profile.
-- Runtime source mounts are configured through the `mounts` file.
+- Runtime source mounts are configured through `agentsandbox.toml` and optional
+  `agentsandbox.local.toml` overrides.
 
 The product needs a clear model for which side may mutate each state source, which mutations are only
 temporary inside the guest, and which mutations may be reflected back into host-controlled policy.
@@ -125,16 +126,16 @@ profiles are writable; that remains controlled by `agentsandbox.mutableSystemPro
 
 ### Mount Entry Mode
 
-Runtime mounts should carry their own mutability. The `mounts` file should support an explicit mode:
+Runtime mounts carry their own mutability in TOML:
 
-```text
-# <host-path><TAB><guest-path><TAB><mode>
-.               project              rw
-.agentsandbox   project/.agentsandbox ro
+```toml
+[mounts]
+project = { source = ".", readonly = false }
+source = { source = "src", readonly = true }
 ```
 
-Omitted mode should mean `rw` for compatibility with existing mounts. Read-only and read-write are mount
-entry attributes, not global source policy.
+Omitted `readonly` means `false`. Read-only and read-write are mount entry
+attributes, not global source policy.
 
 ## Build Source Model
 
@@ -149,7 +150,8 @@ For a local `.agentsandbox/flake.nix` that is not tracked by git, git is not req
 workspace-based and should preserve current behavior closely enough that relative paths from the flake keep
 working.
 
-For global config, the build source is `$XDG_CONFIG_HOME/agentsandbox`.
+For global config, the build source is
+`$XDG_CONFIG_HOME/agentsandbox/<project-name>`.
 
 The build source is mounted read-only for normal builds. This source mount is an internal build/up mount,
 separate from user-visible runtime mounts.
@@ -219,14 +221,10 @@ allowing a new system activation only in modes where profile mutation was intent
 Runtime source exposure is controlled by dynamic mounts. A workspace can be mounted read-write for normal
 coding while `.agentsandbox` is over-mounted read-only:
 
-```bash
-agentsandbox init
-agentsandbox mount . "$(basename "$PWD")" --rw
-agentsandbox mount .agentsandbox "$(basename "$PWD")/.agentsandbox" --ro
-```
-
-If initialization already creates the workspace mount, documentation should show only the read-only overlay
-command for `.agentsandbox`.
+`agentsandbox init` creates the workspace mount. Additional mounts use
+`agentsandbox mount [--read-only] <path> [name]`. The launcher recursively
+over-mounts `agentsandbox.toml` and `agentsandbox.local.toml` read-only in the
+guest-visible workspace and config trees.
 
 ## Expected CLI Behavior
 

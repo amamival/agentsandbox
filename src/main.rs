@@ -363,7 +363,8 @@ fn main() {
             Some(Command::UnallowDomain { domain }) => run_unallow_domain(&env, &domain).context("unallow-domain"),
             Some(Command::Verify) => run_verify(&env).context("verify"),
             Some(Command::Audit { args }) => run_audit(&env, &args).context("audit"),
-            None | Some(_) => {
+            None => run_build_or_up(&env, false, true, true, false).context("up"),
+            Some(_) => {
                 println!("Comming soon(tm)...");
                 Ok(())
             }

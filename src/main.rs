@@ -591,7 +591,7 @@ pub fn parse_config(config_toml: &str, local_toml: Option<&str>, host: &str, _wa
                 .collect()
         };
         for name in names([Some(config.as_item()), config_host]).difference(&names([Some(local.as_item()), local_host])) {
-            eprintln!("warning: {CONFIG_TOML} allows allowedHosts.{name:?}; use {CONFIG_LOCAL_TOML} enable = false to disable");
+            eprintln!("warning: {CONFIG_TOML} allows allowedHosts.{name:?}; set it to false in {CONFIG_LOCAL_TOML} to disable");
         }
     }*/
 

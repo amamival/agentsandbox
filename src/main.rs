@@ -1387,7 +1387,9 @@ fn apply_mounts(env: &Env, instance: &Instance, _system_profile: &Path) -> anyho
         } else {
             env.workspace.join(&mount_config.source)
         };
-        let source_abs = source_abs.canonicalize().context("canonicalize mount source")?;
+        let source_abs = source_abs
+            .canonicalize()
+            .with_context(|| format!("canonicalize mount source {}", source_abs.display()))?;
         if !source_abs.is_dir() && !source_abs.is_file() {
             bail!("mount source is neither file nor directory: {}", source_abs.display());
         }

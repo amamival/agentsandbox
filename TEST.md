@@ -151,10 +151,15 @@ Domain 'test[default]' destroyed
 
 12. Validate allowlist entries
   - Run `agentsandbox allow-domain Example.COM`.
-  - Verify that `.agentsandbox/agentsandbox.local.toml` contains the normalized `example.com` key.
+  - Run `agentsandbox allow-domain '*.Example.COM'`.
+  - Run `agentsandbox allow-domain '*'`.
+  - Verify that `.agentsandbox/agentsandbox.local.toml` contains the normalized
+    `example.com`, `*.example.com`, and `*` keys.
   - Verify that `agentsandbox allow-domain https://example.com/path` fails as invalid input.
   - Run `agentsandbox unallow-domain example.com`.
-  - Verify that the effective TOML policy no longer enables `example.com`.
+  - Run `agentsandbox unallow-domain '*.example.com'`.
+  - Run `agentsandbox unallow-domain '*'`.
+  - Verify that the effective TOML policy no longer enables these entries.
   - This validates persistence only; v0.2 does not enforce the domain policy on network traffic.
 
 13. Validate proxy log handling

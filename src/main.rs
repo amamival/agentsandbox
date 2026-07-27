@@ -1797,6 +1797,9 @@ fn parse_allowed_host_cli_argument(domain: &str) -> anyhow::Result<String> {
     }
 
     let domain = domain.to_ascii_lowercase();
+    if domain == "*" {
+        return Ok(domain);
+    }
     let host_without_wildcard = match domain.strip_prefix("*.") {
         Some(host_without_wildcard) => host_without_wildcard,
         None => {

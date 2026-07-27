@@ -220,6 +220,15 @@
           "systemd.journald.forward_to_console=1" # Show progress while running tests.
           "console=ttyS0,115200n8" # Used on `virsh console`.
         ];
+        system.activationScripts.agentsandboxActivationGuard = ''
+          if [ "$(readlink -f "$systemConfig")" != "$(readlink -f /nix/var/nix/profiles/system)" ]; then
+            guard="$(mktemp /nix/var/nix/profiles/.agentsandbox-activation-guard.XXXXXX)" || {
+              echo "agentsandbox: refusing activation while system profiles are read-only" >&2
+              exit 1
+            }
+            rm -f "$guard"
+          fi
+        '';
         services.getty.autologinUser = "root";
         systemd.targets.agentsandbox-build = {
           description = "AgentSandbox build environment";

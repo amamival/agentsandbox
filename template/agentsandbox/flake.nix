@@ -15,171 +15,13 @@
 
     nixosModules.default = { config, lib, pkgs, ... }: {
       imports = [
-        "${nixpkgs.outPath}/nixos/modules/virtualisation/qemu-vm.nix"
+        "${nixpkgs.outPath}/nixos/modules/profiles/qemu-guest.nix"
         impermanence.nixosModules.impermanence
       ];
 
-      options.agentsandbox = {
-        mutableSandboxConfig = lib.mkOption { type = lib.types.bool; default = false; };
-        portForwards = lib.mkOption {
-          type = lib.types.attrsOf (lib.types.submodule {
-            options = {
-              proto = lib.mkOption { type = lib.types.enum [ "tcp" "udp" ]; };
-              address = lib.mkOption {
-                type = lib.types.addCheck lib.types.str (x: builtins.match "[.0-9:A-Fa-f]+" x != null);
-                default = "0.0.0.0";
-                description = "Host bind address for the forwarded port.";
-              };
-              dev = lib.mkOption {
-                type = lib.types.nullOr (lib.types.addCheck lib.types.str (x: builtins.match "[-a-zA-Z0-9_.]+" x != null));
-                default = null;
-                description = "Optional host device name for binding restriction.";
-              };
-              host = lib.mkOption {
-                type = lib.types.addCheck
-                  (lib.types.coercedTo lib.types.int
-                    (n: { start = n; end = n; })
-                    (lib.types.submodule ({ config, ... }: {
-                      options = {
-                        start = lib.mkOption { type = lib.types.int; description = "Host-side port or range start."; };
-                        end = lib.mkOption { type = lib.types.int; description = "Host-side range end (inclusive)."; };
-                      };
-                      config.end = lib.mkDefault config.start;
-                    })))
-                  (h: h.start <= h.end);
-                description = "Published host port(s). Int or { start, end } inclusive range.";
-              };
-              guest = lib.mkOption {
-                type = lib.types.int;
-                description = "Guest port matching host start (libvirt range to; parallel offset for ranges).";
-              };
-            };
-          });
-          default = { ssh = { proto = "tcp"; address = "127.0.0.1"; dev = "lo"; host = 2223; guest = 22; }; };
-        };
-      };
-
       config = {
-        # Boot.QEMUDirectKernelBoot
-        virtualisation.directBoot.enable = true;
-        virtualisation.diskImage = null;
-        #virtualisation.fileSystems = lib.mkForce { };
-        #virtualisation.fileSystems = lib.mkForce config.fileSystems;
-        virtualisation.sharedDirectories = lib.mkForce { };
-        virtualisation.mountHostNixStore = false;
-        virtualisation.useDefaultFilesystems = false;
-        virtualisation.useNixStoreImage = false;
-        virtualisation.useBootLoader = false;
         boot.loader.external = { enable = true; installHook = "${pkgs.coreutils}/bin/true"; };
-        system.systemBuilderCommands =
-          let
-            kernelParams = lib.escapeXML (lib.concatStringsSep " " config.boot.kernelParams);
-            portForwardsFile = pkgs.writeText "port-forwards" (builtins.toJSON (
-              lib.mapAttrs
-                (_: f: f // {
-                  host_start = f.host.start;
-                  host_end = f.host.end;
-                })
-                config.agentsandbox.portForwards
-            ));
-            portForwardsXml = lib.concatMapStrings
-              (f: ''
-                <portForward proto='${f.proto}' address='${f.address}'${
-                  lib.optionalString (f.dev != null) " dev='${f.dev}'"
-                }>
-                <range start='${toString f.host.start}'${
-                  lib.optionalString (f.host.start != f.host.end) " end='${toString f.host.end}'"
-                } to='${toString f.guest}'/>
-                </portForward>
-              '')
-              (lib.attrValues config.agentsandbox.portForwards);
-            libvirtDomainXmlGen = pkgs.writeShellScript "domain.xml.sh" ''
-              TOPLEVEL="$(cd -- "$(dirname -- "$0")" && pwd -P)"
-              SYSROOT="''${NIX_DIR%/nix}"
-              KERNEL="$SYSROOT$(readlink "$TOPLEVEL/kernel")"
-              INITRD="$SYSROOT$(readlink "$TOPLEVEL/initrd")"
-              UID_IDMAP_XML="$(
-                  while read -r START TARGET COUNT; do
-                    echo "                    <uid start='$START' target='$TARGET' count='$COUNT'/>"
-                  done <<<"$UID_MAP"
-                )"
-              GID_IDMAP_XML="$(
-                  while read -r START TARGET COUNT; do
-                    echo "                    <gid start='$START' target='$TARGET' count='$COUNT'/>"
-                  done <<<"$GID_MAP"
-                )"
-              BUILD_UNIT=''${AGENTSANDBOX_BUILD:+systemd.unit=agentsandbox-build.target}
-              cat <<EOF
-              <domain type='kvm'>
-                <name>$INSTANCE_ID</name>
-                <uuid>$DOMAIN_UUID</uuid>
-                <memory unit='MiB'>${toString config.virtualisation.memorySize}</memory>
-                <currentMemory unit='MiB'>${toString config.virtualisation.memorySize}</currentMemory>
-                <vcpu placement='static'>${toString config.virtualisation.cores}</vcpu>
-                <os>
-                  <type arch='x86_64' machine='q35'>hvm</type>
-                  <kernel>$KERNEL</kernel>
-                  <initrd>$INITRD</initrd>
-                  <cmdline>${kernelParams} init=/nix/var/nix/profiles/system/init systemd.machine_id=$MACHINE_ID $BUILD_UNIT</cmdline>
-                </os>
-                <cpu mode='host-passthrough' migratable='off'/>
-                <memoryBacking>
-                  <source type='memfd'/>
-                  <access mode='shared'/>
-                </memoryBacking>
-                <features>
-                  <acpi/>
-                  <apic/>
-                </features>
-                <devices>
-                  <filesystem type='mount'>
-                    <driver type='virtiofs' queue='1024'/>
-                    <binary path='${pkgs.virtiofsd}/bin/virtiofsd' xattr='on'>
-                      <!-- Omit <cache>; libvirt only accepts none/always, and virtiofsd default is auto. -->
-                      <sandbox mode='namespace'/>
-                      <!-- Rust virtiofsd 1.13.x does not advertise lock support to libvirt:
-                            https://virtio-fs.gitlab.io/virtiofsd/doc/virtiofsd/fuse/struct.FsOptions.html -->
-                      <thread_pool size='0'/>
-                    </binary>
-                    <source dir='$NIX_DIR'/>
-                    <target dir='nix'/>
-                    <idmap>
-              $UID_IDMAP_XML
-              $GID_IDMAP_XML
-                    </idmap>
-                  </filesystem>
-                  <filesystem type='mount'>
-                    <driver type='virtiofs' queue='1024'/>
-                    <source socket='$PERSISTENT_SOCKET_XML'/>
-                    <target dir='persistent'/>
-                  </filesystem>
-                  <serial type='pty'>
-                    <target port='0'/>
-                  </serial>
-                  <console type='pty'>
-                    <target type='serial' port='0'/>
-                  </console>
-                  <rng model='virtio'>
-                    <backend model='random'>/dev/urandom</backend>
-                  </rng>
-                  <interface type='user'>
-                    <backend type='passt'/>
-                    <model type='virtio'/>
-              ${portForwardsXml}
-                  </interface>
-                </devices>
-              </domain>
-              EOF
-            '';
-          in
-          lib.mkAfter ''
-            cp ${libvirtDomainXmlGen} "$out/domain.xml.sh"
-            cp ${portForwardsFile} "$out/port-forwards"
-            ${lib.optionalString config.agentsandbox.mutableSandboxConfig ''
-              touch "$out/mutable-sandbox-config"
-            ''}
-          '';
-        # Keep initrd module set minimal; root and early mounts only need virtiofs.
+        # qemu-guest supplies the transport modules; load virtiofs for early mounts.
         boot.initrd.kernelModules = [ "virtiofs" ];
 
         # Boot.AgentSandbox
@@ -188,9 +30,9 @@
           message = "agentsandbox requires Linux 6.19+ for fuse.inval_wq.";
         }];
         boot.kernelPackages = pkgs.linuxPackages_latest;
-        virtualisation.fileSystems."/" = { device = "none"; fsType = "tmpfs"; options = [ "mode=755" "nosuid" "nodev" "noexec" ]; };
-        virtualisation.fileSystems."/nix" = { device = "nix"; fsType = "virtiofs"; options = [ "nosuid" "nodev" ]; };
-        virtualisation.fileSystems."/home" = { device = "none"; fsType = "tmpfs"; options = [ "mode=755" "nosuid" "nodev" ]; neededForBoot = true; };
+        fileSystems."/" = { device = "none"; fsType = "tmpfs"; options = [ "mode=755" "nosuid" "nodev" "noexec" ]; };
+        fileSystems."/nix" = { device = "nix"; fsType = "virtiofs"; options = [ "nosuid" "nodev" ]; };
+        fileSystems."/home" = { device = "none"; fsType = "tmpfs"; options = [ "mode=755" "nosuid" "nodev" ]; neededForBoot = true; };
         systemd.mounts = [{
           what = "tmpfs";
           where = "/nix/var/nix/builds";
@@ -254,20 +96,23 @@
         users.allowNoPasswordLogin = true;
 
         # Impermanence
-        virtualisation.fileSystems."/persistent" = {
+        fileSystems."/persistent" = {
           neededForBoot = true;
           device = "persistent";
           fsType = "virtiofs";
           options = [ "nosuid" "nodev" ];
         };
-        virtualisation.fileSystems."/workspace" = {
+        fileSystems."/workspace" = {
           device = "/persistent/workspace";
           fsType = "none";
           options = [ "bind" "nosuid" "nodev" ];
           depends = [ "/persistent" ];
         };
         environment.persistence."/persistent" = {
-          directories = [ "/var/lib/nixos" ]; # Stable user/group id.
+          directories = [
+            "/var/lib/nixos" # Stable user/group id.
+            "/var/lib/systemd" # systemd-creds host key.
+          ];
           files = [
             # "/etc/machine-id" # kernel command line takes precedence.
             "/etc/ssh/ssh_host_ed25519_key"

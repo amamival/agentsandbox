@@ -38,10 +38,6 @@ const CONFIG_TOML: &str = concat!(env!("CARGO_PKG_NAME"), ".toml");
 const CONFIG_LOCAL_TOML: &str = concat!(env!("CARGO_PKG_NAME"), ".local.toml");
 const DEFAULT_DOMAIN_XML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/template/domain.xml"));
 
-fn read_optional(path: &Path) -> std::io::Result<String> {
-    fs::read_to_string(path).or_else(|err| (err.kind() == std::io::ErrorKind::NotFound).then(String::new).ok_or(err))
-}
-
 #[derive(Parser)]
 #[command(
     name = APP_NAME,
@@ -557,9 +553,10 @@ fn read_port_forwards_lookup(instance: &Instance, guest_port: Option<u16>, proto
                 if protocol.is_some_and(|proto| f.proto != proto) {
                     continue;
                 }
-                let count = f.host_end.unwrap_or(f.host) - f.host + 1;
-                if f.guest <= guest_port && guest_port < f.guest + count {
-                    return Ok((BTreeMap::new(), Some((f.address.to_string(), f.host + (guest_port - f.guest)))));
+                if let Some(host_port) = guest_port.checked_sub(f.guest).and_then(|offset| f.host.checked_add(offset))
+                    && host_port <= f.host_end.unwrap_or(f.host)
+                {
+                    return Ok((BTreeMap::new(), Some((f.address.to_string(), host_port))));
                 }
             }
             Ok((BTreeMap::new(), None))
@@ -644,6 +641,10 @@ pub fn resolve_host_ca_bundle() -> Option<PathBuf> {
         )
         .find(|path| Path::new(path).is_file())
         .map(PathBuf::from)
+}
+
+fn read_optional(path: &Path) -> std::io::Result<String> {
+    fs::read_to_string(path).or_else(|err| (err.kind() == std::io::ErrorKind::NotFound).then(String::new).ok_or(err))
 }
 
 fn render_domain_xml(env: &Env, instance: &Instance, system_profile: &Path, is_build: bool) -> anyhow::Result<(String, BTreeMap<String, PortForward>)> {
@@ -1362,7 +1363,7 @@ fn apply_mounts(env: &Env, instance: &Instance, _system_profile: &Path) -> anyho
     let config_dir = instance.persistent.join("etc/nixos");
     let mut mounted = Vec::new();
 
-    // Collect all mounted directories under /persistent/workspace.
+    // Detach every old mount below the guest-visible workspace and config roots before replacing the configured mounts.
     let output = (process::Command::new("findmnt").args(["-Rlno", "target"]).output()).context("run findmnt -Rlno target")?;
     if !output.status.success() {
         bail!("findmnt: {}", String::from_utf8_lossy(&output.stderr).trim());
@@ -1453,6 +1454,7 @@ fn apply_mounts(env: &Env, instance: &Instance, _system_profile: &Path) -> anyho
             mount(&source_abs, &target, "", MountFlags::BIND, c"").context("bind-mount file")?;
         }
     }
+    // Scan only the guest-visible workspace and config trees so config files exposed through another mount path are also protected.
     let mut dirs = vec![workspace_dir, config_dir];
     while let Some(dir) = dirs.pop() {
         for entry in fs::read_dir(&dir).with_context(|| format!("scan {}", dir.display()))? {
@@ -1482,6 +1484,7 @@ fn mount_readonly(source: &Path, target: &Path, recursive: bool) -> anyhow::Resu
         userns_fd: 0,
     };
     let flags = libc::AT_EMPTY_PATH | if recursive { libc::AT_RECURSIVE } else { 0 };
+    // rustix wraps open_tree and move_mount, but not mount_setattr; only this operation uses libc directly.
     let result = unsafe { libc::syscall(libc::SYS_mount_setattr, tree.as_raw_fd(), c"".as_ptr(), flags, &attr, size_of_val(&attr)) };
     if result == -1 {
         return Err(std::io::Error::last_os_error()).context("mount read-only");

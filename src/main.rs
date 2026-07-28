@@ -170,13 +170,17 @@ enum Command {
     },
     /// Mount a file or directory into a running VM, or show mounts entries
     Mount {
+        /// Host path. Relative paths are resolved from the current working directory.
         path: Option<String>,
         name: Option<String>,
         #[arg(long)]
         read_only: bool,
     },
     /// Unmount a file or directory from a running VM now and on future starts
-    Unmount { path: String },
+    Unmount {
+        /// Host path. Relative paths are resolved from the current working directory.
+        path: String,
+    },
     /// Prints the public port for a port binding
     Port {
         /// Guest port to resolve to a host port
@@ -1676,9 +1680,10 @@ fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bo
     let config_local_toml_contents = read_optional(&config_local_toml_path).context(format!("read {CONFIG_LOCAL_TOML}"))?;
     let config = parse_config(&config_toml_contents, Some(&config_local_toml_contents), &env.hostname, false).context("validate current TOML config")?;
 
+    let base_abs = env.workspace.canonicalize()?;
+    let cwd_abs = env::current_dir()?.canonicalize()?;
     let to_base_rel = |path: &Path| -> anyhow::Result<(PathBuf, PathBuf)> {
-        let base_abs = env.workspace.canonicalize()?;
-        let path_abs = if path.is_absolute() { path.to_path_buf() } else { base_abs.join(path) };
+        let path_abs = if path.is_absolute() { path.to_path_buf() } else { cwd_abs.join(path) };
         let path_rel = diff_paths(&path_abs, &base_abs).context("resolve relative path")?;
         let path_rel = if path_rel.as_os_str().is_empty() { PathBuf::from(".") } else { path_rel };
         Ok((path_rel, path_abs))

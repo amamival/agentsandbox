@@ -102,9 +102,10 @@ values are merged with `[hosts.<hostname>]` values. CLI `mount`,
 `unmount`, `allow-domain`, and `unallow-domain` edits are kept in the local
 file.
 
-Relative mount sources are resolved from `--workspace`. Use `--read-only` with
-`mount` for a read-only guest mount. `build` and `up` preserve `flake.lock` by
-default; pass `--write-lock` to allow an update.
+Relative paths passed to `mount` and `unmount` are resolved from the shell's
+current directory, then stored relative to `--workspace`. Use `--read-only`
+with `mount` for a read-only guest mount. `build` and `up` preserve `flake.lock`
+by default; pass `--write-lock` to allow an update.
 
 The domain policy is stored in TOML but is not enforced in v0.2. MITM proxy,
 allowlist enforcement, and proxy logs remain unimplemented.

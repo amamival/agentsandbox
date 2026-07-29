@@ -306,6 +306,31 @@ $XDG_RUNTIME_DIR/agentsandbox/<instance-id>/
 - `~/.local/bin`, `.npm-global`, `.local/share/*`, and `.local/state/*` are kept
   as the guest-home compatibility layer.
 
+## Host CA trust
+
+- When `vm.useHostCerts = true`, the launcher imports one host-generated PEM
+  bundle. It selects the first regular file from `SSL_CERT_FILE`,
+  `/etc/ssl/certs/ca-certificates.crt`, `/etc/ssl/ca-bundle.pem`,
+  `/etc/ssl/certs/ca-bundle.crt`, and
+  `/etc/pki/tls/certs/ca-bundle.crt`, in that order.
+- The launcher does not merge individual certificate files. On Ubuntu and
+  Debian hosts, `update-ca-certificates` already combines distribution and
+  locally managed roots, including corporate roots under
+  `/usr/local/share/ca-certificates`, into
+  `/etc/ssl/certs/ca-certificates.crt`.
+- The selected bundle is exported read-only as `/persistent/host-ca.crt`, and
+  the launcher adds `agentsandbox.use-host-certs` to the guest kernel command
+  line. If no bundle is found, VM startup fails before the domain is created.
+- NixOS exposes `/etc/ssl/certs/ca-certificates.crt` as a symlink into the Nix
+  store. A systemd mount unit cannot use that non-canonical path, so a
+  conditional oneshot service resolves the symlink once, bind-mounts the host
+  bundle on the canonical target, and remounts it read-only.
+- The file mount pins the selected bundle for the lifetime of the VM. Host CA
+  updates and corporate CA rotation take effect on the next VM start.
+- This changes trust for software that uses the guest's default OpenSSL-style
+  bundle. Applications with independent stores, such as Java keystores or
+  browser-specific NSS databases, are outside this contract.
+
 ## Mount export
 
 - The startup workspace root is the directory containing `.agentsandbox` when

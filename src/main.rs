@@ -291,7 +291,7 @@ pub struct Vm {
     pub memory_mi_b: Option<u32>,
     pub libvirt_domain_xml: Option<String>,
     pub allow_domain_xml: Option<PolicyEntry<String>>,
-    /// [unimpl] When true, guest should trust the host OS CA bundle.
+    /// When true, guest should trust the host OS CA bundle.
     pub use_host_certs: Option<bool>,
 }
 
@@ -731,7 +731,12 @@ fn render_domain_xml(env: &Env, instance: &Instance, system_profile: &Path, is_b
     let kernel_params = fs::read_to_string(system_profile.join("kernel-params")).context("read kernel-params")?;
     let build_unit = if is_build { " systemd.unit=agentsandbox-build.target" } else { "" };
     let nested = if env.is_nested { " agentsandbox.nested" } else { "" };
-    let cmdline = format!("{kernel_params} init=/nix/var/nix/profiles/system/init systemd.machine_id={machine_id}{build_unit}{nested}");
+    let host_certs = if config.vm.use_host_certs.unwrap_or(false) {
+        " agentsandbox.use-host-certs"
+    } else {
+        ""
+    };
+    let cmdline = format!("{kernel_params} init=/nix/var/nix/profiles/system/init systemd.machine_id={machine_id}{build_unit}{nested}{host_certs}");
 
     let mut domain = XmlElement::from_reader(base_xml.as_bytes()).context("parse domain xml")?;
     if domain.tag().name() != "domain" {
@@ -1361,6 +1366,7 @@ fn start_vm(env: &Env, instance: &Instance, is_build: bool) -> anyhow::Result<Pa
 fn apply_mounts(env: &Env, instance: &Instance, _system_profile: &Path) -> anyhow::Result<()> {
     let workspace_dir = instance.persistent.join("workspace");
     let config_dir = instance.persistent.join("etc/nixos");
+    let host_ca_target = instance.persistent.join("host-ca.crt");
     let mut mounted = Vec::new();
 
     // Detach every old mount below the guest-visible workspace and config roots before replacing the configured mounts.
@@ -1370,7 +1376,7 @@ fn apply_mounts(env: &Env, instance: &Instance, _system_profile: &Path) -> anyho
     }
     for target in String::from_utf8_lossy(&output.stdout).lines() {
         let target = Path::new(target);
-        if target == config_dir || target.starts_with(&workspace_dir) {
+        if target == config_dir || target == host_ca_target || target.starts_with(&workspace_dir) {
             mounted.push(target.to_path_buf());
         }
     }
@@ -1409,6 +1415,14 @@ fn apply_mounts(env: &Env, instance: &Instance, _system_profile: &Path) -> anyho
         true,
         true,
     ));
+    if config.vm.use_host_certs.unwrap_or(false) {
+        parsed_mounts.push((
+            resolve_host_ca_bundle().context("vm.useHostCerts is enabled, but no host CA bundle was found")?,
+            host_ca_target,
+            false,
+            false,
+        ));
+    }
     parsed_mounts.sort_by(|a, b| a.1.cmp(&b.1));
 
     // Unmount all mounted directories in order of depth.

@@ -107,6 +107,8 @@ current directory, then stored relative to `--workspace`. Use `--read-only`
 with `mount` for a read-only guest mount. `build` and `up` preserve `flake.lock`
 by default; pass `--write-lock` to allow an update.
 
+Set `vm.useHostCerts = true` to mount the detected host CA bundle over the guest's default CA bundle on its next start.
+
 The domain policy is stored in TOML but is not enforced in v0.2. MITM proxy,
 allowlist enforcement, and proxy logs remain unimplemented.
 

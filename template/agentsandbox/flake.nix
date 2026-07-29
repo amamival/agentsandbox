@@ -41,6 +41,26 @@
           wantedBy = [ "local-fs.target" ];
           unitConfig.ConditionKernelCommandLine = "agentsandbox.nested";
         }];
+        systemd.services.agentsandbox-host-ca = {
+          description = "Use the host CA bundle";
+          wantedBy = [ "local-fs.target" ];
+          before = [ "local-fs.target" ];
+          after = [ "persistent.mount" ];
+          unitConfig.ConditionKernelCommandLine = "agentsandbox.use-host-certs";
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+          };
+          script = ''
+            target="$(${pkgs.coreutils}/bin/readlink -f /etc/ssl/certs/ca-certificates.crt)"
+            ${pkgs.util-linux}/bin/mount --bind /persistent/host-ca.crt "$target"
+            ${pkgs.util-linux}/bin/mount -o remount,bind,ro "$target"
+          '';
+          preStop = ''
+            target="$(${pkgs.coreutils}/bin/readlink -f /etc/ssl/certs/ca-certificates.crt)"
+            ${pkgs.util-linux}/bin/umount "$target"
+          '';
+        };
         boot.kernel.sysctl."vm.overcommit_memory" = lib.mkDefault "1"; # Stability in low memory situations.
         systemd.services.fuse-inval-wq = {
           description = "Seed fuse.inval_wq before virtiofs mounts to free cached fds on host";

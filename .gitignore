@@ -5,5 +5,5 @@ template/flake.lock
 result*
 # eBPF
 *.bpf
-# agentsandbox
-.agentsandbox
+# devvm
+.devvm

@@ -1,11 +1,11 @@
-.TH AGENTSANDBOX 1 "2026-07-26" "agentsandbox" "User Commands"
+.TH DEVVM 1 "2026-07-26" "devvm" "User Commands"
 .SH NAME
-agentsandbox \- manage a local NixOS VM sandbox
+devvm \- manage a local NixOS VM sandbox
 .SH SYNOPSIS
-.B agentsandbox
+.B devvm
 [\fIglobal-options\fR] \fIcommand\fR [\fIcommand-options\fR]
 .SH DESCRIPTION
-\fBagentsandbox\fR manages per-workspace Linux VMs built from NixOS templates.
+\fBdevvm\fR manages per-workspace Linux VMs built from NixOS templates.
 It resolves a configuration directory, derives an instance identity from that
 configuration plus hostname, and runs lifecycle/attach operations through
 libvirt and SSH.
@@ -26,12 +26,12 @@ Host \fBnix-store\fR.
 .TP
 .B -g, --global
 Resolve and operate on the global config
-(\fB$XDG_CONFIG_HOME/agentsandbox/<project-name>\fR) only.
+(\fB$XDG_CONFIG_HOME/devvm/<project-name>\fR) only.
 Skips local upward search.
 .TP
 .BI "-p, --project-name " PROJECT
 Select the project name. The instance name is \fIPROJECT[HOSTNAME]\fR.
-Defaults to the workspace basename for local use and \fBagentsandbox\fR with
+Defaults to the workspace basename for local use and \fBdevvm\fR with
 \fB--global\fR.
 .TP
 .BI "-n, --hostname " HOSTNAME
@@ -46,22 +46,22 @@ Resolve local config as if invoked from \fIPATH\fR.
 Default: current directory.
 .SH CONFIG RESOLUTION
 Without \fB--global\fR, the tool searches upward from \fB--workspace\fR for
-\fB.agentsandbox/\fR or a directory containing \fBagentsandbox.toml\fR or
-\fBagentsandbox.local.toml\fR. If not found, it falls back to the selected
+\fB.devvm/\fR or a directory containing \fBdevvm.toml\fR or
+\fBdevvm.local.toml\fR. If not found, it falls back to the selected
 global project. With \fB--global\fR, only that global project is used.
 .SH COMMANDS
 .SS version
 Print program version.
 .TP
-.B agentsandbox version
+.B devvm version
 .SS doctor
 Print resolution and dependency diagnostics.
 .TP
-.B agentsandbox doctor
+.B devvm doctor
 .SS init
 Create template config files.
 .TP
-.B agentsandbox init
+.B devvm init
 .RS
 .TP
 .B -f, --force
@@ -71,7 +71,7 @@ Overwrite existing files.
 Build guest system profile. If guest is down, starts VM temporarily, runs
 \fBnixos-rebuild boot\fR, then returns VM to down state.
 .TP
-.B agentsandbox build
+.B devvm build
 .RS
 .TP
 .B -b, --bootstrap
@@ -85,7 +85,7 @@ for its initial creation.
 Build and start VM. If already running, runs rebuild in-place; if domain XML
 changed, VM restart is required (command reports this).
 .TP
-.B agentsandbox up
+.B devvm up
 .RS
 .TP
 .B -d, --detach
@@ -97,15 +97,15 @@ Allow the build to update \fBflake.lock\fR.
 .SS down
 Request graceful shutdown, then wait for stop state.
 .TP
-.B agentsandbox down
+.B devvm down
 .SS kill
 Forcibly stop VM (\fBvirsh destroy\fR).
 .TP
-.B agentsandbox kill
+.B devvm kill
 .SS destroy
 Delete selected host-side instance data. No flags means no file deletion.
 .TP
-.B agentsandbox destroy
+.B devvm destroy
 .RS
 .TP
 .B -s, --system
@@ -127,23 +127,23 @@ Alias: \fBdestory\fR.
 .SS pause
 Pause running VMs for all hostnames in the resolved config.
 .TP
-.B agentsandbox pause
+.B devvm pause
 .SS unpause
 Resume paused VMs for all hostnames in the resolved config.
 .TP
-.B agentsandbox unpause
+.B devvm unpause
 .SS ps
 List VM states for all hostnames in the resolved config.
 .TP
-.B agentsandbox ps
+.B devvm ps
 .SS ls
 List all instance directories stored under the data root.
 .TP
-.B agentsandbox ls
+.B devvm ls
 .SS ssh
 Run command as guest user \fBvscode\fR, or attach shell if no args.
 .TP
-.BI "agentsandbox ssh " [args...]
+.BI "devvm ssh " [args...]
 .PP
 Host port is auto-resolved from \fBport-forwards\fR by selecting
 guest \fBtcp/22\fR.
@@ -151,31 +151,31 @@ If no such mapping exists, command fails.
 .SS exec
 Run command as guest user \fBroot\fR, or attach shell if no args.
 .TP
-.BI "agentsandbox exec " [args...]
+.BI "devvm exec " [args...]
 .SS logs
 Run guest \fBjournalctl\fR via \fBexec\fR path.
 .TP
-.BI "agentsandbox logs " [args...]
+.BI "devvm logs " [args...]
 .br
 Default args: \fB-en1000\fR.
 .SS stats
 Show selected \fBvirsh domstats\fR fields for resolved instances.
 .TP
-.B agentsandbox stats
+.B devvm stats
 .SS wait
 Wait until VM state equals one of provided states.
 .TP
-.BI "agentsandbox wait " [states...]
+.BI "devvm wait " [states...]
 .br
 Default states: \fBdown\fR, \fBshut off\fR, \fBcrashed\fR.
 .br
 State matching uses raw \fBvirsh domstate\fR text (plus synthetic
 \fBdown\fR when domain is absent).
 .SS mount
-Add a mount to hostname-specific \fBagentsandbox.local.toml\fR, or print the
+Add a mount to hostname-specific \fBdevvm.local.toml\fR, or print the
 effective mount set if no path is given.
 .TP
-.BI "agentsandbox mount " [path] [name]
+.BI "devvm mount " [path] [name]
 .br
 \fIpath\fR may be file or directory.
 .br
@@ -183,26 +183,26 @@ Use \fB--read-only\fR to expose it read-only in the guest.
 .SS unmount
 Remove mount entry for \fIpath\fR.
 .TP
-.BI "agentsandbox unmount " path
+.BI "devvm unmount " path
 .SS port
 Print all active port forwards, or resolve a guest port to its host endpoint.
 .TP
-.BI "agentsandbox port " [guest-port]
+.BI "devvm port " [guest-port]
 .br
 Use \fB--protocol tcp|udp\fR to restrict lookup.
 .SS allow-domain
 Add a normalized domain key to the selected hostname section in
-\fBagentsandbox.local.toml\fR.
+\fBdevvm.local.toml\fR.
 .TP
-.BI "agentsandbox allow-domain " domain
+.BI "devvm allow-domain " domain
 .SS unallow-domain
 Remove or disable a normalized domain key in the selected hostname section.
 .TP
-.BI "agentsandbox unallow-domain " domain
+.BI "devvm unallow-domain " domain
 .SS verify
 Run store/system repair checks.
 .TP
-.B agentsandbox verify
+.B devvm verify
 .br
 1) Runs host \fBnix-store --verify --check-contents --repair\fR against guest
 store root.
@@ -213,7 +213,7 @@ store root.
 Run the patched host \fBvulnix\fR against the instance sysroot. Arguments after
 \fB--\fR are passed to vulnix.
 .TP
-.BI "agentsandbox audit -- " [vulnix-options]
+.BI "devvm audit -- " [vulnix-options]
 .SH KNOWN LIMITATIONS
 .TP
 Domain policy
@@ -242,16 +242,16 @@ Fallback root for XDG directories.
 Base paths for config/data/state/runtime roots.
 .SH FILES
 .TP
-\fI<workspace>/.agentsandbox/\fR
+\fI<workspace>/.devvm/\fR
 Local config directory created by \fBinit\fR.
 .TP
-\fI$XDG_CONFIG_HOME/agentsandbox/<project-name>/\fR
+\fI$XDG_CONFIG_HOME/devvm/<project-name>/\fR
 Global project config directory.
 .TP
-\fI<config>/agentsandbox.toml\fR
+\fI<config>/devvm.toml\fR
 Base launcher configuration.
 .TP
-\fI<config>/agentsandbox.local.toml\fR
+\fI<config>/devvm.local.toml\fR
 Optional local and CLI-written overrides.
 .SH EXIT STATUS
 .TP
@@ -264,24 +264,24 @@ Error.
 .TP
 Initialize local config:
 .nf
-agentsandbox init
+devvm init
 .fi
 .TP
 Build then start:
 .nf
-agentsandbox build
-agentsandbox up
+devvm build
+devvm up
 .fi
 .TP
 Run command in guest:
 .nf
-agentsandbox exec -- uname -a
+devvm exec -- uname -a
 .fi
 .TP
 Add and remove mount entry:
 .nf
-agentsandbox mount ./alpha sandbox-alpha
-agentsandbox unmount ./alpha
+devvm mount ./alpha sandbox-alpha
+devvm unmount ./alpha
 .fi
 .SH SEE ALSO
 virsh(1), ssh(1), journalctl(1), nixos-rebuild(8)

@@ -48,7 +48,7 @@
           mkdir -p "$NIX_STATE_DIR/profiles"
           ${pkgs.nix}/bin/nix-instantiate --parse ${./test.nix} >/dev/null
           ${pkgs.nix}/bin/nix-instantiate --parse ${template/flake.nix} >/dev/null
-          ${pkgs.nix}/bin/nix-instantiate --parse ${template/agentsandbox/flake.nix} >/dev/null
+          ${pkgs.nix}/bin/nix-instantiate --parse ${template/devvm/flake.nix} >/dev/null
           touch "$out"
         '';
       });

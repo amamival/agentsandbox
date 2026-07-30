@@ -3,7 +3,7 @@
 { config, lib, pkgs, pkgs-unstable, nixpkgs, claudeNixos, ... }:
 let
   HostConf = {
-    hostName = "agentsandbox";
+    hostName = "devvm";
     wheelUser = "vscode";
   };
 
@@ -144,7 +144,7 @@ let
           ".cargo"
           ".claude"
           ".codex"
-          ".config/agentsandbox"
+          ".config/devvm"
           ".config/Claude"
           ".config/github-copilot"
           ".config/mise"
@@ -153,11 +153,11 @@ let
           ".config/opencode"
           ".config/tmux/plugins"
           ".local/bin"
-          ".local/share/agentsandbox"
+          ".local/share/devvm"
           ".local/share/claude"
           ".local/share/fish"
           ".local/share/mise"
-          ".local/state/agentsandbox"
+          ".local/state/devvm"
           ".local/state/mise"
           ".npm-global"
           ".pnpm-store"

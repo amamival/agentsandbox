@@ -1,4 +1,4 @@
-# Agent Sandbox: a secure, efficient, reproducible NixOS Linux VM for self-improving agentic workflows
+# DevVM: a secure, efficient, reproducible NixOS Linux VM for self-improving agentic workflows
 
 In 2026, agentic loops are becoming increasingly unattended as LLM-based coding harnesses improve. However, the use of such harnesses and external LLM providers still raises security and privacy concerns.
 
@@ -18,7 +18,7 @@ This is not yet a polished runtime. It remains an experimental launcher under he
 
 The target host platform is recent `amd64` Linux in general, not just NixOS. If this does not run on a reasonably current Linux machine, that should be treated as a bug rather than an unsupported edge case.
 
-The `agentsandbox` command handles sysroot bootstrap, system builds, libvirt startup, attach, and mounts.
+The `devvm` command handles sysroot bootstrap, system builds, libvirt startup, attach, and mounts.
 
 ## Installation
 
@@ -30,19 +30,19 @@ The `agentsandbox` command handles sysroot bootstrap, system builds, libvirt sta
 
 Linux host (x86_64/amd64) with KVM, libvirt session QEMU, passt, and virtiofsd is required.
 
-- `agentsandbox`
+- `devvm`
   If the VM is running, attach to it; otherwise, rebuild and start it.
-- `agentsandbox <command>`
+- `devvm <command>`
   Run a command against the selected project and hostname.
 
 The subcommands are similar to those of **Docker Compose**.
 ```
-Usage: agentsandbox [OPTIONS] [COMMAND]
+Usage: devvm [OPTIONS] [COMMAND]
 
 Commands:
   version         Show version
   doctor          Show diagnostics
-  init            Create `.agentsandbox/` and write the initial template files
+  init            Create `.devvm/` and write the initial template files
   build           Build the guest system
   up              Rebuild and start a VM; if already running, build and switch
   down            Tear down the VM gracefully
@@ -68,7 +68,7 @@ Commands:
   help            Print this message or the help of the given subcommand(s)
 
 Options:
-  -g, --global                       Use only global config (`$XDG_CONFIG_HOME/agentsandbox`) and skip local upward search
+  -g, --global                       Use only global config (`$XDG_CONFIG_HOME/devvm`) and skip local upward search
   -p, --project-name <PROJECT_NAME>  Select project name. Combined with hostname to form the instance name
   -n, --hostname <HOSTNAME>          Select sandbox hostname (build target and instance identity input) [default: default]
   -w, --workspace <WORKSPACE>        Resolve the active workspace and config as if running from this directory
@@ -79,25 +79,25 @@ Options:
 ## Quick Start
 ```bash
 # 1) Initialize local config in current workspace
-agentsandbox init
+devvm init
 # 2) Build and start VM (attaches if startup succeeds)
-agentsandbox up
+devvm up
 # 3) Open guest shell (user)
-agentsandbox ssh
+devvm ssh
 # 4) Run command as root in guest
-agentsandbox exec -- uname -a
+devvm exec -- uname -a
 # 5) Stop VM gracefully
-agentsandbox down
+devvm down
 ```
 For global (project-less) usage, initialize once with:
 ```bash
-agentsandbox --global init
+devvm --global init
 ```
 
 ## Configuration
 
-`init` writes `.agentsandbox/agentsandbox.toml`. An optional
-`.agentsandbox/agentsandbox.local.toml` overrides it. Within each file, base
+`init` writes `.devvm/devvm.toml`. An optional
+`.devvm/devvm.local.toml` overrides it. Within each file, base
 values are merged with `[hosts.<hostname>]` values. CLI `mount`,
 `unmount`, `allow-domain`, and `unallow-domain` edits are kept in the local
 file.

@@ -1,4 +1,4 @@
-# Agent Sandbox Protection Model PRD
+# DevVM Protection Model PRD
 
 ## Status
 
@@ -6,19 +6,19 @@ Draft. This document records the protection model that should guide the next imp
 
 ## Problem
 
-Agent Sandbox runs untrusted development workloads in a real NixOS VM. Those workloads may include
+DevVM runs untrusted development workloads in a real NixOS VM. Those workloads may include
 LLM-generated commands, npm packages, flake inputs, build scripts, service definitions, and kernel-facing
 software. A malicious or compromised package may try to exploit the guest kernel, gain guest root, and
 then change the sandbox so that a later host action trusts attacker-controlled state.
 
 The current implementation mixes several mutation paths:
 
-- `agentsandbox build` and `agentsandbox up` may generate or refresh `flake.lock`.
+- `devvm build` and `devvm up` may generate or refresh `flake.lock`.
 - The guest can run `nixos-rebuild`, `switch-to-configuration`, or a toplevel `activate` script.
 - The active configuration is mounted at runtime.
 - Libvirt domain XML is generated from the NixOS system profile.
-- Runtime source mounts are configured through `agentsandbox.toml` and optional
-  `agentsandbox.local.toml` overrides.
+- Runtime source mounts are configured through `devvm.toml` and optional
+  `devvm.local.toml` overrides.
 
 The product needs a clear model for which side may mutate each state source, which mutations are only
 temporary inside the guest, and which mutations may be reflected back into host-controlled policy.
@@ -36,7 +36,7 @@ The host must remain safe. The attacker must not be able to read arbitrary host 
 host files, reuse host Nix state, alter host firewall or libvirt policy, or cause host-controlled policy
 to be silently replaced by guest-generated policy.
 
-The template flake shipped by Agent Sandbox is trusted. `nix-store --verify` against the instance store is
+The template flake shipped by DevVM is trusted. `nix-store --verify` against the instance store is
 trusted. The host launcher, host kernel, KVM, QEMU, libvirt, and virtiofs are trusted for this design.
 
 The guest Nix store is instance-local. `/nix` inside the guest resolves to the instance sysroot, not to the
@@ -64,7 +64,7 @@ configuration changes from becoming host-trusted state without an explicit host 
 ## Non-goals
 
 - Do not expose a single `protectionMode` enum in the implementation.
-- Do not make git a hard requirement for local `.agentsandbox` configurations.
+- Do not make git a hard requirement for local `.devvm` configurations.
 - Do not implement repository snapshots as the primary build source mechanism.
 - Do not add a separate `runtimeSource` setting; runtime source exposure belongs to dynamic mounts.
 - Do not try to make guest root powerless inside the live guest.
@@ -93,17 +93,17 @@ new store paths is not needed.
 
 ## Configuration Axes
 
-### `agentsandbox.mutableSandboxConfig`
+### `devvm.mutableSandboxConfig`
 
 Controls whether the active sandbox configuration mount is writable from the guest.
 
-When false, the guest must not be able to edit `.agentsandbox` or the global sandbox configuration through
+When false, the guest must not be able to edit `.devvm` or the global sandbox configuration through
 the runtime mount. Host commands remain the only supported way to apply configuration changes.
 
 When true, the guest may edit the active sandbox configuration. This is useful for trusted interactive
 configuration work and weakens the host-owned policy boundary.
 
-### `agentsandbox.mutableSystemProfile`
+### `devvm.mutableSystemProfile`
 
 Controls whether `/nix/var/nix/profiles` is writable in the guest.
 
@@ -111,10 +111,10 @@ When false, standard Nix profile mutations are denied. This blocks normal `nixos
 `nixos-rebuild boot`, `nixos-rebuild test`, and profile-changing `nix profile` operations at the profile
 update layer. It does not deny `nix build` or `nix develop` by itself.
 
-When true, the guest may update system and user profiles. This implies `agentsandbox.mutableNixStore = true`
+When true, the guest may update system and user profiles. This implies `devvm.mutableNixStore = true`
 because profile updates need a writable store and writable Nix state.
 
-### `agentsandbox.mutableNixStore`
+### `devvm.mutableNixStore`
 
 Controls whether `/nix` is writable in the guest.
 
@@ -122,7 +122,7 @@ When false, `/nix`, `/nix/store`, and `/nix/var` are mounted read-only. This den
 `nix develop`, profile updates, garbage collection state changes, and normal store registration.
 
 When true, Nix build and development workflows may write the instance store. This does not imply that
-profiles are writable; that remains controlled by `agentsandbox.mutableSystemProfile`.
+profiles are writable; that remains controlled by `devvm.mutableSystemProfile`.
 
 ### Mount Entry Mode
 
@@ -139,19 +139,19 @@ attributes, not global source policy.
 
 ## Build Source Model
 
-`agentsandbox build` and `agentsandbox up` need a source tree that includes every relative path referenced by
+`devvm build` and `devvm up` need a source tree that includes every relative path referenced by
 the active flake. The build source should be chosen automatically to keep the build path reliable.
 
-For a local `.agentsandbox/flake.nix` that is tracked by git, the build source is the containing git worktree
+For a local `.devvm/flake.nix` that is tracked by git, the build source is the containing git worktree
 root. The guest runs the rebuild from inside that worktree so that git-aware Nix input handling avoids the
 slow repeated `path:` store upload.
 
-For a local `.agentsandbox/flake.nix` that is not tracked by git, git is not required. The build source stays
+For a local `.devvm/flake.nix` that is not tracked by git, git is not required. The build source stays
 workspace-based and should preserve current behavior closely enough that relative paths from the flake keep
 working.
 
 For global config, the build source is
-`$XDG_CONFIG_HOME/agentsandbox/<project-name>`.
+`$XDG_CONFIG_HOME/devvm/<project-name>`.
 
 The build source is mounted read-only for normal builds. This source mount is an internal build/up mount,
 separate from user-visible runtime mounts.
@@ -184,7 +184,7 @@ phase is not needed.
 
 ### Profile Guard
 
-When `agentsandbox.mutableSystemProfile = false`, `/nix/var/nix/profiles` is read-only. The path matters:
+When `devvm.mutableSystemProfile = false`, `/nix/var/nix/profiles` is read-only. The path matters:
 `/nix/var/nix/profiles/system` is a symlink, so the protected mount point is `/nix/var/nix/profiles`.
 
 This denies standard profile updates and makes ordinary `nixos-rebuild switch`, `boot`, and `test` fail.
@@ -193,7 +193,7 @@ This denies standard profile updates and makes ordinary `nixos-rebuild switch`, 
 
 The standard `switch-to-configuration` entrypoint takes
 `/run/nixos/switch-to-configuration.lock` before it performs activation or systemd work. When system profile
-mutation is disabled, Agent Sandbox should make that path fail to open as a file. A directory or read-only
+mutation is disabled, DevVM should make that path fail to open as a file. A directory or read-only
 mount at that path is sufficient.
 
 This blocks the standard script early, including attempts with `NIXOS_NO_CHECK=1`.
@@ -208,7 +208,7 @@ The template should install an early activation guard such as:
 
 ```sh
 [ "$(readlink -f "$systemConfig")" = "$(readlink -f /nix/var/nix/profiles/system)" ] ||
-  : > /nix/var/nix/profiles/.agentsandbox-activation-guard || # Or try: touch /nix/var/nix/profiles
+  : > /nix/var/nix/profiles/.devvm-activation-guard || # Or try: touch /nix/var/nix/profiles
   exit 1 # and print some useful message for user
 ```
 
@@ -219,18 +219,18 @@ allowing a new system activation only in modes where profile mutation was intent
 ## Runtime Mount Policy
 
 Runtime source exposure is controlled by dynamic mounts. A workspace can be mounted read-write for normal
-coding while `.agentsandbox` is over-mounted read-only:
+coding while `.devvm` is over-mounted read-only:
 
-`agentsandbox init` creates the workspace mount. Additional mounts use
-`agentsandbox mount [--read-only] <path> [name]`. The launcher recursively
-over-mounts `agentsandbox.toml` and `agentsandbox.local.toml` read-only in the
+`devvm init` creates the workspace mount. Additional mounts use
+`devvm mount [--read-only] <path> [name]`. The launcher recursively
+over-mounts `devvm.toml` and `devvm.local.toml` read-only in the
 guest-visible workspace and config trees.
 
 ## Expected CLI Behavior
 
-- `agentsandbox build` uses the sysroot Nix and instance store.
-- `agentsandbox up` uses the sysroot Nix and instance store.
-- `agentsandbox build` and `agentsandbox up` fail on stale locks unless `--write-lock` is passed.
+- `devvm build` uses the sysroot Nix and instance store.
+- `devvm up` uses the sysroot Nix and instance store.
+- `devvm build` and `devvm up` fail on stale locks unless `--write-lock` is passed.
 - Missing `flake.lock` is treated as implicit `--write-lock`.
 - `--write-lock` makes only `flake.lock` writable inside an otherwise read-only build source.
 - The guest runtime mount list accepts per-entry `rw` and `ro`.
@@ -241,8 +241,8 @@ guest-visible workspace and config trees.
 - A missing `flake.lock` is created by the sysroot build path, not by host `nix`.
 - A stale lock fails without `--write-lock`.
 - A stale lock updates with `--write-lock`.
-- A git-tracked `.agentsandbox/flake.nix` builds from the git worktree root and avoids repeated `path:` uploads.
-- An untracked `.agentsandbox/flake.nix` still works without requiring git.
+- A git-tracked `.devvm/flake.nix` builds from the git worktree root and avoids repeated `path:` uploads.
+- An untracked `.devvm/flake.nix` still works without requiring git.
 - With `mutableNixStore = true` and `mutableSystemProfile = false`, `nix build` works and standard
   `nixos-rebuild switch`, `boot`, and `test` fail.
 - With `mutableNixStore = false`, `nix build` and `nix develop` fail because `/nix` is read-only.

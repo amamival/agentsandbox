@@ -1,11 +1,11 @@
 [package]
-name = "agentsandbox"
-version = "0.2.0"
+name = "devvm"
+version = "0.3.0"
 description = "Manage isolated NixOS VM sandboxes for agentic workflows"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/YOUR_GITHUB_OWNER/agentsandbox"
-homepage = "https://github.com/YOUR_GITHUB_OWNER/agentsandbox"
+repository = "https://github.com/YOUR_GITHUB_OWNER/devvm"
+homepage = "https://github.com/YOUR_GITHUB_OWNER/devvm"
 readme = "README.md"
 keywords = ["nix", "nixos", "vm", "sandbox", "cli"]
 categories = ["command-line-utilities", "virtualization"]

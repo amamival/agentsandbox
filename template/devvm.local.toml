@@ -1,17 +1,17 @@
 # Private launcher policy.
 # CLI commands edit this file of hostname-specific sections.
-# This file has same structure and overrides agentsandbox.toml.
+# This file has same structure and overrides devvm.toml.
 
 # CLI commands write hostname-specific overrides into this file.
 
 [hosts.default.vm]
-# To allow `libvirtDomainXml`, set its SHA256 hash or use `true` in `agentsandbox.local.toml`.
+# To allow `libvirtDomainXml`, set its SHA256 hash or use `true` in `devvm.local.toml`.
 # Use this only if you know what you are doing, since it can damage host devices or cause leaks.
 allowDomainXml = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 [hosts.default.mounts]
 "repo" = { source = ".", readonly = false }
-"scratch" = { source = "/tmp/agentsandbox-scratch", readonly = false }
+"scratch" = { source = "/tmp/devvm-scratch", readonly = false }
 
 [hosts.default.allowedHosts]
-"example.com" = false # Disable the matching `agentsandbox.toml` policy entry.
+"example.com" = false # Disable the matching `devvm.toml` policy entry.

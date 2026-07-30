@@ -11,7 +11,7 @@ rustPlatform.buildRustPackage rec {
   };
   cargoLock.lockFile = ./Cargo.lock;
   nativeBuildInputs = [ makeWrapper ];
-  postInstall = "install -D man/agentsandbox.1 $out/share/man/man1/agentsandbox.1";
+  postInstall = "install -D man/devvm.1 $out/share/man/man1/devvm.1";
   # We expect that libvirtd and qemu are configured on host. See template/configuration.nix
   postFixup = ''
     wrapProgram "$out/bin/${pname}" \

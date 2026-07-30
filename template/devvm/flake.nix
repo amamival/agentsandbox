@@ -24,10 +24,10 @@
         # qemu-guest supplies the transport modules; load virtiofs for early mounts.
         boot.initrd.kernelModules = [ "virtiofs" ];
 
-        # Boot.AgentSandbox
+        # Boot.DevVM
         assertions = [{
           assertion = lib.versionAtLeast config.boot.kernelPackages.kernel.version "6.19";
-          message = "agentsandbox requires Linux 6.19+ for fuse.inval_wq.";
+          message = "devvm requires Linux 6.19+ for fuse.inval_wq.";
         }];
         boot.kernelPackages = pkgs.linuxPackages_latest;
         fileSystems."/" = { device = "none"; fsType = "tmpfs"; options = [ "mode=755" "nosuid" "nodev" "noexec" ]; };
@@ -39,14 +39,14 @@
           type = "tmpfs";
           options = "mode=755,nosuid,nodev";
           wantedBy = [ "local-fs.target" ];
-          unitConfig.ConditionKernelCommandLine = "agentsandbox.nested";
+          unitConfig.ConditionKernelCommandLine = "devvm.nested";
         }];
-        systemd.services.agentsandbox-host-ca = {
+        systemd.services.devvm-host-ca = {
           description = "Use the host CA bundle";
           wantedBy = [ "local-fs.target" ];
           before = [ "local-fs.target" ];
           after = [ "persistent.mount" ];
-          unitConfig.ConditionKernelCommandLine = "agentsandbox.use-host-certs";
+          unitConfig.ConditionKernelCommandLine = "devvm.use-host-certs";
           serviceConfig = {
             Type = "oneshot";
             RemainAfterExit = true;
@@ -82,18 +82,18 @@
           "systemd.journald.forward_to_console=1" # Show progress while running tests.
           "console=ttyS0,115200n8" # Used on `virsh console`.
         ];
-        system.activationScripts.agentsandboxActivationGuard = ''
+        system.activationScripts.devvmActivationGuard = ''
           if [ "$(readlink -f "$systemConfig")" != "$(readlink -f /nix/var/nix/profiles/system)" ]; then
-            guard="$(mktemp /nix/var/nix/profiles/.agentsandbox-activation-guard.XXXXXX)" || {
-              echo "agentsandbox: refusing activation while system profiles are read-only" >&2
+            guard="$(mktemp /nix/var/nix/profiles/.devvm-activation-guard.XXXXXX)" || {
+              echo "devvm: refusing activation while system profiles are read-only" >&2
               exit 1
             }
             rm -f "$guard"
           fi
         '';
         services.getty.autologinUser = "root";
-        systemd.targets.agentsandbox-build = {
-          description = "AgentSandbox build environment";
+        systemd.targets.devvm-build = {
+          description = "DevVM build environment";
           wants = [ "dhcpcd.service" "sshd.service" "dbus.service" "serial-getty@ttyS0.service" ];
           after = [ "dhcpcd.service" ];
           unitConfig.AllowIsolate = true;

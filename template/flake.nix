@@ -4,20 +4,20 @@
     nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
     home-manager.url = "github:nix-community/home-manager/release-26.05";
     home-manager.inputs.nixpkgs.follows = "nixpkgs";
-    agentsandbox.url = "path:./agentsandbox";
-    agentsandbox.inputs.nixpkgs.follows = "nixpkgs";
+    devvm.url = "path:./devvm";
+    devvm.inputs.nixpkgs.follows = "nixpkgs";
     #opencode.url = "github:anomalyco/opencode/dev";
     #opencode.inputs.nixpkgs.follows = "nixpkgs-unstable";
   };
 
-  outputs = { self, nixpkgs, nixpkgs-unstable, home-manager, agentsandbox, ... }:
+  outputs = { self, nixpkgs, nixpkgs-unstable, home-manager, devvm, ... }:
     let
       nixosWithOverlay = system: modules:
         nixpkgs.lib.nixosSystem {
           inherit system;
           modules = modules ++ [
             home-manager.nixosModules.home-manager
-            agentsandbox.nixosModules.default
+            devvm.nixosModules.default
             (_: { nixpkgs.overlays = [ (_: _: self.packages.${system}) ]; })
           ];
           specialArgs.pkgs-unstable = import nixpkgs-unstable { inherit system; config.allowUnfree = true; };
@@ -28,7 +28,7 @@
     in
     {
       packages = eachSystem (system: {
-        claude-nixos = agentsandbox.packages.${system}.claude-nixos;
+        claude-nixos = devvm.packages.${system}.claude-nixos;
         # Extra packages available.
         # opencode-dev = opencode.packages.${system}.opencode.overrideAttrs (old: {
         #   preBuild = (old.preBuild or "") + ''

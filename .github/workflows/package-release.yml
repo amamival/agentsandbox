@@ -32,22 +32,22 @@ jobs:
         run: |
           cargo build --release --locked --target x86_64-unknown-linux-musl
           mkdir -p stage/usr/{bin,share/man/man1}
-          cp ./target/x86_64-unknown-linux-musl/release/agentsandbox ./stage/usr/bin/agentsandbox
-          cp ./man/agentsandbox.1 ./stage/usr/share/man/man1/agentsandbox.1
+          cp ./target/x86_64-unknown-linux-musl/release/devvm ./stage/usr/bin/devvm
+          cp ./man/devvm.1 ./stage/usr/share/man/man1/devvm.1
 
       - name: Build deb/rpm/archlinux packages
         run: |
           ref_name="${{ github.ref_name }}"
           version="${ref_name#v}"
           cat > nfpm.yaml <<EOF
-          name: agentsandbox
+          name: devvm
           arch: amd64
           platform: linux
           version: ${version}
           section: default
           priority: optional
-          maintainer: agentsandbox maintainers
-          description: agentsandbox CLI
+          maintainer: devvm maintainers
+          description: devvm CLI
           license: MIT
           overrides:
             deb:
@@ -69,10 +69,10 @@ jobs:
                 - util-linux
                 - virtiofsd
           contents:
-            - src: ./stage/usr/bin/agentsandbox
-              dst: /usr/bin/agentsandbox
-            - src: ./stage/usr/share/man/man1/agentsandbox.1
-              dst: /usr/share/man/man1/agentsandbox.1
+            - src: ./stage/usr/bin/devvm
+              dst: /usr/bin/devvm
+            - src: ./stage/usr/share/man/man1/devvm.1
+              dst: /usr/share/man/man1/devvm.1
           EOF
 
           mkdir -p dist

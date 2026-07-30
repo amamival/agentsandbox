@@ -45,11 +45,11 @@ const DEFAULT_DOMAIN_XML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR")
     version
 )]
 struct Cli {
-    /// Use only global config (`$XDG_CONFIG_HOME/agentsandbox`) and skip local upward search.
+    /// Use only global config (`$XDG_CONFIG_HOME/devvm`) and skip local upward search.
     #[arg(short = 'g', long, global = true)]
     global: bool,
     /// Select project name. Combined with hostname to form the instance name.
-    #[arg(short = 'p', long, global = true, env = "AGENTSANDBOX_PROJECT_NAME")]
+    #[arg(short = 'p', long, global = true, env = "DEVVM_PROJECT_NAME")]
     project_name: Option<String>,
     /// Select sandbox hostname (build target and instance identity input).
     #[arg(short = 'n', long, global = true, default_value = "default")]
@@ -79,7 +79,7 @@ enum Command {
     Version,
     /// Show diagnostics
     Doctor,
-    /// Create `.agentsandbox/` and write the initial template files
+    /// Create `.devvm/` and write the initial template files
     Init {
         /// Overwrite existing files.
         #[arg(short = 'f', long)]
@@ -207,7 +207,7 @@ enum Command {
     /// See upstream <https://github.com/nix-community/vulnix> for how to reduce false positives.
     #[command(
         verbatim_doc_comment,
-        override_usage = "agentsandbox audit [OPTIONS] -- [VULNIX_OPTIONS] [PATHS...]
+        override_usage = "devvm audit [OPTIONS] -- [VULNIX_OPTIONS] [PATHS...]
 
 Vulnix Options:
   -S, --system                    Scan the current system.
@@ -504,7 +504,7 @@ fn resolve_flake_dir(env: &Env) -> anyhow::Result<PathBuf> {
     if global_flake_dir.is_dir() {
         Ok(global_flake_dir)
     } else {
-        bail!("{} not found. Try `agentsandbox init` to start in a new project.", global_flake_dir.display())
+        bail!("{} not found. Try `devvm init` to start in a new project.", global_flake_dir.display())
     }
 }
 
@@ -729,10 +729,10 @@ fn render_domain_xml(env: &Env, instance: &Instance, system_profile: &Path, is_b
     let kernel = instance.sysroot.join(kernel_target.strip_prefix("/").context("get kernel image path")?);
     let initrd = instance.sysroot.join(initrd_target.strip_prefix("/").context("get initrd image path")?);
     let kernel_params = fs::read_to_string(system_profile.join("kernel-params")).context("read kernel-params")?;
-    let build_unit = if is_build { " systemd.unit=agentsandbox-build.target" } else { "" };
-    let nested = if env.is_nested { " agentsandbox.nested" } else { "" };
+    let build_unit = if is_build { " systemd.unit=devvm-build.target" } else { "" };
+    let nested = if env.is_nested { " devvm.nested" } else { "" };
     let host_certs = if config.vm.use_host_certs.unwrap_or(false) {
-        " agentsandbox.use-host-certs"
+        " devvm.use-host-certs"
     } else {
         ""
     };
@@ -865,7 +865,7 @@ fn write_template_config(target: &Path, workspace: &Path, force: bool) -> anyhow
         bail!("{} already exists", target.display());
     }
     let workspace_name = workspace.file_name().and_then(|name| name.to_str()).context("derive workspace name")?;
-    fs::create_dir_all(target.join(APP_NAME)).context("create agentsandbox dir")?;
+    fs::create_dir_all(target.join(APP_NAME)).context("create devvm dir")?;
     let app_flake = format!("{APP_NAME}/flake.nix");
     let app_claude_nixos = format!("{APP_NAME}/claude-nixos.nix");
     let config_template = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/template/", env!("CARGO_PKG_NAME"), ".toml"));
@@ -878,8 +878,8 @@ fn write_template_config(target: &Path, workspace: &Path, force: bool) -> anyhow
         (CONFIG_TOML, config.to_string()),
         ("flake.nix", include_str!("../template/flake.nix").to_owned()),
         ("configuration.nix", include_str!("../template/configuration.nix").to_owned()),
-        (app_flake.as_str(), include_str!("../template/agentsandbox/flake.nix").to_owned()),
-        (app_claude_nixos.as_str(), include_str!("../template/agentsandbox/claude-nixos.nix").to_owned()),
+        (app_flake.as_str(), include_str!("../template/devvm/flake.nix").to_owned()),
+        (app_claude_nixos.as_str(), include_str!("../template/devvm/claude-nixos.nix").to_owned()),
     ] {
         fs::write(target.join(name), contents).context("write template file")?;
     }
@@ -1053,7 +1053,7 @@ fn install_initial_nixos_profile(workspace: &Path, sysroot: &Path, hostname: &st
             // - On the real host, this sysroot is normally on a local filesystem. The kernel
             //   sees both the install user namespace and the backing inodes, so install-ns root
             //   can use CAP_DAC_OVERRIDE for Nix's builder-owned scratch dirs.
-            // - In a nested AgentSandbox, this same sysroot lives under the outer guest's
+            // - In a nested DevVM, this same sysroot lives under the outer guest's
             //   /persistent, which is virtiofs backed by the outer host. At this point the inner
             //   VM has not started yet; the virtiofs boundary involved here is the already-mounted
             //   outer /persistent, not this invocation's future /persistent device.
@@ -1133,7 +1133,7 @@ fn read_system_profile(instance: &Instance) -> anyhow::Result<PathBuf> {
 /// Run virsh against the session URI (qemu:///session).
 ///
 /// Networking uses `<backend type='passt'/>`; libvirt looks up `passt` on the
-/// user-session libvirtd PATH, not the shell that launched agentsandbox. NixOS
+/// user-session libvirtd PATH, not the shell that launched devvm. NixOS
 /// `systemd.services.libvirtd.path` does not apply here. If passt was installed
 /// or PATH changed after the session daemon started, restart it (or kill stale
 /// libvirt/qemu/passt children) so the daemon picks up the current PATH.
@@ -1250,7 +1250,7 @@ fn start_vm(env: &Env, instance: &Instance, is_build: bool) -> anyhow::Result<Pa
     let nested = env.is_nested;
     let system_profile = read_system_profile(instance)?;
     let pv_socket = instance.runtime_dir.join("pv.sock");
-    let pid_path = instance.runtime_dir.join("agentsandbox.pid");
+    let pid_path = instance.runtime_dir.join("devvm.pid");
     let domain_profile = instance.runtime_dir.join("domain-profile");
     let _ = fs::remove_file(&pv_socket);
     let _ = fs::remove_file(&pid_path);
@@ -1794,10 +1794,10 @@ fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bo
     }
     fs::write(&config_local_toml_path, config_local_toml.to_string()).context(format!("write {CONFIG_LOCAL_TOML}"))?;
 
-    let pid_path = instance.runtime_dir.join("agentsandbox.pid");
+    let pid_path = instance.runtime_dir.join("devvm.pid");
     if let Ok(pid) = fs::read_to_string(&pid_path) {
         let pid = pid.trim().parse::<i32>()?;
-        let pid = Pid::from_raw(pid).context("invalid agentsandbox.pid")?;
+        let pid = Pid::from_raw(pid).context("invalid devvm.pid")?;
         if let Err(err) = kill_process(pid, Signal::HUP) {
             eprintln!("mounts: failed to reload: {err}");
             bail!("{err}");
@@ -1953,6 +1953,6 @@ fn run_audit(env: &Env, args: &[String]) -> anyhow::Result<()> {
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
-        .context("depends on host patched vulnix binary for now. run in `nix develop` of agentsandbox")?;
+        .context("depends on host patched vulnix binary for now. run in `nix develop` of devvm")?;
     process::exit(status.code().unwrap_or(1))
 }

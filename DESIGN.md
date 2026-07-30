@@ -1,4 +1,4 @@
-# Agent Sandbox: a secure, efficient, reproducible NixOS Linux VM for self-improving agentic workflows
+# DevVM: a secure, efficient, reproducible NixOS Linux VM for self-improving agentic workflows
 
 In 2026, agentic loops are becoming increasingly unattended as LLM-based coding harnesses improve. However, the use of such harnesses and external LLM providers still raises security and privacy concerns.
 
@@ -18,7 +18,7 @@ This is not yet a polished runtime. It remains an experimental launcher under he
 
 The target host platform is recent `amd64` Linux in general, not just NixOS. If this does not run on a reasonably current Linux machine, that should be treated as a bug rather than an unsupported edge case.
 
-The `agentsandbox` command handles sysroot bootstrap, system builds, libvirt startup, attach, and mounts.
+The `devvm` command handles sysroot bootstrap, system builds, libvirt startup, attach, and mounts.
 
 ## Installation
 
@@ -30,19 +30,19 @@ The `agentsandbox` command handles sysroot bootstrap, system builds, libvirt sta
 
 Linux host (x86_64/amd64) with KVM support is required.
 
-- `agentsandbox`
+- `devvm`
   If the VM is running, attach to it; otherwise, rebuild and start it.
-- `agentsandbox <command>`
+- `devvm <command>`
   Run one of the commands below against the selected workspace/config/hostname.
 
 The commands are similar to those of **Docker Compose**.
 ```
-Usage: agentsandbox [OPTIONS] [COMMAND]
+Usage: devvm [OPTIONS] [COMMAND]
 
 Commands:
   version         Show version
   doctor          Show diagnostics
-  init            Create `.agentsandbox/` and write the initial template files
+  init            Create `.devvm/` and write the initial template files
   build           Build the guest system
   up              Rebuild and start a VM; if already running, build and switch
   down            Tear down the VM gracefully
@@ -68,7 +68,7 @@ Commands:
   help            Print this message or the help of the given subcommand(s)
 
 Options:
-  -g, --global                       Use only global config (`$XDG_CONFIG_HOME/agentsandbox`) and skip local upward search
+  -g, --global                       Use only global config (`$XDG_CONFIG_HOME/devvm`) and skip local upward search
   -p, --project-name <PROJECT_NAME>  Select project name. Combined with hostname to form the instance name
   -n, --hostname <HOSTNAME>          Select sandbox hostname (build target and instance identity input) [default: default]
   -w, --workspace <WORKSPACE>        Resolve the active workspace and config as if running from this directory
@@ -79,19 +79,19 @@ Options:
 ## Quick Start
 ```bash
 # 1) Initialize local config in current workspace
-agentsandbox init
+devvm init
 # 2) Build and start VM (attaches if startup succeeds)
-agentsandbox up
+devvm up
 # 3) Open guest shell (user)
-agentsandbox ssh
+devvm ssh
 # 4) Run command as root in guest
-agentsandbox exec -- uname -a
+devvm exec -- uname -a
 # 5) Stop VM gracefully
-agentsandbox down
+devvm down
 ```
 For global (project-less) usage, initialize once with:
 ```bash
-agentsandbox --global init
+devvm --global init
 ```
 
 ## Development
@@ -129,12 +129,12 @@ In our experiments, *gVisor* could not run *SystemD* as PID 1 because it lacks t
 - Host-side state lives only under `XDG_CONFIG_HOME`, `XDG_DATA_HOME`,
   `XDG_STATE_HOME`, and `XDG_RUNTIME_DIR`. `XDG_CACHE_HOME` is not used.
 - `instance-id` and libvirt domain name are `<project-name>[<hostname>]`.
-  `project-name` defaults to the workspace basename locally and `agentsandbox`
+  `project-name` defaults to the workspace basename locally and `devvm`
   globally. The guest machine-id and libvirt UUID are derived from this ID.
 - No extra `current-system` link or host-state metadata JSON is kept.
 - Place `sysroot/` next to `persistent/`.
-- Launcher policy is read from `agentsandbox.toml` and optional
-  `agentsandbox.local.toml`. The local file and hostname sections override base
+- Launcher policy is read from `devvm.toml` and optional
+  `devvm.local.toml`. The local file and hostname sections override base
   policy.
 - Generic HTTP filter DSL, `filter-default`, `block-domain`, HTTP ask mode,
   `proxy filter generate`, and CIDR cache are not part of the design.
@@ -154,28 +154,28 @@ In our experiments, *gVisor* could not run *SystemD* as PID 1 because it lacks t
 
 ## Configuration resolution
 
-- The local config search target is the first `.agentsandbox/` directory or
-  directory containing `agentsandbox.toml` or `agentsandbox.local.toml` found
+- The local config search target is the first `.devvm/` directory or
+  directory containing `devvm.toml` or `devvm.local.toml` found
   while walking upward from the workspace.
 - If no local config is found, use
-  `$XDG_CONFIG_HOME/agentsandbox/<project-name>`.
-- `agentsandbox init` creates `.agentsandbox/` in the current directory and
-  writes the Nix files, `agentsandbox.toml`, and runtime module files.
-- `agentsandbox init --global` writes the same files to
-  `$XDG_CONFIG_HOME/agentsandbox/<project-name>`.
+  `$XDG_CONFIG_HOME/devvm/<project-name>`.
+- `devvm init` creates `.devvm/` in the current directory and
+  writes the Nix files, `devvm.toml`, and runtime module files.
+- `devvm init --global` writes the same files to
+  `$XDG_CONFIG_HOME/devvm/<project-name>`.
 - The active config dir is treated as unique across the launcher and is used as
   the TOML edit target and flake build target.
 
 ## Flake contract
 
-- The active config dir is either local `.agentsandbox` or
-  `$XDG_CONFIG_HOME/agentsandbox/<project-name>`.
+- The active config dir is either local `.devvm` or
+  `$XDG_CONFIG_HOME/devvm/<project-name>`.
 - `nixosConfigurations.<hostname>` is the guest build contract.
 - The launcher uses
   `nixosConfigurations.<hostname>.config.system.build.toplevel` as the build
   output and boot source.
-- Runtime settings are merged from `agentsandbox.toml`,
-  `agentsandbox.local.toml`, and their selected `[hosts.<hostname>]` sections.
+- Runtime settings are merged from `devvm.toml`,
+  `devvm.local.toml`, and their selected `[hosts.<hostname>]` sections.
 - The launcher builds the dynamic mount set from the merged `mounts` table.
 
 ## Instance layout
@@ -183,24 +183,24 @@ In our experiments, *gVisor* could not run *SystemD* as PID 1 because it lacks t
 - Split host state per instance as follows.
 
 ```text
-$XDG_CONFIG_HOME/agentsandbox/<project-name>/
+$XDG_CONFIG_HOME/devvm/<project-name>/
   flake.nix
   configuration.nix
-  agentsandbox.toml
-  agentsandbox.local.toml  # optional
+  devvm.toml
+  devvm.local.toml  # optional
 
-$XDG_DATA_HOME/agentsandbox/<instance-id>/
+$XDG_DATA_HOME/devvm/<instance-id>/
   sysroot/
   persistent/
 
-$XDG_STATE_HOME/agentsandbox/<instance-id>/
+$XDG_STATE_HOME/devvm/<instance-id>/
   logs/
     runtime.log
     requests.jsonl
     runtime-*.log.zst
     requests-*.jsonl.zst
 
-$XDG_RUNTIME_DIR/agentsandbox/<instance-id>/
+$XDG_RUNTIME_DIR/devvm/<instance-id>/
   lock
   ... runtime pid/socket files for helpers and sidecars
 ```
@@ -218,8 +218,8 @@ $XDG_RUNTIME_DIR/agentsandbox/<instance-id>/
 
 ## Build flow
 
-- The launcher resolves active config dir (`.agentsandbox` upward search, else
-  `$XDG_CONFIG_HOME/agentsandbox/<project-name>`) and selected `hostname`.
+- The launcher resolves active config dir (`.devvm` upward search, else
+  `$XDG_CONFIG_HOME/devvm/<project-name>`) and selected `hostname`.
 - The launcher resolves `instance-id` and instance paths under XDG roots.
 - The launcher creates instance directories:
   - data: `sysroot/`, `persistent/`
@@ -270,13 +270,13 @@ $XDG_RUNTIME_DIR/agentsandbox/<instance-id>/
 - Mount contract:
   - Read the effective TOML `mounts` table.
   - Relative host paths are resolved from `workspace`.
-  - `mount`/`unmount` edits `agentsandbox.local.toml`; runtime reload is
+  - `mount`/`unmount` edits `devvm.local.toml`; runtime reload is
     signaled by `HUP` to the supervisor pid.
 - Policy file protection:
-  - Every recursively discovered `agentsandbox.toml` and
-    `agentsandbox.local.toml` in guest-visible workspace/config trees is
+  - Every recursively discovered `devvm.toml` and
+    `devvm.local.toml` in guest-visible workspace/config trees is
     mounted read-only. Hard-linked policy files are rejected.
-- Audit command contract (`agentsandbox audit`):
+- Audit command contract (`devvm audit`):
   - Resolve active flake dir and instance with the same path as other instance-scoped commands.
   - Execute host `vulnix` directly (no guest-side wrapper execution).
   - Prepend fixed arguments `-g <instance-sysroot>` so scan scope is the instance store root.
@@ -319,7 +319,7 @@ $XDG_RUNTIME_DIR/agentsandbox/<instance-id>/
   `/usr/local/share/ca-certificates`, into
   `/etc/ssl/certs/ca-certificates.crt`.
 - The selected bundle is exported read-only as `/persistent/host-ca.crt`, and
-  the launcher adds `agentsandbox.use-host-certs` to the guest kernel command
+  the launcher adds `devvm.use-host-certs` to the guest kernel command
   line. If no bundle is found, VM startup fails before the domain is created.
 - NixOS exposes `/etc/ssl/certs/ca-certificates.crt` as a symlink into the Nix
   store. A systemd mount unit cannot use that non-canonical path, so a
@@ -333,13 +333,13 @@ $XDG_RUNTIME_DIR/agentsandbox/<instance-id>/
 
 ## Mount export
 
-- The startup workspace root is the directory containing `.agentsandbox` when
+- The startup workspace root is the directory containing `.devvm` when
   local config exists, and the startup `cwd` for project-less execution.
 - The effective TOML `mounts` table maps guest-relative names to host sources
   and a `readonly` flag.
 - `init` adds the startup workspace mount under its basename.
 - `mount` and `unmount` persist hostname-specific overrides in
-  `agentsandbox.local.toml`.
+  `devvm.local.toml`.
 - The launcher starts a helper in a private host mount namespace and builds a
   synthetic tree under the exported `persistent/workspace` root.
 - TOML policy files in the startup workspace are over-mounted read-only.

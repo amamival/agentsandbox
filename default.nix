@@ -9,8 +9,8 @@
 ,
 }:
 rustPlatform.buildRustPackage rec {
-  pname = "agentsandbox";
-  version = "0.2.0";
+  pname = "devvm";
+  version = "0.3.0";
 
   src = fetchFromGitHub {
     owner = "YOUR_GITHUB_OWNER";
@@ -21,14 +21,14 @@ rustPlatform.buildRustPackage rec {
 
   cargoHash = lib.fakeHash;
   nativeBuildInputs = [ makeWrapper ];
-  postInstall = "install -D man/agentsandbox.1 $out/share/man/man1/agentsandbox.1";
+  postInstall = "install -D man/devvm.1 $out/share/man/man1/devvm.1";
   postFixup = ''
     wrapProgram "$out/bin/${pname}" \
       --prefix PATH : ${lib.makeBinPath [ libvirt openssh util-linux virtiofsd ]}
   '';
   meta = with lib; {
     description = "Manage isolated NixOS VM sandboxes for agentic workflows";
-    homepage = "https://github.com/YOUR_GITHUB_OWNER/agentsandbox";
+    homepage = "https://github.com/YOUR_GITHUB_OWNER/devvm";
     license = lib.licenses.mit;
     mainProgram = pname;
     maintainers = with lib.maintainers; [ ownername ];

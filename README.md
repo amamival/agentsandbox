@@ -18,7 +18,7 @@ This is not yet a polished runtime. It remains an experimental launcher under he
 
 The target host platform is recent `amd64` Linux in general, not just NixOS. If this does not run on a reasonably current Linux machine, that should be treated as a bug rather than an unsupported edge case.
 
-The `devvm` command handles sysroot bootstrap, system builds, libvirt startup, attach, and mounts.
+The `devvm` command handles instance bootstrap, guest builds, libvirt startup, attach, and mounts.
 
 ## Installation
 
@@ -109,7 +109,7 @@ by default; pass `--write-lock` to allow an update.
 
 Set `vm.useHostCerts = true` to mount the detected host CA bundle over the guest's default CA bundle on its next start.
 
-The domain policy is stored in TOML but is not enforced in v0.2. MITM proxy,
+The domain policy is stored in TOML but is not enforced in v0.3. MITM proxy,
 allowlist enforcement, and proxy logs remain unimplemented.
 
 ## Development

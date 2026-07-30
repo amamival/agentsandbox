@@ -66,7 +66,7 @@ Connection timed out during banner exchange
 Connection timed out during banner exchange
 building the system configuration...
 Done. The new configuration is /nix/store/<hash>-nixos-system-devvm-26.05.<revision>
-/home/user/.local/share/devvm/test[default]/sysroot/nix/store/<hash>-nixos-system-devvm-26.05.<revision>
+/home/user/.local/share/devvm/test[default]/system/nix/store/<hash>-nixos-system-devvm-26.05.<revision>
 Domain 'test[default]' destroyed
 ```
 
@@ -100,10 +100,10 @@ Domain 'test[default]' destroyed
   - Create two host directories, for example `alpha/` and `beta/` with `mkdir -p alpha beta; touch alpha/A beta/B`
   - Run `devvm mount ./alpha` while the VM is down
   - Run `devvm up`
-  - Run `devvm ssh l /persistent/workspace` and verify that the guest sees the `alpha` directory as regular user
+  - Run `devvm ssh l /persistent/home/workspace` and verify that the guest sees the `alpha` directory as regular user
   - Verify that the initial workspace mount is visible in the guest under the workspace basename.
   - Run `devvm mount ./beta sandbox-beta` while the VM is running
-  - Run `devvm ssh l /persistent/workspace` and verify that the guest sees the `beta` directory
+  - Run `devvm ssh l /persistent/home/workspace` and verify that the guest sees the `beta` directory
   - Verify that `.devvm/devvm.local.toml` contains the `alpha` and `sandbox-beta` mount entries
   - Run `devvm unmount ./alpha`
   - Verify that the `alpha` entry is removed from the effective TOML config and the guest no longer sees it
@@ -137,13 +137,13 @@ Domain 'test[default]' destroyed
   - Run `devvm doctor` to see `CmdVulnixPathForAuditCmd` is available
   - Run `devvm audit -- --version` and verify that the output contains `vulnix <version>`
   - Run `devvm audit` and verify that the output contains hundreds of CVE vulnerabilities, and
-    the output contains pathes under `InstanceSysrootDir`
+    the output contains paths under `InstanceSystemDir`
 
 11. Validate destroy semantics
-   - Run `devvm doctor` to see `InstanceSysrootDir`, `InstancePersistentDir`, `InstanceStateDir`, `InstanceLogsDir`
-   - Run `devvm destroy` and verify that the `InstanceSysrootDir`, `InstancePersistentDir`, `InstanceLogsDir` remain
-   - Run `devvm destroy -s` and verify that only the `InstanceSysrootDir` is removed
-   - Run `devvm destroy -d` and verify that only the `InstancePersistentDir` is removed
+   - Run `devvm doctor` to see `InstanceRootfsDir`, `InstanceSystemDir`, `InstanceUserDir`, `InstanceStateDir`, `InstanceLogsDir`
+   - Run `devvm destroy` and verify that the `InstanceRootfsDir`, `InstanceSystemDir`, `InstanceUserDir`, `InstanceLogsDir` remain
+   - Run `devvm destroy -s` and verify that `InstanceRootfsDir` and `InstanceSystemDir` are removed
+   - Run `devvm destroy -d` and verify that only the `InstanceUserDir` is removed
    - Run `devvm destroy -sd` and verify that only the `InstanceDataDir` is removed
    - Run `devvm destroy -l` and verify that only the `InstanceStateDir` is removed
    - Run `devvm destroy -c` and verify that only the `ResolvedFlakeDir` is removed
@@ -160,7 +160,7 @@ Domain 'test[default]' destroyed
   - Run `devvm unallow-domain '*.example.com'`.
   - Run `devvm unallow-domain '*'`.
   - Verify that the effective TOML policy no longer enables these entries.
-  - This validates persistence only; v0.2 does not enforce the domain policy on network traffic.
+  - This validates persistence only; v0.3 does not enforce the domain policy on network traffic.
 
 13. Validate proxy log handling
   - Append a request record to `logs/requests.jsonl`.

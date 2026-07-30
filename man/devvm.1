@@ -109,10 +109,10 @@ Delete selected host-side instance data. No flags means no file deletion.
 .RS
 .TP
 .B -s, --system
-Remove sysroot.
+Remove bootstrap rootfs and system data.
 .TP
 .B -d, --data
-Remove persistent data.
+Remove user data.
 .TP
 .B -l, --logs
 Remove state directory (including logs).
@@ -210,7 +210,7 @@ store root.
 2) If guest is running, runs guest
 \fBnixos-rebuild build --repair --flake /persistent/etc/nixos#<hostname>\fR.
 .SS audit
-Run the patched host \fBvulnix\fR against the instance sysroot. Arguments after
+Run the patched host \fBvulnix\fR against the instance system tree. Arguments after
 \fB--\fR are passed to vulnix.
 .TP
 .BI "devvm audit -- " [vulnix-options]
@@ -218,7 +218,7 @@ Run the patched host \fBvulnix\fR against the instance sysroot. Arguments after
 .TP
 Domain policy
 \fBallow-domain\fR and \fBunallow-domain\fR persist TOML policy only. Network
-allowlist enforcement, MITM proxying, and proxy logs are not implemented in v0.2.
+allowlist enforcement, MITM proxying, and proxy logs are not implemented in v0.3.
 .TP
 SSH attach prerequisites
 \fBssh\fR/\fBexec\fR require guest \fBtcp/22\fR to be covered by resolved

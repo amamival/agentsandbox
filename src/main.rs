@@ -6,12 +6,12 @@ use pathdiff::diff_paths;
 use reqwest::{blocking::Client, header};
 use rustix::{
     fs::CWD,
-    io::{Errno, FdFlags, fcntl_setfd, read, write},
+    io::{FdFlags, fcntl_setfd, read, write},
     mount::{MountFlags, MountPropagationFlags, MoveMountFlags, OpenTreeFlags, UnmountFlags},
     mount::{mount, mount_bind_recursive, mount_change, move_mount, open_tree, unmount},
     pipe::{PipeFlags, pipe_with},
     process::{Pid, Signal, WaitOptions, chdir, getgid, getuid, kill_process, pivot_root, setsid, waitpid},
-    runtime::{Fork, How, KernelSigSet, Timespec, exit_group, kernel_fork, kernel_sigprocmask, kernel_sigtimedwait},
+    runtime::{Fork, exit_group, kernel_fork},
     thread::{UnshareFlags, unshare_unsafe},
 };
 use serde::{Deserialize, Serialize};
@@ -21,8 +21,8 @@ use std::{
     collections::BTreeMap,
     env,
     ffi::OsString,
-    fs,
-    io::{IsTerminal as _, Read as _, Write as _},
+    fs::{self, OpenOptions},
+    io::{BufRead as _, BufReader, IsTerminal as _, Read as _, Write as _},
     net::IpAddr,
     os::fd::AsRawFd,
     os::unix::net::{UnixListener, UnixStream},
@@ -115,10 +115,10 @@ enum Command {
     /// For the non-project instance, use `--global`
     #[command(alias = "destory")]
     Destroy {
-        /// Remove sysroot
+        /// Remove bootstrap rootfs and system data
         #[arg(short = 's', long)]
         system: bool,
-        /// Remove persistent data; with --system, remove the whole data dir
+        /// Remove user data; with --system, remove the whole data dir
         #[arg(short = 'd', long)]
         data: bool,
         /// Remove the instance states such as logs
@@ -269,8 +269,9 @@ struct Instance {
     data_dir: PathBuf,
     state_dir: PathBuf,
     runtime_dir: PathBuf,
-    sysroot: PathBuf,
-    persistent: PathBuf,
+    rootfs: PathBuf,
+    system: PathBuf,
+    user: PathBuf,
     logs_dir: PathBuf,
 }
 
@@ -455,8 +456,9 @@ fn run_doctor(env: &Env) -> anyhow::Result<()> {
             println!("InstanceId:\t\t\t{}", instance.id);
             println!("InstanceIsGlobal:\t\t{}", instance.is_global);
             println!("InstanceDataDir:\t\t{}", instance.data_dir.display());
-            println!("InstanceSysrootDir:\t\t{}", instance.sysroot.display());
-            println!("InstancePersistentDir:\t\t{}", instance.persistent.display());
+            println!("InstanceRootfsDir:\t\t{}", instance.rootfs.display());
+            println!("InstanceSystemDir:\t\t{}", instance.system.display());
+            println!("InstanceUserDir:\t\t{}", instance.user.display());
             println!("InstanceStateDir:\t\t{}", instance.state_dir.display());
             println!("InstanceLogsDir:\t\t{}", instance.logs_dir.display());
             println!("InstanceRuntimeDir:\t\t{}", instance.runtime_dir.display());
@@ -519,8 +521,9 @@ fn resolve_instance(env: &Env) -> anyhow::Result<Instance> {
         id,
         is_global: flake_dir == env.config_root.join(&env.project_name),
         flake_dir,
-        sysroot: data_dir.join("sysroot"),
-        persistent: data_dir.join("persistent"),
+        rootfs: data_dir.join("rootfs"),
+        system: data_dir.join("system"),
+        user: data_dir.join("user"),
         logs_dir: state_dir.join("logs"),
         data_dir,
         state_dir,
@@ -726,8 +729,8 @@ fn render_domain_xml(env: &Env, instance: &Instance, system_profile: &Path, is_b
     );
     let kernel_target = fs::read_link(system_profile.join("kernel")).context("read_link($profile/kernel)")?;
     let initrd_target = fs::read_link(system_profile.join("initrd")).context("read_link($profile/initrd)")?;
-    let kernel = instance.sysroot.join(kernel_target.strip_prefix("/").context("get kernel image path")?);
-    let initrd = instance.sysroot.join(initrd_target.strip_prefix("/").context("get initrd image path")?);
+    let kernel = instance.system.join(kernel_target.strip_prefix("/").context("get kernel image path")?);
+    let initrd = instance.system.join(initrd_target.strip_prefix("/").context("get initrd image path")?);
     let kernel_params = fs::read_to_string(system_profile.join("kernel-params")).context("read kernel-params")?;
     let build_unit = if is_build { " systemd.unit=devvm-build.target" } else { "" };
     let nested = if env.is_nested { " devvm.nested" } else { "" };
@@ -767,17 +770,20 @@ fn render_domain_xml(env: &Env, instance: &Instance, system_profile: &Path, is_b
                 && element
                     .find("target")
                     .and_then(|target| target.get_attr("dir"))
-                    .is_some_and(|dir| dir == "nix" || dir == "persistent"))
+                    .is_some_and(|dir| dir == "rootfs" || dir == "system" || dir == "user"))
     });
     // TODO: Remove this. Host must set up the emulator.
     //if devices.find("emulator").is_none() {
     //    devices.append_new_child("emulator").set_text(resolve_cmd_path("qemu-system-x86_64"));
     //}
 
-    let nix_filesystem = devices.append_new_child("filesystem");
-    nix_filesystem.set_attr("type", "mount").append_new_child("driver").set_attr("type", "virtiofs");
+    let system_filesystem = devices.append_new_child("filesystem");
+    system_filesystem
+        .set_attr("type", "mount")
+        .append_new_child("driver")
+        .set_attr("type", "virtiofs");
     // queue='1024' omitted; libvirt/QEMU default is sufficient unless profiling says otherwise.
-    let binary = nix_filesystem.append_new_child("binary");
+    let binary = system_filesystem.append_new_child("binary");
     // https://discourse.nixos.org/t/virt-manager-cannot-find-virtiofsd/26752
     // TODO: Remove this. Host must set up the virtiofsd.
     //binary.set_attr("path", resolve_cmd_path("virtiofsd"));
@@ -787,11 +793,11 @@ fn render_domain_xml(env: &Env, instance: &Instance, system_profile: &Path, is_b
     // https://virtio-fs.gitlab.io/virtiofsd/doc/virtiofsd/fuse/struct.FsOptions.html
     binary.append_new_child("sandbox").set_attr("mode", "namespace");
     binary.append_new_child("thread_pool").set_attr("size", "0");
-    nix_filesystem
+    system_filesystem
         .append_new_child("source")
-        .set_attr("dir", instance.sysroot.join("nix").display().to_string());
-    nix_filesystem.append_new_child("target").set_attr("dir", "nix");
-    let idmap = nix_filesystem.append_new_child("idmap");
+        .set_attr("dir", instance.system.display().to_string());
+    system_filesystem.append_new_child("target").set_attr("dir", "system");
+    let idmap = system_filesystem.append_new_child("idmap");
     for (element_name, map) in [
         ("uid", capture_host_idmap("/proc/self/uid_map", true)?),
         ("gid", capture_host_idmap("/proc/self/gid_map", true)?),
@@ -808,16 +814,16 @@ fn render_domain_xml(env: &Env, instance: &Instance, system_profile: &Path, is_b
         }
     }
 
-    let persistent_filesystem = devices.append_new_child("filesystem");
-    persistent_filesystem
+    let user_filesystem = devices.append_new_child("filesystem");
+    user_filesystem
         .set_attr("type", "mount")
         .append_new_child("driver")
         .set_attr("type", "virtiofs");
-    // queue='1024' omitted; see nix filesystem above.
-    persistent_filesystem
+    // queue='1024' omitted; see system filesystem above.
+    user_filesystem
         .append_new_child("source")
-        .set_attr("socket", instance.runtime_dir.join("pv.sock").display().to_string());
-    persistent_filesystem.append_new_child("target").set_attr("dir", "persistent");
+        .set_attr("socket", instance.runtime_dir.join("user.sock").display().to_string());
+    user_filesystem.append_new_child("target").set_attr("dir", "user");
 
     let interface = devices.append_new_child("interface");
     interface.set_attr("type", "user");
@@ -890,29 +896,29 @@ fn write_template_config(target: &Path, workspace: &Path, force: bool) -> anyhow
 fn run_build_or_up(env: &Env, bootstrap: bool, is_up: bool, attach: bool, mut write_lock: bool) -> anyhow::Result<()> {
     let is_switch = is_up;
     let instance = resolve_instance(env)?;
-    // Prepare the minimal instance directories before sysroot build, virtiofsd, or log writers touch them.
-    for dir in [&instance.sysroot, &instance.persistent, &instance.logs_dir, &instance.runtime_dir] {
+    // Prepare the minimal instance directories before bootstrap, virtiofsd, or log writers touch them.
+    for dir in [&instance.rootfs, &instance.system, &instance.user, &instance.logs_dir, &instance.runtime_dir] {
         fs::create_dir_all(dir).context("prepare instance directories")?;
     }
-    if !instance.sysroot.join("nix/var/nix/profiles/default").is_symlink() {
-        fetch_nix_dockerhub(&instance.sysroot).context("fetch")?;
+    if !instance.system.join("nix/var/nix/profiles/default").is_symlink() {
+        if instance.system.join("nix").exists() {
+            bail!("system Nix store exists without a default profile; destroy --system and retry");
+        }
+        if !instance.rootfs.join("nix/var/nix/profiles/default").is_symlink() {
+            fetch_nix_dockerhub(&instance.rootfs).context("fetch")?;
+        }
+        fs::rename(instance.rootfs.join("nix"), instance.system.join("nix")).context("move bootstrap Nix store into system data")?;
     }
-    if bootstrap || !instance.sysroot.join("nix/var/nix/profiles/system").is_symlink() {
-        install_initial_nixos_profile(&env.workspace, &instance.sysroot, "default", env.is_nested)?;
+    fs::create_dir_all(instance.rootfs.join("nix")).context("prepare bootstrap Nix mountpoint")?;
+    if bootstrap || !instance.system.join("nix/var/nix/profiles/system").is_symlink() {
+        install_initial_nixos_profile(&env.workspace, &instance.rootfs, &instance.system, "default", env.is_nested)?;
     }
     // Provide a minimum writable flake.lock for the initial build.
     if !instance.flake_dir.join("flake.lock").exists() {
         fs::write(instance.flake_dir.join("flake.lock"), r#"{"root":"","version":7}"#).context("write flake.lock")?;
         write_lock = true;
     }
-    let flake = format!("/persistent/etc/nixos#{}", env.hostname);
-    let rebuild = |action| {
-        let args = ["nixos-rebuild", action, "--flake", flake.as_str()]
-            .into_iter()
-            .chain((!write_lock).then_some("--no-write-lock-file"))
-            .collect::<Vec<_>>();
-        run_ssh(env, &args, true, true)
-    };
+    let rebuild = |action| rebuild_guest(env, &instance, action, write_lock);
     let domstate = domstate(&instance.id)?;
     match domstate.as_str() {
         "down" | "shut off" | "crashed" => {
@@ -922,12 +928,14 @@ fn run_build_or_up(env: &Env, bootstrap: bool, is_up: bool, attach: bool, mut wr
             println!("{}", new_profile.display());
             if !is_up {
                 virsh(&["destroy", &instance.id]).context("return to down")?;
+                stop_supervisor(&instance)?;
             } else {
                 let domain_xml_path = instance.runtime_dir.join("domain.xml");
                 let old_xml = fs::read_to_string(&domain_xml_path).unwrap_or_default();
                 let (new_xml, forwards) = render_domain_xml(env, &instance, &new_profile, false)?;
                 if old_xml != new_xml {
                     virsh(&["destroy", &instance.id]).context("restart")?;
+                    stop_supervisor(&instance)?;
                     start_vm(env, &instance, false).context("restart")?;
                 } else {
                     fs::write(&domain_xml_path, new_xml).context("write normalized runtime domain xml")?;
@@ -954,8 +962,19 @@ fn run_build_or_up(env: &Env, bootstrap: bool, is_up: bool, attach: bool, mut wr
     Ok(())
 }
 
+fn rebuild_guest(env: &Env, instance: &Instance, action: &str, write_lock: bool) -> anyhow::Result<()> {
+    let flake = format!("{}#{}", supervisor_command(instance, "BuildOn")?, env.hostname);
+    let args = ["nixos-rebuild", action, "--flake", flake.as_str()]
+        .into_iter()
+        .chain((!write_lock).then_some("--no-write-lock-file"))
+        .collect::<Vec<_>>();
+    let rebuild = run_ssh(env, &args, true, true);
+    let build_off = supervisor_command(instance, "BuildOff").map(|_| ());
+    rebuild.and(build_off)
+}
+
 #[inline(never)]
-fn fetch_nix_dockerhub(sysroot: &Path) -> anyhow::Result<()> {
+fn fetch_nix_dockerhub(rootfs: &Path) -> anyhow::Result<()> {
     let repo = "nixos/nix";
     let registry = "https://registry-1.docker.io/v2";
     eprintln!("fetch: requesting docker auth token for {repo}");
@@ -980,12 +999,12 @@ fn fetch_nix_dockerhub(sysroot: &Path) -> anyhow::Result<()> {
     let manifest = client.get(format!("{registry}/{repo}/manifests/{digest}")).header(header::AUTHORIZATION, &auth);
     let manifest = manifest.send()?.error_for_status()?.json::<Value>()?;
     let layers = manifest["layers"].as_array().context("docker layers missing")?;
-    eprintln!("fetch: extracting {} layers into {}", layers.len(), sysroot.display());
+    eprintln!("fetch: extracting {} layers into {}", layers.len(), rootfs.display());
     for (index, blob) in layers.iter().filter_map(|layer| layer["digest"].as_str()).enumerate() {
         eprintln!("fetch: layer {}/{} {}", index + 1, layers.len(), blob);
         let response = client.get(format!("{registry}/{repo}/blobs/{blob}")).header(header::AUTHORIZATION, &auth);
         let response = response.send()?.error_for_status()?;
-        tar::Archive::new(GzDecoder::new(response)).unpack(sysroot)?;
+        tar::Archive::new(GzDecoder::new(response)).unpack(rootfs)?;
     }
     eprintln!("fetch: completed docker image extraction");
     Ok(())
@@ -993,67 +1012,69 @@ fn fetch_nix_dockerhub(sysroot: &Path) -> anyhow::Result<()> {
 
 // The initial profile is assumed safe, so building it in a simple container is acceptable.
 #[inline(never)]
-fn install_initial_nixos_profile(workspace: &Path, sysroot: &Path, hostname: &str, nested: bool) -> anyhow::Result<()> {
-    let config_target = sysroot.join("etc/nixos");
+fn install_initial_nixos_profile(workspace: &Path, rootfs: &Path, system: &Path, hostname: &str, nested: bool) -> anyhow::Result<()> {
+    let config_target = rootfs.join("etc/nixos");
     eprintln!("install: writing template config into {}", config_target.display());
     write_template_config(&config_target, workspace, true)?;
 
     // Remove previous out-link so `nix build --out-link /nix/var/nix/profiles/system` can overwrite it.
-    let _ = fs::remove_file(sysroot.join("nix/var/nix/profiles/system"));
+    let _ = fs::remove_file(system.join("nix/var/nix/profiles/system"));
     spawn_mapped_namespace(true, true, || {
         (|| -> anyhow::Result<()> {
             // Prepare new file system hierarchy.
             let oldroot = Path::new("/");
-            eprintln!("install: creating mountpoint dir sysroot/dev");
-            fs::create_dir_all(sysroot.join("dev"))?;
-            eprintln!("install: mounting tmpfs to sysroot/dev");
-            mount("tmpfs", sysroot.join("dev"), "tmpfs", MountFlags::NODEV | MountFlags::NOSUID, c"mode=0755")?;
+            eprintln!("install: binding system/nix to rootfs/nix");
+            mount_bind_recursive(system.join("nix"), rootfs.join("nix"))?;
+            eprintln!("install: creating mountpoint dir rootfs/dev");
+            fs::create_dir_all(rootfs.join("dev"))?;
+            eprintln!("install: mounting tmpfs to rootfs/dev");
+            mount("tmpfs", rootfs.join("dev"), "tmpfs", MountFlags::NODEV | MountFlags::NOSUID, c"mode=0755")?;
             for dir in ["dev/shm", "dev/pts", "proc", "tmp"] {
-                eprintln!("install: creating mountpoint dir sysroot/{dir}");
-                fs::create_dir_all(sysroot.join(dir))?;
+                eprintln!("install: creating mountpoint dir rootfs/{dir}");
+                fs::create_dir_all(rootfs.join(dir))?;
             }
             // Python's _multiprocessing.SemLock expects a writable 1777 /dev/shm.
-            eprintln!("install: mounting tmpfs to sysroot/dev/shm");
+            eprintln!("install: mounting tmpfs to rootfs/dev/shm");
             let shm_opts = c"mode=01777";
-            mount("tmpfs", sysroot.join("dev/shm"), "tmpfs", MountFlags::NODEV | MountFlags::NOSUID, shm_opts)?;
-            eprintln!("install: mounting devpts to sysroot/dev/pts");
+            mount("tmpfs", rootfs.join("dev/shm"), "tmpfs", MountFlags::NODEV | MountFlags::NOSUID, shm_opts)?;
+            eprintln!("install: mounting devpts to rootfs/dev/pts");
             let opts = c"newinstance,ptmxmode=0666,mode=620";
-            mount("devpts", sysroot.join("dev/pts"), "devpts", MountFlags::NOSUID | MountFlags::NOEXEC, opts)?;
-            eprintln!("install: binding host /proc to sysroot/proc");
-            mount_bind_recursive(oldroot.join("proc"), sysroot.join("proc"))?;
+            mount("devpts", rootfs.join("dev/pts"), "devpts", MountFlags::NOSUID | MountFlags::NOEXEC, opts)?;
+            eprintln!("install: binding host /proc to rootfs/proc");
+            mount_bind_recursive(oldroot.join("proc"), rootfs.join("proc"))?;
             // Bind host devices etc to new root's /dev.
             for file in ["dev/null", "dev/zero", "dev/full", "dev/random", "dev/urandom", "dev/tty"] {
-                eprintln!("install: touching sysroot/{file} and binding host /{file}");
-                fs::write(sysroot.join(file), "")?;
-                mount_bind_recursive(oldroot.join(file), sysroot.join(file))?;
+                eprintln!("install: touching rootfs/{file} and binding host /{file}");
+                fs::write(rootfs.join(file), "")?;
+                mount_bind_recursive(oldroot.join(file), rootfs.join(file))?;
             }
             eprintln!("install: touching and binding host /etc/resolv.conf read-only");
-            fs::write(sysroot.join("etc/resolv.conf"), "")?;
+            fs::write(rootfs.join("etc/resolv.conf"), "")?;
             let flags = MountFlags::BIND | MountFlags::REC | MountFlags::RDONLY;
-            mount(oldroot.join("etc/resolv.conf"), sysroot.join("etc/resolv.conf"), "", flags, c"")?;
+            mount(oldroot.join("etc/resolv.conf"), rootfs.join("etc/resolv.conf"), "", flags, c"")?;
             eprintln!("install: creating symlinks for /dev/{{stdin,stdout,stderr,fd,core,ptmx}}");
             for (fd, file) in [(0, "dev/stdin"), (1, "dev/stdout"), (2, "dev/stderr")] {
-                symlink(format!("/proc/self/fd/{fd}"), sysroot.join(file))?;
+                symlink(format!("/proc/self/fd/{fd}"), rootfs.join(file))?;
             }
-            symlink("/proc/self/fd", sysroot.join("dev/fd"))?;
-            symlink("/proc/kcore", sysroot.join("dev/core"))?;
-            symlink("pts/ptmx", sysroot.join("dev/ptmx"))?;
+            symlink("/proc/self/fd", rootfs.join("dev/fd"))?;
+            symlink("/proc/kcore", rootfs.join("dev/core"))?;
+            symlink("pts/ptmx", rootfs.join("dev/ptmx"))?;
 
-            eprintln!("install: pivoting root: / => (sysroot)/tmp, sysroot => /");
-            // pivot_root() new_root must be a mountpoint. Bind sysroot to itself.
-            mount_bind_recursive(sysroot, sysroot)?;
-            // Pivot root: / => (sysroot)/tmp, sysroot => /.
-            pivot_root(sysroot, sysroot.join("tmp"))?;
+            eprintln!("install: pivoting root: / => (rootfs)/tmp, rootfs => /");
+            // pivot_root() new_root must be a mountpoint. Bind rootfs to itself.
+            mount_bind_recursive(rootfs, rootfs)?;
+            // Pivot root: / => (rootfs)/tmp, rootfs => /.
+            pivot_root(rootfs, rootfs.join("tmp"))?;
             eprintln!("install: detaching host / (currently pivoted to /tmp)");
             unmount("/tmp", UnmountFlags::DETACH)?; // Unmount old root.
-            eprintln!("install: cd to the brand new root / (sysroot)");
+            eprintln!("install: cd to the brand new root / (rootfs)");
             chdir("/")?;
             // Bootstrap may run in two topologies:
             //
-            // - On the real host, this sysroot is normally on a local filesystem. The kernel
+            // - On the real host, this rootfs is normally on a local filesystem. The kernel
             //   sees both the install user namespace and the backing inodes, so install-ns root
             //   can use CAP_DAC_OVERRIDE for Nix's builder-owned scratch dirs.
-            // - In a nested DevVM, this same sysroot lives under the outer guest's
+            // - In a nested DevVM, this same rootfs lives under the outer guest's
             //   /persistent, which is virtiofs backed by the outer host. At this point the inner
             //   VM has not started yet; the virtiofs boundary involved here is the already-mounted
             //   outer /persistent, not this invocation's future /persistent device.
@@ -1107,14 +1128,18 @@ fn domstate(instance_id: &str) -> anyhow::Result<String> {
     }
 }
 
+fn domain_is_active(instance_id: &str) -> anyhow::Result<bool> {
+    Ok(!matches!(domstate(instance_id)?.as_str(), "down" | "shut off" | "crashed"))
+}
+
 /// Read the NixOS profile to be used to start the VM next time.
 fn read_system_profile(instance: &Instance) -> anyhow::Result<PathBuf> {
-    let mut path = instance.sysroot.join("nix/var/nix/profiles/system");
+    let mut path = instance.system.join("nix/var/nix/profiles/system");
     for _ in 0..16 {
         let target = fs::read_link(&path).context("read system profile symlink")?;
         path = if target.is_absolute() {
             instance
-                .sysroot
+                .system
                 .join(target.strip_prefix("/").context("resolve absolute system profile symlink target")?)
         } else {
             path.parent().context("resolve relative system profile symlink parent")?.join(target)
@@ -1246,245 +1271,415 @@ where
     }
 }
 
+#[derive(Clone)]
+struct MountMapping {
+    source: PathBuf,
+    target: PathBuf,
+    is_dir: bool,
+}
+
 fn start_vm(env: &Env, instance: &Instance, is_build: bool) -> anyhow::Result<PathBuf> {
-    let nested = env.is_nested;
     let system_profile = read_system_profile(instance)?;
-    let pv_socket = instance.runtime_dir.join("pv.sock");
+    let user_socket = instance.runtime_dir.join("user.sock");
+    let control_socket = instance.runtime_dir.join("control.sock");
+    let lock_path = instance.runtime_dir.join("lock");
     let pid_path = instance.runtime_dir.join("devvm.pid");
     let domain_profile = instance.runtime_dir.join("domain-profile");
-    let _ = fs::remove_file(&pv_socket);
-    let _ = fs::remove_file(&pid_path);
-    let _ = fs::remove_file(&domain_profile);
-    let (mut parent_sock, mut child_sock) = UnixStream::pair().context("create supervisor socket pair")?;
-    // if nested {
     let host_uid = getuid().as_raw().to_string();
     let host_gid = getgid().as_raw().to_string();
-    // }
+    let nested = env.is_nested;
+    let (mut parent_sock, mut child_sock) = UnixStream::pair().context("create supervisor startup socket")?;
     let supervisor_pid = spawn_mapped_namespace(false, false, || -> anyhow::Result<()> {
+        let mut daemon = None;
         let result = (|| -> anyhow::Result<()> {
-            if nested {
-                setsid().context("detach virtiofs supervisor session")?;
+            setsid().context("detach supervisor session")?;
+            let lock = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .context("open supervisor lock")?;
+            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == -1 {
+                return Err(std::io::Error::last_os_error()).context("lock instance runtime");
+            }
+            for path in [&user_socket, &control_socket, &pid_path, &domain_profile] {
+                let _ = fs::remove_file(path);
             }
             let downstream_rec = MountPropagationFlags::DOWNSTREAM | MountPropagationFlags::REC;
             mount_change("/", downstream_rec).context("set / mount propagation downstream+rec")?;
-            mount_bind_recursive(&instance.persistent, &instance.persistent).context("self bind persistent dir")?;
-            let shared_rec = MountPropagationFlags::SHARED | MountPropagationFlags::REC;
-            mount_change(&instance.persistent, shared_rec).context("set persistent mount shared+rec")?;
-            apply_mounts(env, instance, &system_profile).context("apply configured mounts")?;
-            fs::write(&pid_path, format!("{}\n", process::id())).context("write pid file")?;
+            mount_bind_recursive(&instance.user, &instance.user).context("self bind user dir")?;
+            mount_change(&instance.user, MountPropagationFlags::SHARED | MountPropagationFlags::REC).context("set user mount shared+rec")?;
 
-            let mut mask = KernelSigSet::empty();
-            mask.insert(Signal::HUP);
-            unsafe { kernel_sigprocmask(How::BLOCK, Some(&mask)) }.context("block HUP signal")?;
+            let mut mounted = Vec::new();
+            let mut build_mounted = Vec::new();
+            let mut build_active = false;
+            apply_user_mounts(env, instance, &mut mounted).context("apply configured mounts")?;
 
-            let listener = UnixListener::bind(&pv_socket).context("bind virtiofs socket")?;
-            fcntl_setfd(&listener, FdFlags::empty()).context("keep virtiofs socket fd across exec")?;
+            let control = UnixListener::bind(&control_socket).context("bind control socket")?;
+            control.set_nonblocking(true).context("set control socket nonblocking")?;
+            let user = UnixListener::bind(&user_socket).context("bind user virtiofs socket")?;
+            fcntl_setfd(&user, FdFlags::empty()).context("keep user virtiofs socket fd across exec")?;
+            fs::write(&pid_path, format!("{}\n", process::id())).context("write supervisor pid")?;
+
             let mut daemon_cmd = process::Command::new("virtiofsd");
             daemon_cmd
-                .args(["--shared-dir", &instance.persistent.display().to_string()])
-                .args(["--fd", &listener.as_raw_fd().to_string()])
-                .args(["--sandbox", "namespace", "--cache", "auto", "--xattr", "--log-level", "error"]);
+                .args(["--shared-dir", &instance.user.display().to_string()])
+                .args(["--fd", &user.as_raw_fd().to_string()])
+                .args(["--sandbox", "namespace", "--cache", "auto", "--xattr", "--log-level", "error"])
+                .uid(0)
+                .gid(0)
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
             if nested {
                 daemon_cmd
                     .args(["--translate-uid", &format!("squash-guest:0:{host_uid}:1")])
                     .args(["--translate-gid", &format!("squash-guest:0:{host_gid}:1")]);
             }
-            let mut daemon = daemon_cmd
-                // Use the supervisor user namespace as the single idmap source.
-                .uid(0)
-                .gid(0)
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .context("spawn virtiofsd")?;
-            drop(listener);
-
-            if let Some(status) = daemon.try_wait().context("poll virtiofsd process")? {
-                bail!("virtiofsd exited before socket became ready: {status}");
+            unsafe {
+                daemon_cmd.pre_exec(|| {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
             }
-            child_sock.write_all(&[1]).context("notify launcher that virtiofs socket is ready")?;
+            daemon = Some(daemon_cmd.spawn().context("spawn user virtiofsd")?);
+            drop(user);
+            if let Some(status) = daemon.as_mut().unwrap().try_wait().context("poll user virtiofsd")? {
+                bail!("user virtiofsd exited before ready: {status}");
+            }
+            child_sock.write_all(&[1]).context("notify launcher that supervisor is ready")?;
+            let mut commit = [0_u8; 1];
+            if child_sock.read_exact(&mut commit).is_err() || commit[0] != 1 {
+                bail!("launcher exited before startup commit");
+            }
+            let _ = child_sock.shutdown(std::net::Shutdown::Both);
 
-            loop {
-                if let Some(status) = daemon.try_wait().context("poll virtiofsd process")? {
-                    if status.success() {
+            let mut ticks = 0_u8;
+            'supervise: loop {
+                if let Some(status) = daemon.as_mut().unwrap().try_wait().context("poll user virtiofsd")? {
+                    if !domain_is_active(&instance.id)? {
+                        break 'supervise;
+                    }
+                    bail!("user virtiofsd exited unexpectedly: {status}");
+                }
+                match control.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+                        let mut command = String::new();
+                        BufReader::new(stream.try_clone()?).read_line(&mut command)?;
+                        let reply = match command.trim() {
+                            "Reload" if build_active => Err(anyhow::anyhow!("build mount is active")),
+                            "Reload" => apply_user_mounts(env, instance, &mut mounted).map(|_| String::new()),
+                            "BuildOn" if build_active => Err(anyhow::anyhow!("build mount is already active")),
+                            "BuildOn" => mount_build_source(instance, &mut build_mounted).inspect(|_| {
+                                build_active = true;
+                            }),
+                            "BuildOff" => {
+                                clear_mounts(&mut build_mounted)?;
+                                build_active = false;
+                                apply_user_mounts(env, instance, &mut mounted)?;
+                                Ok(String::new())
+                            }
+                            "Stop" => {
+                                writeln!(stream, "OK")?;
+                                break 'supervise;
+                            }
+                            other => Err(anyhow::anyhow!("unknown control command: {other}")),
+                        };
+                        match reply {
+                            Ok(value) if value.is_empty() => writeln!(stream, "OK")?,
+                            Ok(value) => writeln!(stream, "OK {value}")?,
+                            Err(err) => writeln!(stream, "ERR {}", format!("{err:#}").replace('\n', ": "))?,
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(err) => return Err(err).context("accept control connection"),
+                }
+                ticks = ticks.wrapping_add(1);
+                if ticks == 10 {
+                    ticks = 0;
+                    if !domain_is_active(&instance.id)? {
                         break;
                     }
-                    bail!("virtiofsd exited unexpectedly: {status}");
                 }
-                let timeout = Timespec {
-                    tv_sec: 0,
-                    tv_nsec: 200_000_000,
-                };
-                match unsafe { kernel_sigtimedwait(&mask, Some(&timeout)) } {
-                    Ok(_info) => {
-                        let reload_result = apply_mounts(env, instance, &system_profile).context("reload mounts");
-                        if let Err(err) = reload_result {
-                            eprintln!("apply_mounts: {err}");
-                        }
-                        continue;
-                    }
-                    Err(Errno::AGAIN) | Err(Errno::INTR) => continue,
-                    Err(err) => bail!("wait HUP signal: {err}"),
-                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
-
+            clear_mounts(&mut build_mounted)?;
+            clear_mounts(&mut mounted)?;
+            drop(lock);
             Ok(())
         })();
-        let _ = fs::remove_file(&pid_path);
-        let _ = fs::remove_file(&pv_socket);
+        if let Some(mut daemon) = daemon {
+            if daemon.try_wait().ok().flatten().is_none() {
+                let _ = kill_process(Pid::from_raw(daemon.id() as i32).expect("child pid is nonzero"), Signal::TERM);
+            }
+            let _ = daemon.wait();
+        }
+        for path in [&control_socket, &user_socket, &pid_path, &lock_path] {
+            let _ = fs::remove_file(path);
+        }
         result
     })
-    .context("up")?;
+    .context("start supervisor")?;
     drop(child_sock);
     let mut ready = [0_u8; 1];
-    parent_sock.read_exact(&mut ready).context("wait for virtiofs socket readiness notification")?;
-    let xml_path = instance.runtime_dir.join("domain.xml");
-    let (domain_xml, forwards) = render_domain_xml(env, instance, &system_profile, is_build)?;
-    fs::write(&xml_path, domain_xml).context("write generated domain xml")?;
-    fs::write(instance.runtime_dir.join("port-forwards"), serde_json::to_string_pretty(&forwards)?).context("write runtime port-forwards")?;
-    // domain.xml references passt; create is handled by the user-session libvirtd above.
-    let status = process::Command::new("virsh")
-        .arg("create")
-        .arg(&xml_path)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .context("run virsh create")?;
-    if !status.success() {
-        let _ = kill_process(supervisor_pid, Signal::TERM);
+    parent_sock.read_exact(&mut ready).context("wait for supervisor readiness")?;
+
+    let mut created = false;
+    let transaction = (|| -> anyhow::Result<()> {
+        let xml_path = instance.runtime_dir.join("domain.xml");
+        let (domain_xml, forwards) = render_domain_xml(env, instance, &system_profile, is_build)?;
+        fs::write(&xml_path, domain_xml).context("write generated domain xml")?;
+        fs::write(instance.runtime_dir.join("port-forwards"), serde_json::to_string_pretty(&forwards)?).context("write runtime port-forwards")?;
+        let create = process::Command::new("virsh")
+            .arg("create")
+            .arg(&xml_path)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .context("run virsh create")?;
+        if !create.success() {
+            bail!(
+                "virsh create failed with status {}",
+                create.code().map_or("signal".to_owned(), |code| code.to_string())
+            );
+        }
+        created = true;
+        symlink(&system_profile, domain_profile).context("write runtime domain-profile symlink")?;
+        parent_sock.write_all(&[1]).context("commit supervisor startup")
+    })();
+    if let Err(err) = transaction {
+        if created {
+            let _ = virsh(&["destroy", &instance.id]);
+        }
+        drop(parent_sock);
         let _ = waitpid(Some(supervisor_pid), WaitOptions::empty());
-        bail!(
-            "virsh create failed with status {}",
-            status.code().map_or("signal".to_owned(), |code| code.to_string())
-        );
+        return Err(err);
     }
-    symlink(&system_profile, domain_profile).context("write runtime domain-profile symlink")?;
     Ok(system_profile)
 }
 
-/// Apply mounts from the merged TOML config to the guest system.
-fn apply_mounts(env: &Env, instance: &Instance, _system_profile: &Path) -> anyhow::Result<()> {
-    let workspace_dir = instance.persistent.join("workspace");
-    let config_dir = instance.persistent.join("etc/nixos");
-    let host_ca_target = instance.persistent.join("host-ca.crt");
-    let mut mounted = Vec::new();
-
-    // Detach every old mount below the guest-visible workspace and config roots before replacing the configured mounts.
-    let output = (process::Command::new("findmnt").args(["-Rlno", "target"]).output()).context("run findmnt -Rlno target")?;
-    if !output.status.success() {
-        bail!("findmnt: {}", String::from_utf8_lossy(&output.stderr).trim());
-    }
-    for target in String::from_utf8_lossy(&output.stdout).lines() {
-        let target = Path::new(target);
-        if target == config_dir || target == host_ca_target || target.starts_with(&workspace_dir) {
-            mounted.push(target.to_path_buf());
-        }
-    }
-    mounted.sort();
-
+fn apply_user_mounts(env: &Env, instance: &Instance, mounted: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+    clear_mounts(mounted)?;
+    let workspace_dir = instance.user.join("workspace");
+    let config_dir = instance.user.join("config");
+    let host_ca_target = instance.user.join("host-ca.crt");
     let config_toml = fs::read_to_string(instance.flake_dir.join(CONFIG_TOML)).context(format!("read {CONFIG_TOML}"))?;
     let local_toml = read_optional(&instance.flake_dir.join(CONFIG_LOCAL_TOML)).context(format!("read {CONFIG_LOCAL_TOML}"))?;
     let config = parse_config(&config_toml, Some(&local_toml), &env.hostname, false)?;
+    let mut mappings = Vec::new();
 
-    // Collect and validate all enabled mounts from the effective config.
-    let mut parsed_mounts = Vec::new();
     for (name, entry) in config.mounts {
         let PolicyEntry::Set(mount_config) = entry else {
             continue;
         };
         validate_mount_source_field(&mount_config.source)?;
-        let source_abs = if Path::new(&mount_config.source).is_absolute() {
+        let source = if Path::new(&mount_config.source).is_absolute() {
             PathBuf::from(&mount_config.source)
         } else {
             env.workspace.join(&mount_config.source)
-        };
-        let source_abs = source_abs
-            .canonicalize()
-            .with_context(|| format!("canonicalize mount source {}", source_abs.display()))?;
-        if !source_abs.is_dir() && !source_abs.is_file() {
-            bail!("mount source is neither file nor directory: {}", source_abs.display());
         }
+        .canonicalize()
+        .with_context(|| format!("canonicalize mount source {}", mount_config.source))?;
         validate_mount_name_field(&name)?;
-        let target = workspace_dir.join(&name);
-        let is_dir = source_abs.is_dir();
-        parsed_mounts.push((source_abs, target, is_dir, !mount_config.readonly.unwrap_or(false)));
+        mount_mapping(
+            MountMapping {
+                is_dir: source.is_dir(),
+                source,
+                target: workspace_dir.join(name),
+            },
+            !mount_config.readonly.unwrap_or(false),
+            mounted,
+            &mut mappings,
+        )?;
     }
-    parsed_mounts.push((
-        instance.flake_dir.canonicalize().context("canonicalize config dir")?,
-        config_dir.clone(),
+    mount_mapping(
+        MountMapping {
+            source: instance.flake_dir.canonicalize().context("canonicalize config dir")?,
+            target: config_dir,
+            is_dir: true,
+        },
         true,
-        true,
-    ));
+        mounted,
+        &mut mappings,
+    )?;
     if config.vm.use_host_certs.unwrap_or(false) {
-        parsed_mounts.push((
-            resolve_host_ca_bundle().context("vm.useHostCerts is enabled, but no host CA bundle was found")?,
-            host_ca_target,
+        mount_mapping(
+            MountMapping {
+                source: resolve_host_ca_bundle().context("vm.useHostCerts is enabled, but no host CA bundle was found")?,
+                target: host_ca_target,
+                is_dir: false,
+            },
             false,
-            false,
-        ));
+            mounted,
+            &mut mappings,
+        )?;
     }
-    parsed_mounts.sort_by(|a, b| a.1.cmp(&b.1));
+    protect_active_config(instance, &mappings, mounted)
+}
 
-    // Unmount all mounted directories in order of depth.
-    for target in mounted.iter().rev() {
-        let metadata = match fs::symlink_metadata(target) {
-            Ok(metadata) => metadata,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => bail!("stat mounted target {}: {err}", target.display()),
-        };
-        if unmount(target, UnmountFlags::DETACH).is_err() {
+fn mount_mapping(mapping: MountMapping, writable: bool, mounted: &mut Vec<PathBuf>, mappings: &mut Vec<MountMapping>) -> anyhow::Result<()> {
+    if !mapping.source.is_dir() && !mapping.source.is_file() {
+        bail!("mount source is neither file nor directory: {}", mapping.source.display());
+    }
+    if mapping.is_dir {
+        fs::create_dir_all(&mapping.target).context("create mount target dir")?;
+    } else {
+        if let Some(parent) = mapping.target.parent() {
+            fs::create_dir_all(parent).context("create mount target parent")?;
+        }
+        if !mapping.target.exists() {
+            fs::write(&mapping.target, "").context("create mount target file")?;
+        }
+    }
+    if writable && mapping.is_dir {
+        mount_bind_recursive(&mapping.source, &mapping.target).context("bind-mount dir")?;
+    } else if writable {
+        mount(&mapping.source, &mapping.target, "", MountFlags::BIND, c"").context("bind-mount file")?;
+    } else {
+        mount_readonly(&mapping.source, &mapping.target, mapping.is_dir)?;
+    }
+    mounted.push(mapping.target.clone());
+    mappings.push(mapping);
+    Ok(())
+}
+
+fn protect_active_config(instance: &Instance, mappings: &[MountMapping], mounted: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+    for config_name in [CONFIG_TOML, CONFIG_LOCAL_TOML] {
+        let active = instance.flake_dir.join(config_name);
+        if !active.exists() {
             continue;
         }
-        if metadata.is_dir() {
-            match fs::remove_dir(target) {
-                Ok(()) => {}
-                // Underlaying mount is still visible.
-                Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
-                Err(err) => bail!("remove mounted dir {}: {err}", target.display()),
-            }
-        } else if metadata.is_file() && metadata.len() == 0 {
-            // Only remove empty files.
-            fs::remove_file(target).context("remove mounted file")?;
+        if fs::metadata(&active)?.nlink() != 1 {
+            bail!("refuse hard-linked config: {}", active.display());
         }
-    }
-
-    // Mount all configured mounts.
-    for (source_abs, target, is_dir, writable) in parsed_mounts {
-        if is_dir {
-            fs::create_dir_all(&target).context("create target dir")?;
-        } else {
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent).context("create target parent dir")?;
-            }
-            if !target.exists() {
-                fs::write(&target, "").context("create target file")?;
-            }
-        }
-        if !writable {
-            mount_readonly(&source_abs, &target, is_dir)?;
-        } else if is_dir {
-            mount_bind_recursive(&source_abs, &target).context("bind-mount dir")?;
-        } else {
-            mount(&source_abs, &target, "", MountFlags::BIND, c"").context("bind-mount file")?;
-        }
-    }
-    // Scan only the guest-visible workspace and config trees so config files exposed through another mount path are also protected.
-    let mut dirs = vec![workspace_dir, config_dir];
-    while let Some(dir) = dirs.pop() {
-        for entry in fs::read_dir(&dir).with_context(|| format!("scan {}", dir.display()))? {
-            let entry = entry.context("read config search entry")?;
-            if entry.file_type()?.is_dir() {
-                dirs.push(entry.path());
-            } else if entry.file_name() == CONFIG_TOML || entry.file_name() == CONFIG_LOCAL_TOML {
-                let path = entry.path();
-                if entry.metadata()?.nlink() != 1 {
-                    bail!("refuse hard-linked config: {}", path.display());
-                }
-                mount_readonly(&path, &path, false)?;
+        let active = active.canonicalize().context("canonicalize active config")?;
+        for mapping in mappings {
+            let alias = if mapping.is_dir {
+                active.strip_prefix(&mapping.source).ok().map(|relative| mapping.target.join(relative))
+            } else {
+                (active == mapping.source).then(|| mapping.target.clone())
+            };
+            if let Some(alias) = alias
+                && alias.exists()
+                && !mounted.contains(&alias)
+            {
+                mount_readonly(&active, &alias, false)?;
+                mounted.push(alias);
             }
         }
     }
     Ok(())
+}
+
+fn mount_build_source(instance: &Instance, mounted: &mut Vec<PathBuf>) -> anyhow::Result<String> {
+    clear_mounts(mounted)?;
+    let Some((git_root, relative_config)) = resolve_git_build_source(instance)? else {
+        return Ok("/persistent/home/config".to_owned());
+    };
+    let target = instance.user.join("build");
+    let mut mappings = Vec::new();
+    mount_mapping(
+        MountMapping {
+            source: git_root,
+            target: target.clone(),
+            is_dir: true,
+        },
+        true,
+        mounted,
+        &mut mappings,
+    )?;
+    protect_active_config(instance, &mappings, mounted)?;
+    Ok(if relative_config.as_os_str().is_empty() {
+        "/persistent/home/build".to_owned()
+    } else {
+        format!("/persistent/home/build/{}", relative_config.display())
+    })
+}
+
+fn resolve_git_build_source(instance: &Instance) -> anyhow::Result<Option<(PathBuf, PathBuf)>> {
+    let output = process::Command::new("git")
+        .args(["-C", &instance.flake_dir.display().to_string(), "rev-parse", "--show-toplevel"])
+        .output()
+        .context("resolve git root")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let git_root = PathBuf::from(String::from_utf8(output.stdout)?.trim())
+        .canonicalize()
+        .context("canonicalize git root")?;
+    let config = instance.flake_dir.canonicalize().context("canonicalize config dir")?;
+    let relative = config.strip_prefix(&git_root).context("config dir is outside git root")?.to_path_buf();
+    let flake = relative.join("flake.nix");
+    let tracked = process::Command::new("git")
+        .arg("-C")
+        .arg(&git_root)
+        .args(["ls-files", "--error-unmatch", "--"])
+        .arg(&flake)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("check tracked flake")?;
+    Ok(tracked.success().then_some((git_root, relative)))
+}
+
+fn clear_mounts(mounted: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+    mounted.sort_by_key(|path| path.components().count());
+    mounted.dedup();
+    for target in mounted.drain(..).rev() {
+        if unmount(&target, UnmountFlags::DETACH).is_err() {
+            continue;
+        }
+        match fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.is_dir() => match fs::remove_dir(&target) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+                Err(err) => return Err(err).with_context(|| format!("remove mountpoint {}", target.display())),
+            },
+            Ok(metadata) if metadata.is_file() && metadata.len() == 0 => fs::remove_file(&target)?,
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err).with_context(|| format!("stat mountpoint {}", target.display())),
+        }
+    }
+    Ok(())
+}
+
+fn supervisor_command(instance: &Instance, command: &str) -> anyhow::Result<String> {
+    let mut stream = UnixStream::connect(instance.runtime_dir.join("control.sock")).context("connect supervisor")?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+    writeln!(stream, "{command}")?;
+    let mut response = String::new();
+    BufReader::new(stream).read_line(&mut response)?;
+    let response = response.trim();
+    if response == "OK" {
+        Ok(String::new())
+    } else if let Some(value) = response.strip_prefix("OK ") {
+        Ok(value.to_owned())
+    } else if let Some(err) = response.strip_prefix("ERR ") {
+        bail!("supervisor: {err}")
+    } else {
+        bail!("invalid supervisor reply: {response}")
+    }
+}
+
+fn stop_supervisor(instance: &Instance) -> anyhow::Result<()> {
+    let socket = instance.runtime_dir.join("control.sock");
+    if !socket.exists() {
+        return Ok(());
+    }
+    let request = supervisor_command(instance, "Stop");
+    for _ in 0..100 {
+        if !socket.exists() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    request?;
+    bail!("supervisor did not stop")
 }
 
 fn mount_readonly(source: &Path, target: &Path, recursive: bool) -> anyhow::Result<()> {
@@ -1529,10 +1724,10 @@ fn validate_mount_name_field(value: &str) -> anyhow::Result<()> {
 fn run_virsh_action(env: &Env, action: &str) -> anyhow::Result<()> {
     let instance = resolve_instance(env)?;
     virsh(&[action, &instance.id])?;
-    match action {
-        "shutdown" => run_wait(&instance, &["down", "shut off", "crashed"]),
-        _ => Ok(()),
+    if action == "shutdown" {
+        run_wait(&instance, &["down", "shut off", "crashed"])?;
     }
+    stop_supervisor(&instance)
 }
 
 fn run_virsh_action_all(env: &Env, action: &str) -> anyhow::Result<()> {
@@ -1546,14 +1741,16 @@ fn run_virsh_action_all(env: &Env, action: &str) -> anyhow::Result<()> {
 fn run_destroy(env: &Env, system: bool, data: bool, logs: bool, conf: bool) -> anyhow::Result<()> {
     let instance = resolve_instance(env)?;
     let _ = virsh(&["destroy", &instance.id]);
+    stop_supervisor(&instance)?;
     if instance.is_global && !env.is_global {
         bail!("destroy files for the non-project instance requires --global");
     }
     if system {
-        spawn_mapped_namespace(false, true, || remove_dir_all_if_exists(&instance.sysroot)).context("destroy sysroot")?;
+        spawn_mapped_namespace(false, true, || remove_dir_all_if_exists(&instance.rootfs)).context("destroy rootfs")?;
+        spawn_mapped_namespace(false, true, || remove_dir_all_if_exists(&instance.system)).context("destroy system data")?;
     }
     if data {
-        spawn_mapped_namespace(true, true, || remove_dir_all_if_exists(&instance.persistent)).context("destroy persistent")?;
+        spawn_mapped_namespace(true, true, || remove_dir_all_if_exists(&instance.user)).context("destroy user data")?;
     }
     if system && data {
         remove_dir_all_if_exists(&instance.data_dir)?;
@@ -1794,14 +1991,8 @@ fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bo
     }
     fs::write(&config_local_toml_path, config_local_toml.to_string()).context(format!("write {CONFIG_LOCAL_TOML}"))?;
 
-    let pid_path = instance.runtime_dir.join("devvm.pid");
-    if let Ok(pid) = fs::read_to_string(&pid_path) {
-        let pid = pid.trim().parse::<i32>()?;
-        let pid = Pid::from_raw(pid).context("invalid devvm.pid")?;
-        if let Err(err) = kill_process(pid, Signal::HUP) {
-            eprintln!("mounts: failed to reload: {err}");
-            bail!("{err}");
-        }
+    if instance.runtime_dir.join("control.sock").exists() {
+        supervisor_command(&instance, "Reload")?;
         eprintln!("mounts: reloading");
     }
     Ok(())
@@ -1925,7 +2116,7 @@ fn run_verify(env: &Env) -> anyhow::Result<()> {
     // $ nix store copy-sigs -rvs https://cache.nixos.org /nix/var/nix/profiles/system
     let output = process::Command::new("nix-store")
         .args(["--verify", "--check-contents", "--repair", "--store"])
-        .arg(format!("local?root={}", instance.sysroot.display()))
+        .arg(format!("local?root={}", instance.system.display()))
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -1938,8 +2129,10 @@ fn run_verify(env: &Env) -> anyhow::Result<()> {
     if domstate(&instance.id)? != "running" {
         bail!("guest is not running, skipping nixos-rebuild --repair");
     }
-    let flake = format!("/persistent/etc/nixos#{}", env.hostname);
-    run_ssh(env, &["nixos-rebuild", "build", "--repair", "--flake", &flake], true, true)?;
+    let flake = format!("{}#{}", supervisor_command(&instance, "BuildOn")?, env.hostname);
+    let repair = run_ssh(env, &["nixos-rebuild", "build", "--repair", "--flake", &flake], true, true);
+    let build_off = supervisor_command(&instance, "BuildOff").map(|_| ());
+    repair.and(build_off)?;
     eprintln!("verify: nixos-rebuild build --repair succeeded (no remaining system profile corruptions)");
     Ok(())
 }
@@ -1947,7 +2140,7 @@ fn run_verify(env: &Env) -> anyhow::Result<()> {
 fn run_audit(env: &Env, args: &[String]) -> anyhow::Result<()> {
     let instance = resolve_instance(env)?;
     let status = process::Command::new("vulnix")
-        .args(["-g", &instance.sysroot.display().to_string()])
+        .args(["-g", &instance.system.display().to_string()])
         .args(args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())

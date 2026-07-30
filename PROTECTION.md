@@ -39,7 +39,7 @@ to be silently replaced by guest-generated policy.
 The template flake shipped by DevVM is trusted. `nix-store --verify` against the instance store is
 trusted. The host launcher, host kernel, KVM, QEMU, libvirt, and virtiofs are trusted for this design.
 
-The guest Nix store is instance-local. `/nix` inside the guest resolves to the instance sysroot, not to the
+The guest Nix store is instance-local. `/nix` inside the guest resolves to the instance system tree, not to the
 host `/nix`. Build and lock operations for the active sandbox configuration must not depend on a host `nix`
 binary or host Nix store.
 
@@ -51,7 +51,7 @@ configuration changes from becoming host-trusted state without an explicit host 
 ## Goals
 
 - Keep host files and host Nix state out of the guest trust boundary.
-- Make `build` and `up` use the instance sysroot Nix and the same store that the guest will use.
+- Make `build` and `up` use the instance system Nix and the same store that the guest will use.
 - Preserve a fast build path by avoiding repeated `path:` uploads when the configuration is in a git repo.
 - Allow common development workflows where `nix build` and `nix develop` work in the guest.
 - Provide stricter modes that can deny Nix store mutation or deny system profile mutation.
@@ -153,8 +153,10 @@ working.
 For global config, the build source is
 `$XDG_CONFIG_HOME/devvm/<project-name>`.
 
-The build source is mounted read-only for normal builds. This source mount is an internal build/up mount,
-separate from user-visible runtime mounts.
+For a tracked flake, the worktree root is mounted read-write at
+`/persistent/home/build` only between acknowledged `BuildOn` and `BuildOff`
+commands. For untracked, non-git, and global configs, the launcher falls back
+to the always-present `/persistent/home/config` mount.
 
 ## Lock File Policy
 
@@ -163,8 +165,8 @@ separate from user-visible runtime mounts.
 The default behavior with an existing `flake.lock` is no lock write. If the lock is stale, `nixos-rebuild`
 should fail and the user should rerun with an explicit lock-writing flag.
 
-Add a CLI flag named `--write-lock`. This flag allows `nixos-rebuild` to write `flake.lock` using the sysroot
-Nix in the same mount namespace and the same instance store as the build.
+The `--write-lock` flag allows `nixos-rebuild` to write `flake.lock` using the
+system Nix and instance store.
 
 If `flake.lock` is missing, behave as if `--write-lock` was specified. Before the file bind is installed, the
 host creates the placeholder file:
@@ -173,9 +175,11 @@ host creates the placeholder file:
 {"root":"","version":7}
 ```
 
-The build source remains read-only. Only `flake.lock` is over-mounted as a writable file. The writable file
-bind source must live outside the read-only source view so that the guest can rewrite the file even though the
-parent directory is read-only.
+The build worktree is read-write because Nix 2.34 updates `flake.lock` by
+opening the file with truncate/write, and future implementations may require
+directory-level replacement. Exposure is limited by mounting the worktree only
+for the rebuild. Active `devvm.toml` and `devvm.local.toml` aliases remain
+read-only.
 
 `nixos-rebuild` should receive the appropriate lock flags directly. A separate pre-build `nix flake lock`
 phase is not needed.
@@ -222,23 +226,24 @@ Runtime source exposure is controlled by dynamic mounts. A workspace can be moun
 coding while `.devvm` is over-mounted read-only:
 
 `devvm init` creates the workspace mount. Additional mounts use
-`devvm mount [--read-only] <path> [name]`. The launcher recursively
-over-mounts `devvm.toml` and `devvm.local.toml` read-only in the
-guest-visible workspace and config trees.
+`devvm mount [--read-only] <path> [name]`. For each configured mapping and the
+internal build mapping, the launcher derives only the aliases of the active
+`devvm.toml` and `devvm.local.toml` and over-mounts those files read-only.
 
 ## Expected CLI Behavior
 
-- `devvm build` uses the sysroot Nix and instance store.
-- `devvm up` uses the sysroot Nix and instance store.
+- `devvm build` uses the system Nix and instance store.
+- `devvm up` uses the system Nix and instance store.
 - `devvm build` and `devvm up` fail on stale locks unless `--write-lock` is passed.
 - Missing `flake.lock` is treated as implicit `--write-lock`.
-- `--write-lock` makes only `flake.lock` writable inside an otherwise read-only build source.
+- A tracked worktree is writable only while the host-requested rebuild runs;
+  active policy files remain read-only.
 - The guest runtime mount list accepts per-entry `rw` and `ro`.
 
 ## Acceptance Criteria
 
 - A host without `nix` can run the active configuration lock/build path after bootstrap prerequisites exist.
-- A missing `flake.lock` is created by the sysroot build path, not by host `nix`.
+- A missing `flake.lock` is created by the system build path, not by host `nix`.
 - A stale lock fails without `--write-lock`.
 - A stale lock updates with `--write-lock`.
 - A git-tracked `.devvm/flake.nix` builds from the git worktree root and avoids repeated `path:` uploads.

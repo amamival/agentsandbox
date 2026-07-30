@@ -11,7 +11,6 @@ allowDomainXml = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991
 
 [hosts.default.mounts]
 "repo" = { source = ".", readonly = false }
-"scratch" = { source = "/tmp/devvm-scratch", readonly = false }
 
 [hosts.default.allowedHosts]
 "example.com" = false # Disable the matching `devvm.toml` policy entry.

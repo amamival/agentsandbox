@@ -18,7 +18,7 @@ This is not yet a polished runtime. It remains an experimental launcher under he
 
 The target host platform is recent `amd64` Linux in general, not just NixOS. If this does not run on a reasonably current Linux machine, that should be treated as a bug rather than an unsupported edge case.
 
-The `devvm` command handles sysroot bootstrap, system builds, libvirt startup, attach, and mounts.
+The `devvm` command handles rootfs bootstrap, system builds, libvirt startup, attach, and mounts.
 
 ## Installation
 
@@ -123,16 +123,17 @@ In our experiments, *gVisor* could not run *SystemD* as PID 1 because it lacks t
   `nixosConfigurations`.
 - The execution path is fixed to Linux `qemu:///session`, KVM, libvirt, virtiofs,
   NixOS, and home-manager.
-- The host is not assumed to be NixOS. Each instance has its own dedicated
-  `sysroot`. The `/nix` shown to the guest uses the instance `sysroot/nix`, not
-  the host `/nix`.
+- The host is not assumed to be NixOS. Each instance has a private bootstrap
+  `rootfs`, a root-idmapped `system` tree, and a host-user-mapped `user` tree.
+  The guest never uses the host `/nix`.
 - Host-side state lives only under `XDG_CONFIG_HOME`, `XDG_DATA_HOME`,
   `XDG_STATE_HOME`, and `XDG_RUNTIME_DIR`. `XDG_CACHE_HOME` is not used.
 - `instance-id` and libvirt domain name are `<project-name>[<hostname>]`.
   `project-name` defaults to the workspace basename locally and `devvm`
   globally. The guest machine-id and libvirt UUID are derived from this ID.
 - No extra `current-system` link or host-state metadata JSON is kept.
-- Place `sysroot/` next to `persistent/`.
+- Place sibling `rootfs/`, `system/`, and `user/` directories under the
+  instance data dir.
 - Launcher policy is read from `devvm.toml` and optional
   `devvm.local.toml`. The local file and hostname sections override base
   policy.
@@ -141,10 +142,10 @@ In our experiments, *gVisor* could not run *SystemD* as PID 1 because it lacks t
 - `.git/config` is not inherited, so `.git/config` sanitization is also not part
   of the design.
 - The initial workspace mount appears in the guest as
-  `/persistent/workspace/<dirname>`. It is stored in the TOML `mounts` table
+  `/persistent/home/workspace/<dirname>`. It is stored in the TOML `mounts` table
   with directories added later through `mount`.
-- Dynamic mounts are materialized under `/persistent/workspace` in a private
-  host mount namespace and are exported through the single `/persistent`
+- Dynamic mounts are materialized under `/persistent/home/workspace` in the
+  supervisor's private host mount namespace and exported through the `user`
   virtiofs share.
 - Runtime sockets and pid files live under `XDG_RUNTIME_DIR`.
 - Generate libvirt domain XML in Rust and start the transient domain with
@@ -190,8 +191,9 @@ $XDG_CONFIG_HOME/devvm/<project-name>/
   devvm.local.toml  # optional
 
 $XDG_DATA_HOME/devvm/<instance-id>/
-  sysroot/
-  persistent/
+  rootfs/                 # bootstrap root, never exported
+  system/                 # Nix store and explicit system persistence
+  user/                   # user-owned state and mount underlays
 
 $XDG_STATE_HOME/devvm/<instance-id>/
   logs/
@@ -202,19 +204,21 @@ $XDG_STATE_HOME/devvm/<instance-id>/
 
 $XDG_RUNTIME_DIR/devvm/<instance-id>/
   lock
-  ... runtime pid/socket files for helpers and sidecars
+  control.sock
+  user.sock
+  domain.xml
+  ... runtime metadata
 ```
 
-- `sysroot/` contains an instance-specific Nix root and the source of guest boot
-  artifacts.
-- `persistent/` is exported to the guest as `/persistent`.
+- `rootfs/` is the Docker bootstrap pivot root and is never exported.
+- `system/` contains the instance Nix store and explicitly declared system
+  persistence and is exported to the guest as `/persistent`.
+- `user/` is exported through the supervisor as `/persistent/home`.
 - The merged TOML `mounts` table stores the dynamic mount set, including the
   initial workspace mount.
 - `logs/` stores the active log files and their rotated archives.
-- The runtime dir contains instance-scoped sockets, pid files, and helper state
-  for mount namespace and sidecars.
-- Runtime filename details are implementation details and are not a fixed
-  public contract.
+- The runtime dir is the cleanup unit for the supervisor lock, acknowledged
+  control socket, user virtiofs socket, and generated domain metadata.
 
 ## Build flow
 
@@ -222,25 +226,37 @@ $XDG_RUNTIME_DIR/devvm/<instance-id>/
   `$XDG_CONFIG_HOME/devvm/<project-name>`) and selected `hostname`.
 - The launcher resolves `instance-id` and instance paths under XDG roots.
 - The launcher creates instance directories:
-  - data: `sysroot/`, `persistent/`
+  - data: `rootfs/`, `system/`, `user/`
   - state: `logs/`
   - runtime: pid/socket/lock files
-- If `sysroot/nix/var/nix/profiles/default` is missing, bootstrap `sysroot`
-  from Docker image `nixos/nix` (linux/amd64 manifest).
+- If `system/nix/var/nix/profiles/default` is missing, extract Docker image
+  `nixos/nix` (linux/amd64 manifest) into `rootfs/`, then move its Nix tree to
+  `system/nix`.
 - If `--bootstrap` is specified, or system profile is missing, write template
-  config into `sysroot/etc/nixos` and build initial profile with:
+  config into `rootfs/etc/nixos` and build initial profile with:
   `nix build /etc/nixos#nixosConfigurations.<hostname>.config.system.build.toplevel`
-  in a mapped user+mount namespace.
+  in a mapped user+mount namespace. Only that namespace bind-mounts
+  `system/nix` at `rootfs/nix`.
 - During mapped namespace setup, child enters `NEWUSER|NEWNS`, parent writes
   uid/gid mappings (`newuidmap`/`newgidmap`), then child continues.
 - VM startup path:
-  1. start mount supervisor in mapped namespace
-  2. apply dynamic mounts to exported `/persistent`
-  3. render domain XML in Rust from TOML and runtime paths
-  4. write XML and port-forward state under `<runtime-dir>`
-  5. `virsh create <runtime-dir>/domain.xml`
+  1. acquire the instance lock and start the supervisor in a mapped namespace
+  2. apply dynamic mounts to the `user` view and start its virtiofsd
+  3. expose the acknowledged control socket and report readiness
+  4. render runtime metadata and `virsh create <runtime-dir>/domain.xml`
+  5. commit supervisor ownership; pre-commit failure rolls back the sidecar
 - After boot path is available, run guest-side rebuild over SSH:
-  `nixos-rebuild boot|switch --flake /persistent/etc/nixos#<hostname>`.
+  `nixos-rebuild boot|switch --flake <BuildOn reply>#<hostname>`.
+- `BuildOn` mounts a tracked worktree at `/persistent/home/build` only for the
+  rebuild. Untracked, non-git, and global configs use
+  `/persistent/home/config`. `BuildOff` runs on success and failure.
+- The user export maps host-owned files to guest uid 1000, while rebuild runs
+  as guest root. Git therefore declares the fixed build path as a safe
+  directory; otherwise libgit2 rejects the correctly mapped worktree as being
+  owned by another user.
+- `nixos-rebuild switch` restarts `local-fs.target` and may detach nested bind
+  mounts visible through virtiofs. `BuildOff` consequently removes the build
+  mount and reapplies the normal config and workspace mounts before replying.
 - Guest-centered rebuild is the security boundary: flake evaluation/build for
   the operational system runs inside the guest path rather than host runtime.
 - If newly rendered domain XML differs from the runtime XML, domain changes are
@@ -270,16 +286,16 @@ $XDG_RUNTIME_DIR/devvm/<instance-id>/
 - Mount contract:
   - Read the effective TOML `mounts` table.
   - Relative host paths are resolved from `workspace`.
-  - `mount`/`unmount` edits `devvm.local.toml`; runtime reload is
-    signaled by `HUP` to the supervisor pid.
+  - `mount`/`unmount` edits `devvm.local.toml` and sends acknowledged `Reload`
+    over the supervisor control socket.
 - Policy file protection:
-  - Every recursively discovered `devvm.toml` and
-    `devvm.local.toml` in guest-visible workspace/config trees is
-    mounted read-only. Hard-linked policy files are rejected.
+  - Only the active `devvm.toml` and `devvm.local.toml` aliases derived from
+    source-to-target mappings are mounted read-only. Hard-linked active policy
+    files are rejected; unrelated files with the same basename are untouched.
 - Audit command contract (`devvm audit`):
   - Resolve active flake dir and instance with the same path as other instance-scoped commands.
   - Execute host `vulnix` directly (no guest-side wrapper execution).
-  - Prepend fixed arguments `-g <instance-sysroot>` so scan scope is the instance store root.
+  - Prepend fixed arguments `-g <instance-system>` so scan scope is the instance store root.
   - Forward all user audit arguments after the fixed prefix without launcher-side rewriting.
   - Inherit stdin/stdout/stderr to preserve vulnix I/O behavior and output format.
   - Terminate process with vulnix exit code; if no code is available (for example, signal),
@@ -290,14 +306,18 @@ $XDG_RUNTIME_DIR/devvm/<instance-id>/
 ## Guest system contract
 
 - The guest boots with direct kernel boot.
-- The guest root filesystem uses tmpfs, and `/nix` and `/persistent` are
-  mounted with virtiofs.
-- `/nix` exports instance `sysroot/nix` as `read-write,nodev`.
-- `/persistent` exports instance `persistent/` as `read-write,nodev`.
+- The guest root filesystem uses tmpfs. The `system` virtiofs share is mounted
+  at `/persistent`; the `user` share is mounted over `/persistent/home`.
+- `/nix` is a bind mount from `/persistent/nix`.
+- System paths are persistent only when explicitly declared under
+  `environment.persistence."/persistent"`; the runtime does not persist
+  `/var`, `/root`, or `/srv` as a whole.
+- Both virtiofs mounts are needed for boot, with `/persistent/home` ordered
+  after `/persistent`.
 - The mount entry corresponding to the startup workspace root appears at
-  `/persistent/workspace/<dirname>`.
+  `/persistent/home/workspace/<dirname>`.
 - Additional mount entries managed by `mount` and `unmount` appear at
-  `/persistent/workspace/<guest-name>`.
+  `/persistent/home/workspace/<guest-name>`.
 - The guest `machine-id` is set via `systemd.machine_id=` on the kernel command
   line from a hash of the instance ID.
 - The guest home-manager profile keeps shell and tool integration inside the
@@ -318,13 +338,18 @@ $XDG_RUNTIME_DIR/devvm/<instance-id>/
   locally managed roots, including corporate roots under
   `/usr/local/share/ca-certificates`, into
   `/etc/ssl/certs/ca-certificates.crt`.
-- The selected bundle is exported read-only as `/persistent/host-ca.crt`, and
+- The selected bundle is exported read-only as
+  `/persistent/home/host-ca.crt`, and
   the launcher adds `devvm.use-host-certs` to the guest kernel command
   line. If no bundle is found, VM startup fails before the domain is created.
 - NixOS exposes `/etc/ssl/certs/ca-certificates.crt` as a symlink into the Nix
   store. A systemd mount unit cannot use that non-canonical path, so a
   conditional oneshot service resolves the symlink once, bind-mounts the host
   bundle on the canonical target, and remounts it read-only.
+- That service is ordered before `multi-user.target`, not `local-fs.target`.
+  A regular service has an implicit dependency after `sysinit.target`; placing
+  it before `local-fs.target` would create an ordering cycle during a live
+  NixOS switch.
 - The file mount pins the selected bundle for the lifetime of the VM. Host CA
   updates and corporate CA rotation take effect on the next VM start.
 - This changes trust for software that uses the guest's default OpenSSL-style
@@ -340,16 +365,30 @@ $XDG_RUNTIME_DIR/devvm/<instance-id>/
 - `init` adds the startup workspace mount under its basename.
 - `mount` and `unmount` persist hostname-specific overrides in
   `devvm.local.toml`.
-- The launcher starts a helper in a private host mount namespace and builds a
-  synthetic tree under the exported `persistent/workspace` root.
-- TOML policy files in the startup workspace are over-mounted read-only.
+- The supervisor self-binds `data/<id>/user` in its private mount namespace;
+  no separate runtime export tree is created.
+- Active TOML policy aliases exposed through a mount are over-mounted
+  read-only.
 - Additional mount entries are materialized as bind mounts under
-  `persistent/workspace/<guest-name>` in the same namespace.
-- The single `virtiofsd` instance for `/persistent` exports that synthetic tree
-  to the guest.
-- `mount` and `unmount` update TOML and reload the helper namespace for a
-  running instance.
+  `user/workspace/<guest-name>` in the same namespace.
+- The supervisor-owned virtiofsd exports that namespace-specific view to guest
+  `/persistent/home`.
+- `mount` and `unmount` update TOML and wait for the supervisor's `Reload`
+  acknowledgement.
 - The active config dir for the build is always reachable from the launcher.
+
+## Supervisor ownership
+
+- The supervisor owns the user mount namespace, user virtiofsd, `control.sock`,
+  and instance lock.
+- Commands are `Reload`, `BuildOn`, `BuildOff`, and `Stop`; every command
+  returns `OK` or `ERR` before the caller continues.
+- The supervisor monitors both virtiofsd and the libvirt domain. Domain exit or
+  `Stop` terminates virtiofsd, tears down the namespace, and removes its
+  sockets and lock.
+- `down`, `kill`, restart, and `destroy` stop the domain before waiting for
+  supervisor cleanup. A stale runtime from host failure is recovered under
+  the flock on the next start.
 
 ## Network and proxy
 
@@ -366,9 +405,9 @@ $XDG_RUNTIME_DIR/devvm/<instance-id>/
 - The `ssh` subcommand uses the `tcp` forward where `guest_port = 22`.
 - `allowedHosts` is stored in TOML. `allow-domain` and `unallow-domain` edit
   hostname-specific local overrides.
-- v0.2 does not enforce `allowedHosts` on network traffic.
+- v0.3 does not enforce `allowedHosts` on network traffic.
 
-## Future proxy pipeline (not implemented in v0.2)
+## Future proxy pipeline (not implemented in v0.3)
 
 - The proxy runs on the host side and receives the VM's HTTP/S egress.
 - The request pipeline flows in the following order.
@@ -387,7 +426,7 @@ $XDG_RUNTIME_DIR/devvm/<instance-id>/
 - Optional remote receivers are `syslog`, `syslog-remote`, `otlp-http`, and
   `otlp-grpc`.
 
-## Future OpenSnitch integration (not implemented in v0.2)
+## Future OpenSnitch integration (not implemented in v0.3)
 
 - OpenSnitch exists as an optional feature.
 - The selected `nixosConfiguration` contains
@@ -401,7 +440,7 @@ $XDG_RUNTIME_DIR/devvm/<instance-id>/
 - For instances that use OpenSnitch, the baseline is `DefaultAction = "deny"`
   and `InterceptUnknown = true`.
 
-## Future proxy logging (not implemented in v0.2)
+## Future proxy logging (not implemented in v0.3)
 
 - State logs are collected under `logs/`.
 - The active request log file is `logs/requests.jsonl`.
@@ -421,7 +460,7 @@ $XDG_RUNTIME_DIR/devvm/<instance-id>/
 
 - `build`
   - Resolve config/instance, prepare instance dirs.
-  - Bootstrap sysroot/default profile when absent.
+  - Bootstrap rootfs and seed `system/nix` when the default profile is absent.
   - Ensure `flake.lock` exists for active config.
   - If VM is down (`down`/`shut off`/`crashed`): start VM, run guest
     `nixos-rebuild boot`, then explicitly return to down by `virsh destroy`.
@@ -441,8 +480,8 @@ $XDG_RUNTIME_DIR/devvm/<instance-id>/
     selected project.
 - `destroy` (alias: `destory`)
   - Always attempts `virsh destroy` first.
-  - `--system`: remove `sysroot/` (mapped namespace path)
-  - `--data`: remove `persistent/` (mapped namespace path)
+  - `--system`: remove `rootfs/` and `system/` (root-mapped namespace paths)
+  - `--data`: remove `user/` (mapped namespace path)
   - `--system --data`: remove whole data dir
   - `--logs`: remove whole state dir
   - `--conf`: remove resolved config dir
@@ -451,5 +490,5 @@ $XDG_RUNTIME_DIR/devvm/<instance-id>/
   - Prints: state code/reason, cpu time/user/system ns, vcpu current/maximum,
     balloon current/rss/available/usable KiB.
 - `verify`
-  - Host side: `nix-store --verify --check-contents --repair --store local?root=<sysroot>`
-  - Guest side (running VM): `nixos-rebuild build --repair --flake /persistent/etc/nixos#<hostname>`
+  - Host side: `nix-store --verify --check-contents --repair --store local?root=<system>`
+  - Guest side (running VM): `nixos-rebuild build --repair --flake <BuildOn reply>#<hostname>`

@@ -9,25 +9,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
-name = "devvm"
-version = "0.3.0"
-dependencies = [
- "anyhow",
- "clap",
- "elementtree",
- "flate2",
- "libc",
- "pathdiff",
- "reqwest",
- "rustix",
- "serde",
- "serde_json",
- "sha2",
- "tar",
- "toml_edit",
-]
-
-[[package]]
 name = "anstyle"
 version = "1.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -240,6 +221,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
 dependencies = [
  "hybrid-array",
+]
+
+[[package]]
+name = "devvm"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "elementtree",
+ "flate2",
+ "libc",
+ "pathdiff",
+ "reqwest",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "toml_edit",
 ]
 
 [[package]]

@@ -31,7 +31,26 @@
         }];
         boot.kernelPackages = pkgs.linuxPackages_latest;
         fileSystems."/" = { device = "none"; fsType = "tmpfs"; options = [ "mode=755" "nosuid" "nodev" "noexec" ]; };
-        fileSystems."/nix" = { device = "nix"; fsType = "virtiofs"; options = [ "nosuid" "nodev" ]; };
+        fileSystems."/persistent" = {
+          neededForBoot = true;
+          device = "system";
+          fsType = "virtiofs";
+          options = [ "nosuid" "nodev" ];
+        };
+        fileSystems."/persistent/home" = {
+          neededForBoot = true;
+          device = "user";
+          fsType = "virtiofs";
+          options = [ "nosuid" "nodev" ];
+          depends = [ "/persistent" ];
+        };
+        fileSystems."/nix" = {
+          neededForBoot = true;
+          device = "/persistent/nix";
+          fsType = "none";
+          options = [ "bind" "nosuid" "nodev" ];
+          depends = [ "/persistent" ];
+        };
         fileSystems."/home" = { device = "none"; fsType = "tmpfs"; options = [ "mode=755" "nosuid" "nodev" ]; neededForBoot = true; };
         systemd.mounts = [{
           what = "tmpfs";
@@ -43,9 +62,9 @@
         }];
         systemd.services.devvm-host-ca = {
           description = "Use the host CA bundle";
-          wantedBy = [ "local-fs.target" ];
-          before = [ "local-fs.target" ];
-          after = [ "persistent.mount" ];
+          wantedBy = [ "multi-user.target" ];
+          before = [ "multi-user.target" ];
+          after = [ "persistent-home.mount" ];
           unitConfig.ConditionKernelCommandLine = "devvm.use-host-certs";
           serviceConfig = {
             Type = "oneshot";
@@ -53,7 +72,7 @@
           };
           script = ''
             target="$(${pkgs.coreutils}/bin/readlink -f /etc/ssl/certs/ca-certificates.crt)"
-            ${pkgs.util-linux}/bin/mount --bind /persistent/host-ca.crt "$target"
+            ${pkgs.util-linux}/bin/mount --bind /persistent/home/host-ca.crt "$target"
             ${pkgs.util-linux}/bin/mount -o remount,bind,ro "$target"
           '';
           preStop = ''
@@ -65,7 +84,7 @@
         systemd.services.fuse-inval-wq = {
           description = "Seed fuse.inval_wq before virtiofs mounts to free cached fds on host";
           wantedBy = [ "local-fs-pre.target" ];
-          before = [ "local-fs-pre.target" "nix.mount" "persistent.mount" ];
+          before = [ "local-fs-pre.target" "persistent.mount" "persistent-home.mount" ];
           unitConfig.DefaultDependencies = false;
           serviceConfig.Type = "oneshot";
           script = ''
@@ -99,6 +118,10 @@
           unitConfig.AllowIsolate = true;
         };
         nix.settings.experimental-features = [ "nix-command" "flakes" ];
+        programs.git = {
+          enable = true;
+          config.safe.directory = "/persistent/home/build";
+        };
 
         # Users
         users.users.vscode = {
@@ -116,23 +139,13 @@
         users.allowNoPasswordLogin = true;
 
         # Impermanence
-        fileSystems."/persistent" = {
-          neededForBoot = true;
-          device = "persistent";
-          fsType = "virtiofs";
-          options = [ "nosuid" "nodev" ];
-        };
         fileSystems."/workspace" = {
-          device = "/persistent/workspace";
+          device = "/persistent/home/workspace";
           fsType = "none";
           options = [ "bind" "nosuid" "nodev" ];
-          depends = [ "/persistent" ];
+          depends = [ "/persistent/home" ];
         };
         environment.persistence."/persistent" = {
-          directories = [
-            "/var/lib/nixos" # Stable user/group id.
-            "/var/lib/systemd" # systemd-creds host key.
-          ];
           files = [
             # "/etc/machine-id" # kernel command line takes precedence.
             "/etc/ssh/ssh_host_ed25519_key"

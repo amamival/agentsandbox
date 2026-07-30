@@ -40,12 +40,12 @@ memoryMiB = 8192
 #     <apic/>
 #   </features>
 #   <devices>
-#     <!-- Replaced as a unit by target dir='nix'|'persistent':
+#     <!-- Replaced as a unit by target dir='system'|'user':
 #       <filesystem type='mount'>
-#         <target dir='nix'/>
+#         <target dir='system'/>
 #       </filesystem>
 #       <filesystem type='mount'>
-#         <target dir='persistent'/>
+#         <target dir='user'/>
 #       </filesystem>
 #     -->
 #     <serial type='pty'>

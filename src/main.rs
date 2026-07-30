@@ -10,7 +10,7 @@ use rustix::{
     mount::{MountFlags, MountPropagationFlags, MoveMountFlags, OpenTreeFlags, UnmountFlags},
     mount::{mount, mount_bind_recursive, mount_change, move_mount, open_tree, unmount},
     pipe::{PipeFlags, pipe_with},
-    process::{Pid, Signal, WaitOptions, chdir, getgid, getuid, kill_process, pivot_root, setsid, waitpid},
+    process::{Pid, Signal, WaitOptions, chdir, getuid, kill_process, pivot_root, setsid, waitpid},
     runtime::{Fork, exit_group, kernel_fork},
     thread::{UnshareFlags, unshare_unsafe},
 };
@@ -258,7 +258,6 @@ struct Env {
     data_root: PathBuf,
     state_root: PathBuf,
     runtime_root: PathBuf,
-    is_nested: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -399,7 +398,6 @@ fn resolve_env(cli: &Cli) -> anyhow::Result<Env> {
             .clone()
             .unwrap_or_else(|| if uid == 0 { "/run".into() } else { format!("/run/user/{uid}").into() })
             .join(APP_NAME),
-        is_nested: Path::new("/persistent").is_dir(), // FIXME: use findmnt to detect virtiofs backed /.
     })
 }
 
@@ -733,13 +731,12 @@ fn render_domain_xml(env: &Env, instance: &Instance, system_profile: &Path, is_b
     let initrd = instance.system.join(initrd_target.strip_prefix("/").context("get initrd image path")?);
     let kernel_params = fs::read_to_string(system_profile.join("kernel-params")).context("read kernel-params")?;
     let build_unit = if is_build { " systemd.unit=devvm-build.target" } else { "" };
-    let nested = if env.is_nested { " devvm.nested" } else { "" };
     let host_certs = if config.vm.use_host_certs.unwrap_or(false) {
         " devvm.use-host-certs"
     } else {
         ""
     };
-    let cmdline = format!("{kernel_params} init=/nix/var/nix/profiles/system/init systemd.machine_id={machine_id}{build_unit}{nested}{host_certs}");
+    let cmdline = format!("{kernel_params} init=/nix/var/nix/profiles/system/init systemd.machine_id={machine_id}{build_unit}{host_certs}");
 
     let mut domain = XmlElement::from_reader(base_xml.as_bytes()).context("parse domain xml")?;
     if domain.tag().name() != "domain" {
@@ -777,53 +774,15 @@ fn render_domain_xml(env: &Env, instance: &Instance, system_profile: &Path, is_b
     //    devices.append_new_child("emulator").set_text(resolve_cmd_path("qemu-system-x86_64"));
     //}
 
-    let system_filesystem = devices.append_new_child("filesystem");
-    system_filesystem
-        .set_attr("type", "mount")
-        .append_new_child("driver")
-        .set_attr("type", "virtiofs");
-    // queue='1024' omitted; libvirt/QEMU default is sufficient unless profiling says otherwise.
-    let binary = system_filesystem.append_new_child("binary");
-    // https://discourse.nixos.org/t/virt-manager-cannot-find-virtiofsd/26752
-    // TODO: Remove this. Host must set up the virtiofsd.
-    //binary.set_attr("path", resolve_cmd_path("virtiofsd"));
-    binary.set_attr("xattr", "on");
-    // Omit <cache>; libvirt only accepts none/always, and virtiofsd default is auto.
-    // Rust virtiofsd 1.13.x does not advertise lock support to libvirt:
-    // https://virtio-fs.gitlab.io/virtiofsd/doc/virtiofsd/fuse/struct.FsOptions.html
-    binary.append_new_child("sandbox").set_attr("mode", "namespace");
-    binary.append_new_child("thread_pool").set_attr("size", "0");
-    system_filesystem
-        .append_new_child("source")
-        .set_attr("dir", instance.system.display().to_string());
-    system_filesystem.append_new_child("target").set_attr("dir", "system");
-    let idmap = system_filesystem.append_new_child("idmap");
-    for (element_name, map) in [
-        ("uid", capture_host_idmap("/proc/self/uid_map", true)?),
-        ("gid", capture_host_idmap("/proc/self/gid_map", true)?),
-    ] {
-        for line in map.lines() {
-            let mut fields = line.split_whitespace();
-            if let (Some(start), Some(target), Some(count)) = (fields.next(), fields.next(), fields.next()) {
-                idmap
-                    .append_new_child(element_name)
-                    .set_attr("start", start)
-                    .set_attr("target", target)
-                    .set_attr("count", count);
-            }
-        }
+    // The supervisor owns both daemons; libvirt only connects QEMU to their sockets.
+    for tag in ["system", "user"] {
+        let filesystem = devices.append_new_child("filesystem");
+        filesystem.set_attr("type", "mount").append_new_child("driver").set_attr("type", "virtiofs");
+        filesystem
+            .append_new_child("source")
+            .set_attr("socket", instance.runtime_dir.join(format!("{tag}.sock")).display().to_string());
+        filesystem.append_new_child("target").set_attr("dir", tag);
     }
-
-    let user_filesystem = devices.append_new_child("filesystem");
-    user_filesystem
-        .set_attr("type", "mount")
-        .append_new_child("driver")
-        .set_attr("type", "virtiofs");
-    // queue='1024' omitted; see system filesystem above.
-    user_filesystem
-        .append_new_child("source")
-        .set_attr("socket", instance.runtime_dir.join("user.sock").display().to_string());
-    user_filesystem.append_new_child("target").set_attr("dir", "user");
 
     let interface = devices.append_new_child("interface");
     interface.set_attr("type", "user");
@@ -907,11 +866,12 @@ fn run_build_or_up(env: &Env, bootstrap: bool, is_up: bool, attach: bool, mut wr
         if !instance.rootfs.join("nix/var/nix/profiles/default").is_symlink() {
             fetch_nix_dockerhub(&instance.rootfs).context("fetch")?;
         }
+        // The image is only bootstrap scaffolding; the Nix store belongs to persistent system data.
         fs::rename(instance.rootfs.join("nix"), instance.system.join("nix")).context("move bootstrap Nix store into system data")?;
     }
     fs::create_dir_all(instance.rootfs.join("nix")).context("prepare bootstrap Nix mountpoint")?;
     if bootstrap || !instance.system.join("nix/var/nix/profiles/system").is_symlink() {
-        install_initial_nixos_profile(&env.workspace, &instance.rootfs, &instance.system, "default", env.is_nested)?;
+        install_initial_nixos_profile(&env.workspace, &instance.rootfs, &instance.system, "default")?;
     }
     // Provide a minimum writable flake.lock for the initial build.
     if !instance.flake_dir.join("flake.lock").exists() {
@@ -919,7 +879,13 @@ fn run_build_or_up(env: &Env, bootstrap: bool, is_up: bool, attach: bool, mut wr
         write_lock = true;
     }
     let rebuild = |action| rebuild_guest(env, &instance, action, write_lock);
-    let domstate = domstate(&instance.id)?;
+    let mut domstate = domstate(&instance.id)?;
+    // A domain cannot recover its external virtiofs connections after their supervisor disappears.
+    if domstate == "running" && !instance.runtime_dir.join("control.sock").exists() {
+        eprintln!("supervisor is missing; recreating the VM");
+        virsh(&["destroy", &instance.id]).context("recover missing supervisor")?;
+        domstate = "down".to_owned();
+    }
     match domstate.as_str() {
         "down" | "shut off" | "crashed" => {
             start_vm(env, &instance, true)?;
@@ -1012,7 +978,7 @@ fn fetch_nix_dockerhub(rootfs: &Path) -> anyhow::Result<()> {
 
 // The initial profile is assumed safe, so building it in a simple container is acceptable.
 #[inline(never)]
-fn install_initial_nixos_profile(workspace: &Path, rootfs: &Path, system: &Path, hostname: &str, nested: bool) -> anyhow::Result<()> {
+fn install_initial_nixos_profile(workspace: &Path, rootfs: &Path, system: &Path, hostname: &str) -> anyhow::Result<()> {
     let config_target = rootfs.join("etc/nixos");
     eprintln!("install: writing template config into {}", config_target.display());
     write_template_config(&config_target, workspace, true)?;
@@ -1069,28 +1035,6 @@ fn install_initial_nixos_profile(workspace: &Path, rootfs: &Path, system: &Path,
             unmount("/tmp", UnmountFlags::DETACH)?; // Unmount old root.
             eprintln!("install: cd to the brand new root / (rootfs)");
             chdir("/")?;
-            // Bootstrap may run in two topologies:
-            //
-            // - On the real host, this rootfs is normally on a local filesystem. The kernel
-            //   sees both the install user namespace and the backing inodes, so install-ns root
-            //   can use CAP_DAC_OVERRIDE for Nix's builder-owned scratch dirs.
-            // - In a nested DevVM, this same rootfs lives under the outer guest's
-            //   /persistent, which is virtiofs backed by the outer host. At this point the inner
-            //   VM has not started yet; the virtiofs boundary involved here is the already-mounted
-            //   outer /persistent, not this invocation's future /persistent device.
-            //
-            // Nix creates /nix/var/nix/builds entries as 0700 and chowns them to nixbld users;
-            // nixbld1 is uid 30001 in the install namespace, observed as uid 62768 after the
-            // guest subuid map. Nix then creates .attr-* files from its still-root parent. The
-            // guest VFS check succeeds, but FUSE sends only the mapped fsuid/fsgid. Thus the
-            // outer virtiofsd sees uid 1000 creating in a nixbld-owned 0700 dir, not namespace
-            // root overriding DAC. Remapping uid 1000 would also change ordinary guest uid 1000
-            // writes on /persistent, so only Nix's transient build scratch is moved to tmpfs.
-            if nested {
-                println!("install: mounting tmpfs to /nix/var/nix/builds");
-                fs::create_dir_all("/nix/var/nix/builds")?;
-                mount("tmpfs", "/nix/var/nix/builds", "tmpfs", MountFlags::NODEV | MountFlags::NOSUID, c"mode=0755")?;
-            }
             // Err(process::Command::new("cat").args(["/proc/self/mountinfo"]).exec().to_string())
 
             eprintln!("install: execing nix build for hostname={hostname}");
@@ -1112,7 +1056,23 @@ fn install_initial_nixos_profile(workspace: &Path, rootfs: &Path, system: &Path,
 
 #[inline(never)]
 fn domstate(instance_id: &str) -> anyhow::Result<String> {
+    // The supervisor is namespace root, so pin libvirt to the launcher's host-user session; use the ordinary URI only to preserve daemon autostart.
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR is required for libvirt session access")?;
+    let socket = format!("{runtime_dir}/libvirt/virtqemud-sock");
+    if !Path::new(&socket).exists() {
+        let status = process::Command::new("virsh")
+            .args(["-c", "qemu:///session", "uri"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .status()
+            .context("start libvirt session daemon")?;
+        if !status.success() {
+            bail!("failed to start libvirt session daemon");
+        }
+    }
+    let uri = format!("qemu+unix:///session?socket={socket}");
     let output = process::Command::new("virsh")
+        .args(["-c", &uri])
         .arg("domstate")
         .arg(instance_id)
         .output()
@@ -1121,7 +1081,7 @@ fn domstate(instance_id: &str) -> anyhow::Result<String> {
         return Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned());
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains("failed to get domain") {
+    if stderr.contains("failed to get domain") || stderr.contains("Domain not found") {
         Ok("down".to_owned())
     } else {
         bail!("{}", stderr.trim())
@@ -1164,7 +1124,11 @@ fn read_system_profile(instance: &Instance) -> anyhow::Result<PathBuf> {
 /// libvirt/qemu/passt children) so the daemon picks up the current PATH.
 #[inline(never)]
 fn virsh(args: &[&str]) -> anyhow::Result<()> {
+    // This may run as namespace root; keep all operations in the launcher's host-user libvirt session.
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR is required for libvirt session access")?;
+    let uri = format!("qemu+unix:///session?socket={runtime_dir}/libvirt/virtqemud-sock");
     let status = process::Command::new("virsh")
+        .args(["-c", &uri])
         .args(args)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -1280,17 +1244,15 @@ struct MountMapping {
 
 fn start_vm(env: &Env, instance: &Instance, is_build: bool) -> anyhow::Result<PathBuf> {
     let system_profile = read_system_profile(instance)?;
+    let system_socket = instance.runtime_dir.join("system.sock");
     let user_socket = instance.runtime_dir.join("user.sock");
     let control_socket = instance.runtime_dir.join("control.sock");
     let lock_path = instance.runtime_dir.join("lock");
     let pid_path = instance.runtime_dir.join("devvm.pid");
     let domain_profile = instance.runtime_dir.join("domain-profile");
-    let host_uid = getuid().as_raw().to_string();
-    let host_gid = getgid().as_raw().to_string();
-    let nested = env.is_nested;
     let (mut parent_sock, mut child_sock) = UnixStream::pair().context("create supervisor startup socket")?;
-    let supervisor_pid = spawn_mapped_namespace(false, false, || -> anyhow::Result<()> {
-        let mut daemon = None;
+    let supervisor_pid = spawn_mapped_namespace(true, false, || -> anyhow::Result<()> {
+        let mut daemons = Vec::new();
         let result = (|| -> anyhow::Result<()> {
             setsid().context("detach supervisor session")?;
             let lock = OpenOptions::new()
@@ -1303,13 +1265,16 @@ fn start_vm(env: &Env, instance: &Instance, is_build: bool) -> anyhow::Result<Pa
             if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == -1 {
                 return Err(std::io::Error::last_os_error()).context("lock instance runtime");
             }
-            for path in [&user_socket, &control_socket, &pid_path, &domain_profile] {
+            for path in [&system_socket, &user_socket, &control_socket, &pid_path, &domain_profile] {
                 let _ = fs::remove_file(path);
             }
             let downstream_rec = MountPropagationFlags::DOWNSTREAM | MountPropagationFlags::REC;
             mount_change("/", downstream_rec).context("set / mount propagation downstream+rec")?;
-            mount_bind_recursive(&instance.user, &instance.user).context("self bind user dir")?;
-            mount_change(&instance.user, MountPropagationFlags::SHARED | MountPropagationFlags::REC).context("set user mount shared+rec")?;
+            // Propagate later bind mounts below either export into virtiofsd's child mount namespace.
+            for (name, root) in [("system", &instance.system), ("user", &instance.user)] {
+                mount_bind_recursive(root, root).with_context(|| format!("self bind {name} dir"))?;
+                mount_change(root, MountPropagationFlags::SHARED | MountPropagationFlags::REC).with_context(|| format!("set {name} mount shared+rec"))?;
+            }
 
             let mut mounted = Vec::new();
             let mut build_mounted = Vec::new();
@@ -1318,40 +1283,76 @@ fn start_vm(env: &Env, instance: &Instance, is_build: bool) -> anyhow::Result<Pa
 
             let control = UnixListener::bind(&control_socket).context("bind control socket")?;
             control.set_nonblocking(true).context("set control socket nonblocking")?;
+            let system = UnixListener::bind(&system_socket).context("bind system virtiofs socket")?;
             let user = UnixListener::bind(&user_socket).context("bind user virtiofs socket")?;
+            fcntl_setfd(&system, FdFlags::empty()).context("keep system virtiofs socket fd across exec")?;
             fcntl_setfd(&user, FdFlags::empty()).context("keep user virtiofs socket fd across exec")?;
             fs::write(&pid_path, format!("{}\n", process::id())).context("write supervisor pid")?;
 
-            let mut daemon_cmd = process::Command::new("virtiofsd");
-            daemon_cmd
-                .args(["--shared-dir", &instance.user.display().to_string()])
-                .args(["--fd", &user.as_raw_fd().to_string()])
-                .args(["--sandbox", "namespace", "--cache", "auto", "--xattr", "--log-level", "error"])
-                .uid(0)
-                .gid(0)
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit());
-            if nested {
-                daemon_cmd
-                    .args(["--translate-uid", &format!("squash-guest:0:{host_uid}:1")])
-                    .args(["--translate-gid", &format!("squash-guest:0:{host_gid}:1")]);
+            // Keep the highest mapped ID as a guest-inaccessible scratch slot for owner translation.
+            let mut reserved = [0; 2];
+            for (limit, path) in reserved.iter_mut().zip(["/proc/self/uid_map", "/proc/self/gid_map"]) {
+                for line in fs::read_to_string(path)?.lines() {
+                    let mut fields = line.split_whitespace();
+                    let start = fields.next().context("missing namespace ID")?.parse::<u32>()?;
+                    let _parent = fields.next().context("missing parent ID")?.parse::<u32>()?;
+                    let count = fields.next().context("missing ID map count")?.parse::<u32>()?;
+                    let end = start.checked_add(count).and_then(|end| end.checked_sub(1)).context("ID map range overflow")?;
+                    *limit = (*limit).max(end);
+                }
             }
-            unsafe {
-                daemon_cmd.pre_exec(|| {
-                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
-                        Err(std::io::Error::last_os_error())
-                    } else {
-                        Ok(())
+            let [uid_reserved, gid_reserved] = reserved;
+            // nixbld1 is 30001, so the scratch slot must be above it.
+            if uid_reserved <= 30_001 || gid_reserved <= 30_001 {
+                bail!("at least 30003 mapped UIDs and GIDs are required");
+            }
+            for (name, shared_dir, listener) in [("system", &instance.system, &system), ("user", &instance.user, &user)] {
+                let mut command = process::Command::new("virtiofsd");
+                command
+                    .args(["--shared-dir", &shared_dir.display().to_string()])
+                    .args(["--fd", &listener.as_raw_fd().to_string()])
+                    .args(["--sandbox", "namespace", "--cache", "auto", "--xattr", "--log-level", "error"])
+                    .uid(0)
+                    .gid(0)
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit());
+                if name == "user" {
+                    // Guest root and the normal guest owner both become the real host owner;
+                    // the forbidden scratch ID prevents ambiguity in the reverse translation.
+                    for (option, owner, reserved) in [("--translate-uid", 1000, uid_reserved), ("--translate-gid", 100, gid_reserved)] {
+                        for mapping in [
+                            "squash-guest:0:0:1".to_owned(),
+                            format!("squash-guest:{owner}:0:1"),
+                            format!("host:0:{owner}:1"),
+                            format!("host:{owner}:{reserved}:1"),
+                            format!("forbid-guest:{reserved}:1"),
+                        ] {
+                            command.arg(option).arg(mapping);
+                        }
                     }
-                });
+                }
+                unsafe {
+                    command.pre_exec(|| {
+                        // Never leave an export daemon behind if its supervisor dies.
+                        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
+                            Err(std::io::Error::last_os_error())
+                        } else {
+                            Ok(())
+                        }
+                    });
+                }
+                daemons.push((name, command.spawn().with_context(|| format!("spawn {name} virtiofsd"))?));
             }
-            daemon = Some(daemon_cmd.spawn().context("spawn user virtiofsd")?);
+            drop(system);
             drop(user);
-            if let Some(status) = daemon.as_mut().unwrap().try_wait().context("poll user virtiofsd")? {
-                bail!("user virtiofsd exited before ready: {status}");
+            for (name, daemon) in &mut daemons {
+                if let Some(status) = daemon.try_wait().with_context(|| format!("poll {name} virtiofsd"))? {
+                    bail!("{name} virtiofsd exited before ready: {status}");
+                }
             }
             child_sock.write_all(&[1]).context("notify launcher that supervisor is ready")?;
             let mut commit = [0_u8; 1];
+            // Stay alive only after libvirt accepts a domain that consumes the export sockets.
             if child_sock.read_exact(&mut commit).is_err() || commit[0] != 1 {
                 bail!("launcher exited before startup commit");
             }
@@ -1359,11 +1360,13 @@ fn start_vm(env: &Env, instance: &Instance, is_build: bool) -> anyhow::Result<Pa
 
             let mut ticks = 0_u8;
             'supervise: loop {
-                if let Some(status) = daemon.as_mut().unwrap().try_wait().context("poll user virtiofsd")? {
-                    if !domain_is_active(&instance.id)? {
-                        break 'supervise;
+                for (name, daemon) in &mut daemons {
+                    if let Some(status) = daemon.try_wait().with_context(|| format!("poll {name} virtiofsd"))? {
+                        if !domain_is_active(&instance.id)? {
+                            break 'supervise;
+                        }
+                        bail!("{name} virtiofsd exited unexpectedly: {status}");
                     }
-                    bail!("user virtiofsd exited unexpectedly: {status}");
                 }
                 match control.accept() {
                     Ok((mut stream, _)) => {
@@ -1412,13 +1415,13 @@ fn start_vm(env: &Env, instance: &Instance, is_build: bool) -> anyhow::Result<Pa
             drop(lock);
             Ok(())
         })();
-        if let Some(mut daemon) = daemon {
+        for (_, mut daemon) in daemons {
             if daemon.try_wait().ok().flatten().is_none() {
                 let _ = kill_process(Pid::from_raw(daemon.id() as i32).expect("child pid is nonzero"), Signal::TERM);
             }
             let _ = daemon.wait();
         }
-        for path in [&control_socket, &user_socket, &pid_path, &lock_path] {
+        for path in [&control_socket, &system_socket, &user_socket, &pid_path, &lock_path] {
             let _ = fs::remove_file(path);
         }
         result

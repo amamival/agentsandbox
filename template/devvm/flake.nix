@@ -52,14 +52,11 @@
           depends = [ "/persistent" ];
         };
         fileSystems."/home" = { device = "none"; fsType = "tmpfs"; options = [ "mode=755" "nosuid" "nodev" ]; neededForBoot = true; };
-        systemd.mounts = [{
-          what = "tmpfs";
-          where = "/nix/var/nix/builds";
-          type = "tmpfs";
-          options = "mode=755,nosuid,nodev";
-          wantedBy = [ "local-fs.target" ];
-          unitConfig.ConditionKernelCommandLine = "devvm.nested";
-        }];
+        # Keep libvirtd's required initializer successful without a TPM or a persistent systemd host key; null provides no confidentiality or authenticity.
+        systemd.services.virt-secret-init-encryption.serviceConfig.ExecStart = [
+          ""
+          "${pkgs.runtimeShell} -c 'umask 0077; ${pkgs.coreutils}/bin/dd if=/dev/random status=none bs=32 count=1 | ${config.systemd.package}/bin/systemd-creds encrypt --with-key=null --name=secrets-encryption-key - /var/lib/libvirt/secrets/secrets-encryption-key'"
+        ];
         systemd.services.devvm-host-ca = {
           description = "Use the host CA bundle";
           wantedBy = [ "multi-user.target" ];

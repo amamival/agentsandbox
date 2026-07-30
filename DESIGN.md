@@ -205,6 +205,7 @@ $XDG_STATE_HOME/devvm/<instance-id>/
 $XDG_RUNTIME_DIR/devvm/<instance-id>/
   lock
   control.sock
+  system.sock
   user.sock
   domain.xml
   ... runtime metadata
@@ -218,7 +219,7 @@ $XDG_RUNTIME_DIR/devvm/<instance-id>/
   initial workspace mount.
 - `logs/` stores the active log files and their rotated archives.
 - The runtime dir is the cleanup unit for the supervisor lock, acknowledged
-  control socket, user virtiofs socket, and generated domain metadata.
+  control socket, both virtiofs sockets, and generated domain metadata.
 
 ## Build flow
 
@@ -241,7 +242,8 @@ $XDG_RUNTIME_DIR/devvm/<instance-id>/
   uid/gid mappings (`newuidmap`/`newgidmap`), then child continues.
 - VM startup path:
   1. acquire the instance lock and start the supervisor in a mapped namespace
-  2. apply dynamic mounts to the `user` view and start its virtiofsd
+  2. self-bind both export roots, apply dynamic mounts to the `user` view, and
+     start the `system` and `user` virtiofsd processes
   3. expose the acknowledged control socket and report readiness
   4. render runtime metadata and `virsh create <runtime-dir>/domain.xml`
   5. commit supervisor ownership; pre-commit failure rolls back the sidecar
@@ -250,10 +252,16 @@ $XDG_RUNTIME_DIR/devvm/<instance-id>/
 - `BuildOn` mounts a tracked worktree at `/persistent/home/build` only for the
   rebuild. Untracked, non-git, and global configs use
   `/persistent/home/config`. `BuildOff` runs on success and failure.
-- The user export maps host-owned files to guest uid 1000, while rebuild runs
-  as guest root. Git therefore declares the fixed build path as a safe
-  directory; otherwise libgit2 rejects the correctly mapped worktree as being
-  owned by another user.
+- Both exports run inside the supervisor's root-mapped user namespace. The
+  `system` export preserves guest IDs. The `user` export aliases guest root and
+  uid 1000 to the export owner, aliases guest groups 0 and 100 likewise, and
+  preserves the remaining IDs. The last mapped uid and gid are reserved to
+  make those aliases reversible. This keeps root authority on system state and
+  ordinary user ownership on host workspaces without a nested-only path.
+- Rebuild runs as guest root while the worktree appears owned by guest uid
+  1000. Git therefore declares the fixed build path as a safe directory;
+  otherwise libgit2 rejects the correctly mapped worktree as being owned by
+  another user.
 - `nixos-rebuild switch` restarts `local-fs.target` and may detach nested bind
   mounts visible through virtiofs. `BuildOff` consequently removes the build
   mount and reapplies the normal config and workspace mounts before replying.
@@ -365,22 +373,22 @@ $XDG_RUNTIME_DIR/devvm/<instance-id>/
 - `init` adds the startup workspace mount under its basename.
 - `mount` and `unmount` persist hostname-specific overrides in
   `devvm.local.toml`.
-- The supervisor self-binds `data/<id>/user` in its private mount namespace;
-  no separate runtime export tree is created.
+- The supervisor self-binds `data/<id>/system` and `data/<id>/user` in its
+  private mount namespace; no separate runtime export tree is created.
 - Active TOML policy aliases exposed through a mount are over-mounted
   read-only.
 - Additional mount entries are materialized as bind mounts under
   `user/workspace/<guest-name>` in the same namespace.
-- The supervisor-owned virtiofsd exports that namespace-specific view to guest
-  `/persistent/home`.
+- Supervisor-owned virtiofsd processes export the system view to guest
+  `/persistent` and the namespace-specific user view to `/persistent/home`.
 - `mount` and `unmount` update TOML and wait for the supervisor's `Reload`
   acknowledgement.
 - The active config dir for the build is always reachable from the launcher.
 
 ## Supervisor ownership
 
-- The supervisor owns the user mount namespace, user virtiofsd, `control.sock`,
-  and instance lock.
+- The supervisor owns the export mount namespace, both virtiofsd processes,
+  their sockets, `control.sock`, and the instance lock.
 - Commands are `Reload`, `BuildOn`, `BuildOff`, and `Stop`; every command
   returns `OK` or `ERR` before the caller continues.
 - The supervisor monitors both virtiofsd and the libvirt domain. Domain exit or
@@ -388,7 +396,8 @@ $XDG_RUNTIME_DIR/devvm/<instance-id>/
   sockets and lock.
 - `down`, `kill`, restart, and `destroy` stop the domain before waiting for
   supervisor cleanup. A stale runtime from host failure is recovered under
-  the flock on the next start.
+  the flock on the next start. A running domain without its supervisor is
+  destroyed and recreated because its virtiofs connections cannot be reused.
 
 ## Network and proxy
 

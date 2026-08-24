@@ -251,9 +251,9 @@ Vulnix Options:
 #[derive(Debug, PartialEq, Eq)]
 struct Env {
     is_global: bool,
-    project_name: String,
+    project_name: Option<String>,
     hostname: String,
-    workspace: PathBuf,
+    search_dir: PathBuf,
     config_root: PathBuf,
     data_root: PathBuf,
     state_root: PathBuf,
@@ -264,6 +264,8 @@ struct Env {
 struct Instance {
     id: String,
     is_global: bool,
+    project_name: String,
+    workspace: PathBuf,
     flake_dir: PathBuf,
     data_dir: PathBuf,
     state_dir: PathBuf,
@@ -382,14 +384,8 @@ fn resolve_env(cli: &Cli) -> anyhow::Result<Env> {
     Ok(Env {
         is_global: cli.global,
         hostname: cli.hostname.clone(),
-        project_name: cli.project_name.clone().unwrap_or_else(|| {
-            if cli.global {
-                APP_NAME.to_owned()
-            } else {
-                cli.workspace.file_name().and_then(|name| name.to_str()).unwrap_or(APP_NAME).to_owned()
-            }
-        }),
-        workspace: cli.workspace.clone(),
+        project_name: cli.project_name.clone(),
+        search_dir: cli.workspace.clone(),
         config_root: cli.xdg_config_home.clone().unwrap_or_else(|| home.join(".config")).join(APP_NAME),
         data_root: cli.xdg_data_home.clone().unwrap_or_else(|| home.join(".local/share")).join(APP_NAME),
         state_root: cli.xdg_state_home.clone().unwrap_or_else(|| home.join(".local/state")).join(APP_NAME),
@@ -425,15 +421,16 @@ fn run_doctor(env: &Env) -> anyhow::Result<()> {
     println!("ResolvedDataRoot:\t\t{}", env.data_root.display());
     println!("ResolvedStateRoot:\t\t{}", env.state_root.display());
     println!("ResolvedRuntimeRoot:\t\t{}", env.runtime_root.display());
-    println!("WorkspaceArg:\t\t\t{}", env.workspace.display());
+    println!("WorkspaceArg:\t\t\t{}", env.search_dir.display());
     println!("IsUserGlobalProject:\t\t{}", env.is_global);
     println!("InstanceHostnameArg:\t\t{}", env.hostname);
-    println!("ProjectNameArg:\t\t\t{}", env.project_name);
+    println!("ProjectNameArg:\t\t\t{}", env.project_name.as_deref().unwrap_or(""));
 
-    let flake_dir = resolve_flake_dir(env);
-    match &flake_dir {
-        Err(err) => println!("ResolveFlakeDirError:\t\t{err:#}"),
-        Ok(flake_dir) => {
+    let workspace = resolve_workspace(env);
+    match &workspace {
+        Err(err) => println!("ResolveWorkspaceError:\t\t{err:#}"),
+        Ok((workspace, flake_dir)) => {
+            println!("ResolvedWorkspace:\t\t{}", workspace.display());
             println!("ResolvedFlakeDir:\t\t{}", flake_dir.display());
             println!("FileFlakeNixExists:\t\t{}", flake_dir.join("flake.nix").is_file());
             println!("FileConfigTomlExists:\t\t{}", flake_dir.join(CONFIG_TOML).is_file());
@@ -446,7 +443,7 @@ fn run_doctor(env: &Env) -> anyhow::Result<()> {
         }
     }
 
-    let instance = flake_dir.ok().map(|_| resolve_instance(env));
+    let instance = workspace.ok().map(|_| resolve_instance(env));
     match instance {
         None => println!("InstanceId:\t\t\tN/A"),
         Some(Err(err)) => println!("ResolveInstanceError:\t\t{err:#}"),
@@ -484,25 +481,26 @@ fn run_doctor(env: &Env) -> anyhow::Result<()> {
 }
 
 #[inline(never)]
-fn resolve_flake_dir(env: &Env) -> anyhow::Result<PathBuf> {
+fn resolve_workspace(env: &Env) -> anyhow::Result<(PathBuf, PathBuf)> {
     if !env.is_global {
-        let mut dir = env.workspace.clone();
+        let mut dir = env.search_dir.clone();
         loop {
             if dir.join(LOCAL_CONFIG_DIR).is_dir() {
-                return Ok(dir.join(LOCAL_CONFIG_DIR));
+                return Ok((dir.clone(), dir.join(LOCAL_CONFIG_DIR)));
             }
-            if dir.file_name().and_then(|p| p.to_str()) != Some(LOCAL_CONFIG_DIR) && (dir.join(CONFIG_TOML).is_file() || dir.join(CONFIG_LOCAL_TOML).is_file())
-            {
-                return Ok(dir);
+            let direct_config = dir.file_name().and_then(|p| p.to_str()) != Some(LOCAL_CONFIG_DIR)
+                && (dir.join(CONFIG_TOML).is_file() || dir.join(CONFIG_LOCAL_TOML).is_file());
+            if direct_config {
+                return Ok((dir.clone(), dir));
             }
             if !dir.pop() {
                 break;
             }
         }
     }
-    let global_flake_dir = env.config_root.join(&env.project_name);
+    let global_flake_dir = env.config_root.join(env.project_name.as_deref().unwrap_or(APP_NAME));
     if global_flake_dir.is_dir() {
-        Ok(global_flake_dir)
+        Ok((global_flake_dir.clone(), global_flake_dir))
     } else {
         bail!("{} not found. Try `devvm init` to start in a new project.", global_flake_dir.display())
     }
@@ -510,14 +508,20 @@ fn resolve_flake_dir(env: &Env) -> anyhow::Result<PathBuf> {
 
 #[inline(never)]
 fn resolve_instance(env: &Env) -> anyhow::Result<Instance> {
-    let flake_dir = resolve_flake_dir(env)?;
-    let id = format!("{}[{}]", env.project_name, env.hostname);
+    let (workspace, flake_dir) = resolve_workspace(env)?;
+    let project_name = env
+        .project_name
+        .clone()
+        .unwrap_or_else(|| workspace.file_name().and_then(|name| name.to_str()).unwrap_or(APP_NAME).to_owned());
+    let id = format!("{}[{}]", project_name, env.hostname);
     let data_dir = env.data_root.join(&id);
     let state_dir = env.state_root.join(&id);
     Ok(Instance {
         runtime_dir: env.runtime_root.join(&id),
         id,
-        is_global: flake_dir == env.config_root.join(&env.project_name),
+        is_global: flake_dir == env.config_root.join(&project_name),
+        project_name,
+        workspace,
         flake_dir,
         rootfs: data_dir.join("rootfs"),
         system: data_dir.join("system"),
@@ -815,17 +819,19 @@ fn render_domain_xml(env: &Env, instance: &Instance, system_profile: &Path, is_b
 // Create the config dir and initial files for local/global init, or return a displayable error.
 #[inline(never)]
 fn run_init(env: &Env, force: bool) -> anyhow::Result<()> {
-    let target = if env.is_global {
-        env.config_root.join(&env.project_name)
+    let (target, source) = if env.is_global {
+        let target = env.config_root.join(env.project_name.as_deref().unwrap_or(APP_NAME));
+        let source = diff_paths(std::path::absolute(&env.search_dir)?, &target).context("resolve workspace mount source")?;
+        (target, if source.as_os_str().is_empty() { PathBuf::from(".") } else { source })
     } else {
-        env.workspace.join(LOCAL_CONFIG_DIR)
+        (env.search_dir.join(LOCAL_CONFIG_DIR), PathBuf::from("."))
     };
-    write_template_config(&target, &env.workspace, force)?;
+    write_template_config(&target, &env.search_dir, &source, force)?;
     eprintln!("init: wrote template files to {}", target.display());
     Ok(())
 }
 
-fn write_template_config(target: &Path, workspace: &Path, force: bool) -> anyhow::Result<()> {
+fn write_template_config(target: &Path, workspace: &Path, source: &Path, force: bool) -> anyhow::Result<()> {
     if target.exists() && !force {
         bail!("{} already exists", target.display());
     }
@@ -836,7 +842,7 @@ fn write_template_config(target: &Path, workspace: &Path, force: bool) -> anyhow
     let config_template = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/template/", env!("CARGO_PKG_NAME"), ".toml"));
     let mut config: DocumentMut = config_template.parse().context(format!("parse template {CONFIG_TOML}"))?;
     let mut workspace_mount = toml_edit::InlineTable::new();
-    workspace_mount.insert("source", toml_edit::Value::from("."));
+    workspace_mount.insert("source", toml_edit::Value::from(source.display().to_string()));
     workspace_mount.insert("readonly", toml_edit::Value::from(false));
     config["mounts"][workspace_name] = toml_edit::value(workspace_mount);
     for (name, contents) in [
@@ -871,7 +877,7 @@ fn run_build_or_up(env: &Env, bootstrap: bool, is_up: bool, attach: bool, mut wr
     }
     fs::create_dir_all(instance.rootfs.join("nix")).context("prepare bootstrap Nix mountpoint")?;
     if bootstrap || !instance.system.join("nix/var/nix/profiles/system").is_symlink() {
-        install_initial_nixos_profile(&env.workspace, &instance.rootfs, &instance.system, "default")?;
+        install_initial_nixos_profile(&instance.workspace, &instance.rootfs, &instance.system, "default")?;
     }
     // Provide a minimum writable flake.lock for the initial build.
     if !instance.flake_dir.join("flake.lock").exists() {
@@ -981,7 +987,7 @@ fn fetch_nix_dockerhub(rootfs: &Path) -> anyhow::Result<()> {
 fn install_initial_nixos_profile(workspace: &Path, rootfs: &Path, system: &Path, hostname: &str) -> anyhow::Result<()> {
     let config_target = rootfs.join("etc/nixos");
     eprintln!("install: writing template config into {}", config_target.display());
-    write_template_config(&config_target, workspace, true)?;
+    write_template_config(&config_target, workspace, Path::new("."), true)?;
 
     // Remove previous out-link so `nix build --out-link /nix/var/nix/profiles/system` can overwrite it.
     let _ = fs::remove_file(system.join("nix/var/nix/profiles/system"));
@@ -1144,12 +1150,13 @@ fn virsh(args: &[&str]) -> anyhow::Result<()> {
 }
 
 fn list_instance_ids(env: &Env) -> anyhow::Result<Vec<String>> {
+    let project_name = resolve_instance(env)?.project_name;
     Ok(fs::read_dir(&env.data_root)?
         .filter_map(|entry| {
             let entry = entry.ok()?;
             entry.file_type().ok()?.is_dir().then(|| entry.file_name().into_string().ok())?
         })
-        .filter(|id| id.rsplit_once('[').map(|(name, _)| name) == Some(env.project_name.as_str()))
+        .filter(|id| id.rsplit_once('[').map(|(name, _)| name) == Some(project_name.as_str()))
         .collect())
 }
 
@@ -1483,7 +1490,7 @@ fn apply_user_mounts(env: &Env, instance: &Instance, mounted: &mut Vec<PathBuf>)
         let source = if Path::new(&mount_config.source).is_absolute() {
             PathBuf::from(&mount_config.source)
         } else {
-            env.workspace.join(&mount_config.source)
+            instance.workspace.join(&mount_config.source)
         }
         .canonicalize()
         .with_context(|| format!("canonicalize mount source {}", mount_config.source))?;
@@ -1897,7 +1904,7 @@ fn run_mount(env: &Env, path: Option<String>, name: Option<String>, is_mount: bo
     let config_local_toml_contents = read_optional(&config_local_toml_path).context(format!("read {CONFIG_LOCAL_TOML}"))?;
     let config = parse_config(&config_toml_contents, Some(&config_local_toml_contents), &env.hostname, false).context("validate current TOML config")?;
 
-    let base_abs = env.workspace.canonicalize()?;
+    let base_abs = instance.workspace.canonicalize()?;
     let cwd_abs = env::current_dir()?.canonicalize()?;
     let to_base_rel = |path: &Path| -> anyhow::Result<(PathBuf, PathBuf)> {
         let path_abs = if path.is_absolute() { path.to_path_buf() } else { cwd_abs.join(path) };

@@ -1,3 +1,7 @@
+![devvm architecture: a host workspace connected through the devvm supervisor to an isolated NixOS VM](devvm-overview.svg)
+
+![devvm workflow: initialize configuration.nix, boot a NixOS VM, and iterate with simple commands from any recent Linux host](devvm-workflow.svg)
+
 # DevVM: a secure, efficient, reproducible NixOS Linux VM for self-improving agentic workflows
 
 In 2026, agentic loops are becoming increasingly unattended as LLM-based coding harnesses improve. However, the use of such harnesses and external LLM providers still raises security and privacy concerns.
@@ -77,6 +81,7 @@ Options:
 ```
 
 ## Quick Start
+
 ```bash
 # 1) Initialize local config in current workspace
 devvm init
